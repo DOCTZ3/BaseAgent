@@ -1,0 +1,119 @@
+// ============================================
+// Tools 层:工具执行器(runner)
+// ============================================
+
+import {
+  Tool,
+  ToolCall,
+  ToolResult,
+  ToolContext,
+  ConfirmRequest,
+} from './contract.js';
+import { ToolRegistry } from './registry.js';
+import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard } from '../platform/index.js';
+import { FsDriver } from '../executors/index.js';
+
+export interface RunnerConfig {
+  sessionId: string;
+  logger: Logger;
+  signal: AbortSignal;
+  onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
+  allowDangerousTools: boolean;
+  fsSandboxPaths: string[];
+}
+
+export class ToolRunner {
+  private fsDriver: FsDriver;
+
+  constructor(
+    private registry: ToolRegistry,
+    private config: RunnerConfig,
+  ) {
+    // 初始化文件系统执行器(带沙箱)
+    const securityGuard = new SecurityGuard(config.fsSandboxPaths);
+    this.fsDriver = new FsDriver(securityGuard);
+  }
+
+  async run(toolCall: ToolCall): Promise<ToolResult> {
+    const { name, args } = toolCall;
+    const tool = this.registry.get(name);
+
+    if (!tool) {
+      return {
+        ok: false,
+        error: `工具 ${name} 未注册`,
+      };
+    }
+
+    try {
+      // ① 校验参数
+      const parseResult = tool.parameters.safeParse(args);
+      if (!parseResult.success) {
+        throw new ValidationError(
+          `参数校验失败: ${parseResult.error.message}`
+        );
+      }
+
+      // ② 危险工具确认
+      if (tool.danger && this.config.allowDangerousTools) {
+        const confirmed = await this.config.onConfirmRequired({
+          reason: `工具 ${name} 需要确认`,
+          toolName: name,
+          args,
+        });
+        if (!confirmed) {
+          return {
+            ok: false,
+            error: '用户拒绝执行',
+          };
+        }
+      } else if (tool.danger && !this.config.allowDangerousTools) {
+        throw new SecurityError(`危险工具 ${name} 已被禁用`);
+      }
+
+      // ③ 组装 ctx(按 needs 注入资源)
+      const ctx = this.buildContext(tool);
+
+      // ④ 执行工具
+      this.config.logger.info(`执行工具: ${name}`, { args });
+      const result = await tool.run(parseResult.data, ctx);
+
+      return result;
+
+    } catch (error) {
+      this.config.logger.error(`工具执行失败: ${name}`, { error });
+
+      if (error instanceof ValidationError || error instanceof SecurityError) {
+        return { ok: false, error: error.message };
+      }
+
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : '未知错误',
+      };
+    }
+  }
+
+  private buildContext(tool: Tool): ToolContext {
+    // 按 needs 注入执行器
+    const executors: ToolContext['executors'] = {};
+
+    for (const need of tool.needs) {
+      if (need === 'fs') {
+        executors.fs = this.fsDriver;
+      } else if (need === 'browser') {
+        executors.browser = null; // 占位
+      } else if (need === 'http') {
+        executors.http = null; // 占位
+      }
+    }
+
+    return {
+      sessionId: this.config.sessionId,
+      logger: this.config.logger,
+      signal: this.config.signal,
+      confirm: this.config.onConfirmRequired,
+      executors,
+    };
+  }
+}
