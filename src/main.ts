@@ -10,7 +10,7 @@ import {
   loadConfig,
 } from './platform/index.js';
 import { ToolRegistry, ToolRunner } from './tools/index.js';
-import { DeepSeekAdapter, Orchestrator } from './core/index.js';
+import { ContextManager, DeepSeekAdapter, Orchestrator } from './core/index.js';
 import {
   EchoTool,
   GetCurrentTimeTool,
@@ -74,16 +74,38 @@ async function main() {
     baseURL: modelConfig.baseURL!,
     model:   modelConfig.model,
     enableThinking: modelConfig.enableThinking ?? true, // 默认开启
+    retry:   config.retry,   // 统一重试策略（SDK 自带重试已关闭）
     logger,
   });
 
-  // ⑥ 创建 Orchestrator
+  // ⑥ 创建 Context 管理器（Turn 管理 + 主题聚类压缩）
+  const context = new ContextManager(
+    {
+      sessionId: 'session-001',
+      windowSize:            config.context.windowSize,
+      compressionThreshold:  config.context.compressionThreshold,
+      recentTurnsToKeep:     config.context.recentTurnsToKeep,
+      maxTopicsInContext:    config.context.maxTopicsInContext,
+      maxTokensPerToolResult: {
+        file_read:   config.context.maxFileTokens,
+        web_content: config.context.maxContentTokens,
+        dom_tree:    config.context.maxDOMTokens,
+      },
+      retry: config.retry,
+      logger,
+    },
+    llmClient
+  );
+  await context.initialize();
+
+  // ⑦ 创建 Orchestrator
   const orchestrator = new Orchestrator(llmClient, runner, registry, {
     maxSteps: config.execution.maxSteps,
     logger,
+    context,
   });
 
-  // ⑦ 测试任务
+  // ⑧ 测试任务
   const result = await orchestrator.run([
     {
       role: 'system',
@@ -96,6 +118,8 @@ async function main() {
   ]);
 
   logger.info('任务结果', { result });
+
+  context.dispose();
 }
 
 main().catch(error => {

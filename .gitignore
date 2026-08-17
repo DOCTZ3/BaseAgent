@@ -1,3 +1,11 @@
 node_modules/
 dist/
 .env
+
+# Claude Code 相关文件（不上传到 GitHub）
+CLAUDE.md
+.claude/
+
+# 本地集成测试与测试输出（不上传到 GitHub）
+test-*.js
+*.log

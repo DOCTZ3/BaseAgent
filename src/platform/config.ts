@@ -32,6 +32,7 @@ export interface AgentConfig {
     windowSize: number;        // 上下文窗口大小(token)
     compressionThreshold: number;  // 压缩触发阈值(占窗口比例)
     recentTurnsToKeep: number;     // 压缩时保留的最近轮数
+    maxTopicsInContext: number;    // 上下文中最多保留的主题数量（时间滑动窗口）
     maxDOMTokens: number;          // DOM/无障碍树单次上限
     maxContentTokens: number;      // 网页正文单次上限
     maxFileTokens: number;         // 文件读取单次上限
@@ -41,6 +42,14 @@ export interface AgentConfig {
   security: {
     fsSandboxPaths: string[];  // 文件系统白名单路径
     allowDangerousTools: boolean;  // 是否启用危险工具
+  };
+
+  // 重试配置（幂等操作:LLM 调用/结构化输出解析）
+  retry: {
+    maxRetries: number;          // 最大重试次数(不含首次尝试)
+    baseDelay: number;           // 指数退避基础延迟(ms)
+    maxDelay: number;            // 单次延迟上限(ms)
+    retryableErrors?: string[];  // 可重试错误特征,未配置则用内置默认表
   };
 
   // 日志
@@ -95,22 +104,32 @@ const buildModels = (): { main: ModelConfig; fast?: ModelConfig; reasoning?: Mod
 export const defaultConfig: AgentConfig = {
   models: buildModels(),
   execution: {
-    maxSteps: 20,
-    timeout: 60000,
+    maxSteps: process.env.MAX_STEPS ? parseInt(process.env.MAX_STEPS) : 20,
+    timeout: process.env.EXECUTION_TIMEOUT ? parseInt(process.env.EXECUTION_TIMEOUT) : 60000,
   },
   context: {
-    windowSize: 1_000_000,
-    compressionThreshold: 0.7,
-    recentTurnsToKeep: 10,
-    maxDOMTokens: 20_000,
-    maxContentTokens: 10_000,
-    maxFileTokens: 10_000,
+    windowSize: process.env.CONTEXT_WINDOW_SIZE ? parseInt(process.env.CONTEXT_WINDOW_SIZE) : 1_000_000,
+    compressionThreshold: process.env.CONTEXT_COMPRESSION_THRESHOLD ? parseFloat(process.env.CONTEXT_COMPRESSION_THRESHOLD) : 0.7,
+    recentTurnsToKeep: process.env.CONTEXT_RECENT_TURNS ? parseInt(process.env.CONTEXT_RECENT_TURNS) : 10,
+    maxTopicsInContext: process.env.CONTEXT_MAX_TOPICS ? parseInt(process.env.CONTEXT_MAX_TOPICS) : 10,
+    maxDOMTokens: process.env.CONTEXT_MAX_DOM_TOKENS ? parseInt(process.env.CONTEXT_MAX_DOM_TOKENS) : 20_000,
+    maxContentTokens: process.env.CONTEXT_MAX_CONTENT_TOKENS ? parseInt(process.env.CONTEXT_MAX_CONTENT_TOKENS) : 10_000,
+    maxFileTokens: process.env.CONTEXT_MAX_FILE_TOKENS ? parseInt(process.env.CONTEXT_MAX_FILE_TOKENS) : 10_000,
   },
   security: {
-    fsSandboxPaths: [],
-    allowDangerousTools: false,
+    fsSandboxPaths: process.env.FS_SANDBOX_PATHS ? process.env.FS_SANDBOX_PATHS.split(',') : [],
+    allowDangerousTools: process.env.ALLOW_DANGEROUS_TOOLS === 'true',
   },
-  logLevel: 'info',
+  retry: {
+    maxRetries: process.env.RETRY_MAX_ATTEMPTS ? parseInt(process.env.RETRY_MAX_ATTEMPTS) : 3,
+    baseDelay: process.env.RETRY_BASE_DELAY ? parseInt(process.env.RETRY_BASE_DELAY) : 1000,
+    maxDelay: process.env.RETRY_MAX_DELAY ? parseInt(process.env.RETRY_MAX_DELAY) : 60_000,
+    // 未配置时留空,由 RetryHandler 使用内置默认错误表
+    retryableErrors: process.env.RETRY_RETRYABLE_ERRORS
+      ? process.env.RETRY_RETRYABLE_ERRORS.split(',').map(s => s.trim()).filter(Boolean)
+      : undefined,
+  },
+  logLevel: (process.env.LOG_LEVEL as 'debug' | 'info' | 'warn' | 'error') || 'info',
 };
 
 export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -135,5 +154,6 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     execution: { ...defaultConfig.execution, ...overrides.execution },
     context: { ...defaultConfig.context, ...overrides.context },
     security: { ...defaultConfig.security, ...overrides.security },
+    retry: { ...defaultConfig.retry, ...overrides.retry },
   };
 }

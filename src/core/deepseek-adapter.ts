@@ -4,7 +4,7 @@
 
 import OpenAI from 'openai';
 import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage } from './llm-client.js';
-import { Logger, LLMError } from '../platform/index.js';
+import { Logger, LLMError, RetryHandler, RetryConfig } from '../platform/index.js';
 
 export interface DeepSeekConfig {
   apiKey: string;
@@ -12,47 +12,61 @@ export interface DeepSeekConfig {
   model: string;
   enableThinking: boolean;  // 是否开启推理模式
   logger: Logger;
+  retry?: Partial<RetryConfig>;  // 重试策略(未配置则用 RetryHandler 默认值)
 }
 
 export class DeepSeekAdapter implements LLMClient {
   private client: OpenAI;
+  private retryHandler: RetryHandler;
 
   constructor(private config: DeepSeekConfig) {
     this.client = new OpenAI({
       apiKey: config.apiKey,
       baseURL: config.baseURL,
+      // 关掉 SDK 自带重试,统一由 RetryHandler 管,避免两层重试叠乘
+      maxRetries: 0,
     });
+    this.retryHandler = new RetryHandler(config.retry ?? {}, config.logger);
   }
 
   async complete(request: LLMRequest): Promise<LLMResponse> {
+    // 转换内部格式 → OpenAI 格式
+    const messages = this.convertMessages(request.messages);
+    const tools = request.tools?.map(t => ({
+      type: 'function' as const,
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      },
+    }));
+
+    this.config.logger.debug('LLM 请求', {
+      messageCount: messages.length,
+      toolCount: tools?.length || 0,
+      responseFormat: request.responseFormat || 'text',
+    });
+
     try {
-      // 转换内部格式 → OpenAI 格式
-      const messages = this.convertMessages(request.messages);
-      const tools = request.tools?.map(t => ({
-        type: 'function' as const,
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters,
-        },
-      }));
-
-      this.config.logger.debug('LLM 请求', {
-        messageCount: messages.length,
-        toolCount: tools?.length || 0,
-      });
-
-      const completion = await this.client.chat.completions.create({
-        model: this.config.model,
-        messages,
-        tools: tools && tools.length > 0 ? tools : undefined,
-        temperature: request.temperature,
-        max_tokens: request.maxTokens,
-        // 根据配置决定是否开启推理模式
-        ...(this.config.enableThinking !== undefined ? {
-          thinking: { type: this.config.enableThinking ? 'enabled' : 'disabled' }
-        } : {}),
-      });
+      // API 调用是幂等的,交给 RetryHandler 处理网络错误/限流/5xx
+      const completion = await this.retryHandler.execute(
+        () => this.client.chat.completions.create({
+          model: this.config.model,
+          messages,
+          tools: tools && tools.length > 0 ? tools : undefined,
+          temperature: request.temperature,
+          max_tokens: request.maxTokens,
+          // 结构化输出:强制模型只返回合法 JSON
+          ...(request.responseFormat === 'json_object' ? {
+            response_format: { type: 'json_object' as const }
+          } : {}),
+          // 根据配置决定是否开启推理模式
+          ...(this.config.enableThinking !== undefined ? {
+            thinking: { type: this.config.enableThinking ? 'enabled' : 'disabled' }
+          } : {}),
+        }),
+        'DeepSeek API 调用'
+      );
 
       const choice = completion.choices[0];
       if (!choice) {
@@ -75,6 +89,11 @@ export class DeepSeekAdapter implements LLMClient {
         toolCalls,
         finishReason: choice.finish_reason === 'tool_calls' ? 'tool_calls' :
                       choice.finish_reason === 'length' ? 'length' : 'stop',
+        usage: completion.usage ? {
+          prompt_tokens: completion.usage.prompt_tokens,
+          completion_tokens: completion.usage.completion_tokens,
+          prompt_cache_hit_tokens: (completion.usage as any).prompt_cache_hit_tokens
+        } : undefined
       };
 
       this.config.logger.debug('LLM 响应', {
@@ -82,6 +101,7 @@ export class DeepSeekAdapter implements LLMClient {
         hasReasoning: !!response.reasoning,
         toolCallCount: toolCalls.length,
         finishReason: response.finishReason,
+        usage: response.usage
       });
 
       return response;
