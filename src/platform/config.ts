@@ -52,6 +52,13 @@ export interface AgentConfig {
     retryableErrors?: string[];  // 可重试错误特征,未配置则用内置默认表
   };
 
+  // 可观测:LLM 调用留痕(本地调试用)
+  trace: {
+    enabled: boolean;    // 是否把每次调用的线格式请求/响应写盘
+    dir: string;         // 落盘根目录
+    verbose: boolean;    // 终端是否回显 reasoning 全文
+  };
+
   // 日志
   logLevel: 'debug' | 'info' | 'warn' | 'error';
 }
@@ -129,6 +136,13 @@ export const defaultConfig: AgentConfig = {
       ? process.env.RETRY_RETRYABLE_ERRORS.split(',').map(s => s.trim()).filter(Boolean)
       : undefined,
   },
+  trace: {
+    // 默认开启:本地调试的主要手段,开销只有一次同步写盘
+    enabled: process.env.TRACE_ENABLED !== 'false',
+    // 放项目根目录下的可见文件夹,不放 .claude/(隐藏目录不好找)
+    dir: process.env.TRACE_DIR || 'traces',
+    verbose: process.env.TRACE_VERBOSE === 'true',
+  },
   logLevel: (process.env.LOG_LEVEL as 'debug' | 'info' | 'warn' | 'error') || 'info',
 };
 
@@ -155,5 +169,6 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     context: { ...defaultConfig.context, ...overrides.context },
     security: { ...defaultConfig.security, ...overrides.security },
     retry: { ...defaultConfig.retry, ...overrides.retry },
+    trace: { ...defaultConfig.trace, ...overrides.trace },
   };
 }

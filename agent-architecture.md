@@ -26,7 +26,7 @@
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  interface/  交互层(壳,可替换)                            │
-│    · cli          先做:命令行输入输出                      │
+│    · cli          已实现:REPL/单发两种模式 + 可观测回显     │
 │    · voice        预留:ASR 语音转文字 / TTS 播报            │
 │    · gui          预留:Electron/Tauri 桌面窗口             │
 │    职责:只做 输入→文本 / 结构化结果→展示,零业务逻辑        │
@@ -71,6 +71,7 @@
 │    · security      SecurityGuard:白名单路径检查            │
 │    · errors        统一错误类型(Validation/Security/...)  │
 │    · retry-handler 幂等操作的指数退避重试                  │
+│    · trace-recorder LLM 调用留痕(线格式请求/响应落盘)      │
 │    职责:全局共用,所有层都可能依赖                          │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -282,6 +283,14 @@ interface TopicSummary {
   - 主题分析失败 → 所有 Turn 归入默认主题
   - 摘要生成失败 → 占位摘要
   - 理由:压缩是保命机制(防超窗口),中断它比丢一段摘要严重得多
+- **可观测靠留痕,不靠日志**:
+  - Adapter 暴露 `onTrace` 钩子,记录**线格式**(转换后)的请求与原始响应;
+    落盘由 `TraceRecorder` 负责,Adapter 不关心写到哪里
+  - 理由:定位真实效果问题需要「发出去的原始请求 + 收到的原始响应」成对数据,
+    而日志只有布尔值和计数。记内部格式会看漏 —— `content: null` 转换、
+    `reasoning_content` 回填、`tool_calls` 结构都在转换那一步才成型
+  - 失败调用同样留痕:定位 4xx 时请求体比错误消息有用
+  - 留痕写盘失败只告警,绝不影响主流程
 
 ---
 
@@ -292,6 +301,7 @@ interface TopicSummary {
 **Platform 层**:
 - Logger / Config / Storage / SecurityGuard / Errors
 - RetryHandler (幂等操作的统一重试)
+- TraceRecorder (LLM 调用留痕,本地可观测)
 
 **Executors 层**:
 - FsDriver (文件系统,集成 SecurityGuard)
@@ -302,10 +312,13 @@ interface TopicSummary {
 - 系统工具:ReadFile / WriteFile / ListFiles / SearchFiles
 
 **Core 层**:
-- LLMClient (接口) + DeepSeekAdapter (实现)
+- LLMClient (接口) + DeepSeekAdapter (实现,含 trace 钩子)
 - TokenCounter (Token 统计和阈值判断)
 - ContextManager (Turn 管理 + 主题聚类压缩 + 结构化输出)
 - Orchestrator (ReAct 主循环)
+
+**Interface 层**:
+- CLI (REPL / 单发两种模式,斜杠命令 + 每轮可观测回显)
 
 ### ⏳ 待实现
 
@@ -321,7 +334,6 @@ interface TopicSummary {
 - Planner 模块(多步任务拆解)
 
 **Interface 层**:
-- CLI (命令行交互)
 - Voice (语音接口 - 预留)
 - GUI (图形界面 - 预留)
 
@@ -348,6 +360,5 @@ interface TopicSummary {
 ## 下一步
 
 1. 实现 BrowserDriver + 浏览器工具组
-2. 实现 CLI 交互界面
-3. Memory 模块(长期记忆)
-4. Planner 模块(多步任务拆解)
+2. Memory 模块(长期记忆)
+3. Planner 模块(多步任务拆解)

@@ -3,7 +3,7 @@
 // ============================================
 
 import OpenAI from 'openai';
-import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage } from './llm-client.js';
+import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage, TraceSink } from './llm-client.js';
 import { Logger, LLMError, RetryHandler, RetryConfig } from '../platform/index.js';
 
 export interface DeepSeekConfig {
@@ -13,11 +13,13 @@ export interface DeepSeekConfig {
   enableThinking: boolean;  // 是否开启推理模式
   logger: Logger;
   retry?: Partial<RetryConfig>;  // 重试策略(未配置则用 RetryHandler 默认值)
+  onTrace?: TraceSink;           // 可观测钩子(未设置则零开销)
 }
 
 export class DeepSeekAdapter implements LLMClient {
   private client: OpenAI;
   private retryHandler: RetryHandler;
+  private callCounter = 0;
 
   constructor(private config: DeepSeekConfig) {
     this.client = new OpenAI({
@@ -47,24 +49,33 @@ export class DeepSeekAdapter implements LLMClient {
       responseFormat: request.responseFormat || 'text',
     });
 
+    // 线格式请求体：这才是真正发给 API 的内容，trace 必须记这个
+    const wireRequest = {
+      model: this.config.model,
+      messages,
+      tools: tools && tools.length > 0 ? tools : undefined,
+      temperature: request.temperature,
+      max_tokens: request.maxTokens,
+      ...(request.responseFormat === 'json_object' ? {
+        response_format: { type: 'json_object' as const }
+      } : {}),
+      ...(this.config.enableThinking !== undefined ? {
+        thinking: { type: this.config.enableThinking ? 'enabled' : 'disabled' }
+      } : {}),
+    };
+
+    const callIndex = ++this.callCounter;
+    const label = request.traceLabel ?? 'unlabeled';
+    const startedAt = Date.now();
+    let attempts = 0;
+
     try {
       // API 调用是幂等的,交给 RetryHandler 处理网络错误/限流/5xx
       const completion = await this.retryHandler.execute(
-        () => this.client.chat.completions.create({
-          model: this.config.model,
-          messages,
-          tools: tools && tools.length > 0 ? tools : undefined,
-          temperature: request.temperature,
-          max_tokens: request.maxTokens,
-          // 结构化输出:强制模型只返回合法 JSON
-          ...(request.responseFormat === 'json_object' ? {
-            response_format: { type: 'json_object' as const }
-          } : {}),
-          // 根据配置决定是否开启推理模式
-          ...(this.config.enableThinking !== undefined ? {
-            thinking: { type: this.config.enableThinking ? 'enabled' : 'disabled' }
-          } : {}),
-        }),
+        () => {
+          attempts++;
+          return this.client.chat.completions.create(wireRequest as any);
+        },
         'DeepSeek API 调用'
       );
 
@@ -104,10 +115,38 @@ export class DeepSeekAdapter implements LLMClient {
         usage: response.usage
       });
 
+      this.config.onTrace?.({
+        callIndex,
+        label,
+        model: this.config.model,
+        startedAt,
+        durationMs: Date.now() - startedAt,
+        attempts,
+        wireRequest,
+        wireResponse: completion,
+        parsed: response,
+      });
+
       return response;
 
     } catch (error) {
       this.config.logger.error('LLM 调用失败', { error });
+
+      // 失败也要留痕：定位 4xx/格式问题时，请求体比错误消息更有用
+      this.config.onTrace?.({
+        callIndex,
+        label,
+        model: this.config.model,
+        startedAt,
+        durationMs: Date.now() - startedAt,
+        attempts,
+        wireRequest,
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          name: error instanceof Error ? error.name : undefined,
+        },
+      });
+
       throw new LLMError(
         error instanceof Error ? error.message : '未知错误',
         true

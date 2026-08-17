@@ -8,6 +8,7 @@
     "build": "tsc",
     "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
+    "cli": "tsx src/interface/cli.ts",
     "test:mock": "tsx src/test-mock.ts",
     "typecheck": "tsc --noEmit"
   },

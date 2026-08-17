@@ -59,6 +59,7 @@ export class Orchestrator {
       const response = await this.llmClient.complete({
         messages: currentMessages,
         tools: this.toolRegistry.getAllDescriptions(),
+        traceLabel: `main-loop:step-${step}`,
       });
 
       // 记录 Token 使用量（如果有 Context）

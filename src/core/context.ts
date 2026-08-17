@@ -93,6 +93,9 @@ export class ContextManager {
   private topicSummaries: Map<string, TopicSummary> = new Map();  // 主题摘要（id -> TopicSummary）
   private activeTurnTopics: Map<number, string> = new Map();      // Turn ID -> Topic ID 映射
   private retryHandler: RetryHandler;
+  // 实际执行过的压缩次数（跳过的不计）。上层靠它判断「这一轮是否压缩了」——
+  // 不能用 turns 数量反推：turns 要到下一轮开始才递增，新会话第一轮会误报。
+  private compressionCount = 0;
 
   constructor(
     private config: ContextConfig,
@@ -267,6 +270,16 @@ export class ContextManager {
   }
 
   /**
+   * 只读快照当前消息列表（观测用，不触发压缩）
+   *
+   * 与 preparePrompt() 的区别：后者会检查并执行 Mid-Turn 压缩。
+   * CLI 的 /context 命令必须用这个，否则「看一眼上下文」会改变上下文。
+   */
+  peekMessages(): readonly Message[] {
+    return this.messages;
+  }
+
+  /**
    * 准备 Prompt（检查 Mid-Turn 压缩）
    */
   async preparePrompt(): Promise<Message[]> {
@@ -327,6 +340,8 @@ export class ContextManager {
 
     // 更新 Turn 列表
     this.turns = recentTurns;
+
+    this.compressionCount++;
 
     this.config.logger.info('压缩完成', {
       archived: oldTurns.length,
@@ -506,6 +521,8 @@ export class ContextManager {
     // 恢复当前 Turn 的消息
     this.messages.push(...currentTurnMessages);
 
+    this.compressionCount++;
+
     this.config.logger.debug('恢复当前 Turn 消息', {
       total_messages: this.messages.length
     });
@@ -643,7 +660,8 @@ export class ContextManager {
     systemPrompt: string,
     userContent: string,
     operationName: string,
-    maxTokens: number
+    maxTokens: number,
+    traceLabel: string
   ): Promise<T> {
     return this.retryHandler.execute(async () => {
       const response = await this.llmClient.complete({
@@ -653,7 +671,8 @@ export class ContextManager {
         ],
         temperature: 0.3,
         maxTokens,
-        responseFormat: 'json_object'
+        responseFormat: 'json_object',
+        traceLabel
       });
 
       const raw = response.content?.trim();
@@ -742,7 +761,8 @@ export class ContextManager {
         systemPrompt,
         turnsText,
         '主题分析',
-        1000
+        1000,
+        'compression:topic-analysis'
       );
 
       // 按 turn_id 映射回 Turn 对象（模型可能返回不存在的 id，需过滤）
@@ -806,7 +826,8 @@ export class ContextManager {
         systemPrompt,
         turnsText,
         `主题"${topicTitle}"摘要生成`,
-        600
+        600,
+        `compression:topic-summary:${topicTitle}`
       );
 
       return {
@@ -937,6 +958,9 @@ export class ContextManager {
     return {
       turns: this.turns.length,
       messages: this.messages.length,
+      // 实际执行过的压缩次数（跳过的不计），供上层判断某一轮是否发生压缩
+      compressions: this.compressionCount,
+      topics: this.topicSummaries.size,
       tokens: this.tokenCounter.getStats()
     };
   }

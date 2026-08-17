@@ -9,3 +9,6 @@ CLAUDE.md
 # 本地集成测试与测试输出（不上传到 GitHub）
 test-*.js
 *.log
+
+# LLM 调用留痕（本地调试产物，含完整对话内容）
+traces/
