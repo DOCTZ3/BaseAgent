@@ -36,6 +36,20 @@ export interface AgentConfig {
     maxDOMTokens: number;          // DOM/无障碍树单次上限
     maxContentTokens: number;      // 网页正文单次上限
     maxFileTokens: number;         // 文件读取单次上限
+
+    // 压缩调用的输出预算(token)。未配置则跟随主模型 maxTokens:
+    // 推理内容计入输出预算,给小了会让思维链吃光额度、正文为空(finish_reason=length)
+    compressionMaxTokens?: number;
+
+    // 压缩「输入」的逐字段截断上限(字符)。防止工具结果(可能是整个文件)
+    // 把压缩自身的输入撑爆;给太小则会切掉摘要需要的事实
+    compressionClip: {
+      user: number;         // 用户提问
+      toolArgs: number;     // 工具入参
+      toolResult: number;   // 工具返回(最关键:摘要的事实来源)
+      answer: number;       // 最终回答(摘要生成用)
+      answerBrief: number;  // 最终回答(主题分析用,只需判意图)
+    };
   };
 
   // 安全配置
@@ -122,6 +136,18 @@ export const defaultConfig: AgentConfig = {
     maxDOMTokens: process.env.CONTEXT_MAX_DOM_TOKENS ? parseInt(process.env.CONTEXT_MAX_DOM_TOKENS) : 20_000,
     maxContentTokens: process.env.CONTEXT_MAX_CONTENT_TOKENS ? parseInt(process.env.CONTEXT_MAX_CONTENT_TOKENS) : 10_000,
     maxFileTokens: process.env.CONTEXT_MAX_FILE_TOKENS ? parseInt(process.env.CONTEXT_MAX_FILE_TOKENS) : 10_000,
+    // 留空 = 跟随主模型 MAIN_MAX_TOKENS(见 ContextManager 构造函数)
+    compressionMaxTokens: process.env.CONTEXT_COMPRESSION_MAX_TOKENS
+      ? parseInt(process.env.CONTEXT_COMPRESSION_MAX_TOKENS)
+      : undefined,
+    compressionClip: {
+      user: process.env.CONTEXT_CLIP_USER ? parseInt(process.env.CONTEXT_CLIP_USER) : 300,
+      toolArgs: process.env.CONTEXT_CLIP_TOOL_ARGS ? parseInt(process.env.CONTEXT_CLIP_TOOL_ARGS) : 120,
+      toolResult: process.env.CONTEXT_CLIP_TOOL_RESULT ? parseInt(process.env.CONTEXT_CLIP_TOOL_RESULT) : 600,
+      // 给得比 toolResult 宽：最终回答是模型对工具结果的蒸馏，信息密度更高
+      answer: process.env.CONTEXT_CLIP_ANSWER ? parseInt(process.env.CONTEXT_CLIP_ANSWER) : 1200,
+      answerBrief: process.env.CONTEXT_CLIP_ANSWER_BRIEF ? parseInt(process.env.CONTEXT_CLIP_ANSWER_BRIEF) : 120,
+    },
   },
   security: {
     fsSandboxPaths: process.env.FS_SANDBOX_PATHS ? process.env.FS_SANDBOX_PATHS.split(',') : [],
@@ -166,7 +192,15 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     ...overrides,
     models,
     execution: { ...defaultConfig.execution, ...overrides.execution },
-    context: { ...defaultConfig.context, ...overrides.context },
+    context: {
+      ...defaultConfig.context,
+      ...overrides.context,
+      // compressionClip 是嵌套对象，浅合并会被整体覆盖 —— 只覆盖传入的字段
+      compressionClip: {
+        ...defaultConfig.context.compressionClip,
+        ...overrides.context?.compressionClip,
+      },
+    },
     security: { ...defaultConfig.security, ...overrides.security },
     retry: { ...defaultConfig.retry, ...overrides.retry },
     trace: { ...defaultConfig.trace, ...overrides.trace },

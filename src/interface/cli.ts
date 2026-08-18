@@ -175,6 +175,10 @@ async function main() {
         web_content: config.context.maxContentTokens,
         dom_tree: config.context.maxDOMTokens,
       },
+      // 压缩用的是同一个主模型，输出预算默认跟随它（避免硬编码值找不到）
+      compressionMaxTokens: config.context.compressionMaxTokens,
+      modelMaxTokens: modelConfig.maxTokens,
+      compressionClip: config.context.compressionClip,
       retry: config.retry,
       logger,
     },
@@ -200,7 +204,13 @@ async function main() {
   console.log(bold('\nBaseAgent CLI'));
   console.log(dim(`  模型      ${modelConfig.model}  @ ${modelConfig.baseURL}`));
   console.log(dim(`  会话      ${sessionId}`));
-  console.log(dim(`  窗口      ${fmtTokens(config.context.windowSize)} tokens,压缩阈值 ${config.context.compressionThreshold * 100}%`));
+  console.log(dim(`  窗口      ${fmtTokens(config.context.windowSize)} tokens,压缩阈值 ${config.context.compressionThreshold * 100}%,保留最近 ${config.context.recentTurnsToKeep} 轮`));
+
+  // 压缩预算来源要能直接看见：之前是硬编码常量，改配置时根本找不到在哪
+  const compBudget = config.context.compressionMaxTokens ?? modelConfig.maxTokens ?? 4000;
+  const compSource = config.context.compressionMaxTokens ? '显式配置'
+    : modelConfig.maxTokens ? '跟随主模型' : '内置兜底';
+  console.log(dim(`  压缩预算  ${fmtTokens(compBudget)} tokens (${compSource}),工具结果截断 ${config.context.compressionClip.toolResult} 字`));
   console.log(dim(`  留痕      ${config.trace.enabled ? recorder.traceDir : '已关闭'}`));
   console.log(dim(`  沙箱      ${config.security.fsSandboxPaths.join(', ') || '(空)'}`));
   console.log(dim(`  危险工具  ${config.security.allowDangerousTools ? '已启用(需确认)' : '已禁用'}`));

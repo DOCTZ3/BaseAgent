@@ -11,4 +11,5 @@ test-*.js
 *.log
 
 # LLM 调用留痕（本地调试产物，含完整对话内容）
-traces/
+# 用 traces* 覆盖实验目录（如 traces-compress-test/），避免误提交
+traces*/

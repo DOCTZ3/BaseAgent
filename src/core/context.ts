@@ -28,6 +28,12 @@ const TopicSummarySchema = z.object({
   keywords: z.array(z.string().min(1)).default([]),
 });
 
+// 压缩调用的输出预算兜底值。
+// 仅在「既没配 compressionMaxTokens、也没传主模型 maxTokens」时才用到。
+// 取 4000 是因为推理内容计入输出预算：实测思维链可达 1500+ token，
+// 正文 150~250 token，给小了会让思维链吃光额度、正文为空（finish_reason=length）。
+const FALLBACK_COMPRESSION_MAX_TOKENS = 4000;
+
 // Turn 结构（完整对话单元）
 export interface Turn {
   turn_id: number;
@@ -81,7 +87,46 @@ export interface ContextConfig {
   };
   logger: Logger;
   retry?: Partial<RetryConfig>;  // 摘要/主题分析的重试策略
+
+  // 压缩调用的输出预算。未传则回退到 modelMaxTokens，再回退到内置兜底值。
+  compressionMaxTokens?: number;
+  // 主模型的 maxTokens。压缩用的是同一个模型，预算理应跟随它，
+  // 免得主模型调大了、压缩还卡在一个找不到的硬编码值上。
+  modelMaxTokens?: number;
+
+  // 压缩「输入」的逐字段截断上限（字符）。未传则用内置默认值。
+  compressionClip?: Partial<{
+    user: number;
+    toolArgs: number;
+    toolResult: number;
+    answer: number;
+    answerBrief: number;
+  }>;
 }
+
+// 压缩输入的逐字段截断上限（字符）
+interface ClipLimits {
+  user: number;
+  toolArgs: number;
+  toolResult: number;
+  answer: number;
+  answerBrief: number;
+}
+
+// 内置默认值。注意不要加 `as const`：那会让类型变成字面量（300 而非 number），
+// 配置覆盖时无法赋值。
+//
+// answer 给得比 toolResult 宽：最终回答是模型对工具结果的蒸馏，
+// 单位字符的信息密度远高于原始 JSON —— 同样的输入预算花在这里更划算。
+// 1200 的依据：实测 20 条真实回答，中位 211、p90 950、最长 1016，
+// 1200 能完整保留全部样本（400 时有 25% 被截）。
+const DEFAULT_CLIP: ClipLimits = {
+  user: 300,
+  toolArgs: 120,
+  toolResult: 600,
+  answer: 1200,
+  answerBrief: 120,   // 主题分析只需判意图，不需要全文
+};
 
 export class ContextManager {
   private messages: Message[] = [];
@@ -97,12 +142,31 @@ export class ContextManager {
   // 不能用 turns 数量反推：turns 要到下一轮开始才递增，新会话第一轮会误报。
   private compressionCount = 0;
 
+  // 压缩调用的输出预算：显式配置 > 主模型 maxTokens > 内置兜底
+  private compressionMaxTokens: number;
+  // 压缩输入的逐字段截断上限
+  private clipLimits: ClipLimits;
+
   constructor(
     private config: ContextConfig,
     private llmClient: LLMClient
   ) {
     this.tokenCounter = new TokenCounter(config.logger);
     this.archiveDir = path.join('.claude', 'sessions', config.sessionId);
+
+    this.compressionMaxTokens =
+      config.compressionMaxTokens
+      ?? config.modelMaxTokens
+      ?? FALLBACK_COMPRESSION_MAX_TOKENS;
+
+    this.clipLimits = { ...DEFAULT_CLIP, ...(config.compressionClip ?? {}) };
+
+    config.logger.debug('压缩参数', {
+      compression_max_tokens: this.compressionMaxTokens,
+      source: config.compressionMaxTokens ? 'explicit'
+        : config.modelMaxTokens ? 'model' : 'fallback',
+      clip: this.clipLimits,
+    });
     // 重试粒度 = 单次 LLM 调用（每个主题的摘要各自重试，互不影响）
     //
     // explicitOnly：这一层只重试 JSON 解析/Schema 校验失败（RetryableError）。
@@ -728,15 +792,74 @@ export class ContextManager {
   }
 
   /**
+   * 截断长文本，保留开头（ok 标志、数据头部都在前面）
+   */
+  private clip(text: string, limit: number): string {
+    const flat = (text ?? '').replace(/\s+/g, ' ').trim();
+    if (flat.length <= limit) return flat;
+    return `${flat.slice(0, limit)}…(截断,共 ${flat.length} 字)`;
+  }
+
+  /**
+   * 把一个 Turn 渲染成完整轨迹文本（喂给压缩用的 LLM）
+   *
+   * 必须包含「工具调用 + 工具结果 + 最终回答」，不能只给 user_message 和工具名：
+   * 缺了结果和回答，模型只能靠猜补全，会把编造的结论写进长期上下文
+   * （实测出现过「工具调用后未返回具体时间数据」这种与事实相反的摘要）。
+   *
+   * @param brief true = 主题分析用（判意图，压缩细节）；false = 摘要生成用（要保留事实）
+   */
+  private renderTurnTrace(turn: Turn, brief: boolean): string {
+    const lines: string[] = [
+      `[Turn ${turn.turn_id}]`,
+      `用户: ${this.clip(turn.user_message.content ?? '', this.clipLimits.user)}`,
+    ];
+
+    for (const iter of turn.assistant_iterations) {
+      const calls = iter.tool_calls ?? [];
+      const results = iter.tool_results ?? [];
+
+      calls.forEach((tc, i) => {
+        if (brief) {
+          lines.push(`工具: ${tc.name}`);
+        } else {
+          lines.push(`工具调用: ${tc.name}(${this.clip(JSON.stringify(tc.args ?? {}), this.clipLimits.toolArgs)})`);
+          // 按位置配对；缺失时不编造，明确写「无结果」
+          const res = results[i];
+          lines.push(res
+            ? `工具结果: ${this.clip(res.content, this.clipLimits.toolResult)}`
+            : '工具结果: (无结果)');
+        }
+      });
+
+      // 兜底：结果数多于调用数时不丢数据
+      if (!brief && results.length > calls.length) {
+        results.slice(calls.length).forEach(res => {
+          lines.push(`工具结果: ${this.clip(res.content, this.clipLimits.toolResult)}`);
+        });
+      }
+    }
+
+    // 最终回答是「这轮到底得出了什么结论」的唯一来源
+    if (turn.final_response?.content) {
+      lines.push(`助手回答: ${this.clip(
+        turn.final_response.content,
+        brief ? this.clipLimits.answerBrief : this.clipLimits.answer
+      )}`);
+    } else {
+      lines.push('助手回答: (本轮未产生最终回答)');
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
    * 分析每个 Turn 的主题（批量调用 LLM）
    */
   private async analyzeTurnTopics(turns: Turn[]): Promise<Array<{ turn: Turn; topicTitle: string }>> {
-    const turnsText = turns.map(t => {
-      const tools = t.assistant_iterations
-        .flatMap(iter => (iter.tool_calls ?? []).map(tc => tc.name))
-        .join(', ');
-      return `[Turn ${t.turn_id}] 用户: ${t.user_message.content}\n工具: ${tools || '无'}`;
-    }).join('\n\n');
+    const turnsText = turns
+      .map(t => this.renderTurnTrace(t, true))
+      .join('\n\n');
 
     const systemPrompt = `你是一个对话分析助手。请为每个 Turn 分配一个主题标签（3-8 字）。
 相同意图的 Turn 必须使用完全相同的主题标签。
@@ -761,7 +884,7 @@ export class ContextManager {
         systemPrompt,
         turnsText,
         '主题分析',
-        1000,
+        this.compressionMaxTokens,
         'compression:topic-analysis'
       );
 
@@ -800,14 +923,13 @@ export class ContextManager {
    * 为一组 Turn 生成主题摘要
    */
   private async generateTopicSummary(topicTitle: string, turns: Turn[]): Promise<TopicSummary> {
-    const turnsText = turns.map(t => {
-      const tools = t.assistant_iterations
-        .flatMap(iter => (iter.tool_calls ?? []).map(tc => tc.name))
-        .join(', ');
-      return `Turn ${t.turn_id}: ${t.user_message.content} [工具: ${tools || '无'}]`;
-    }).join('\n');
+    const turnsText = turns
+      .map(t => this.renderTurnTrace(t, false))
+      .join('\n\n');
 
     const systemPrompt = `你是一个摘要助手。请为主题"${topicTitle}"的对话生成摘要。
+
+输入是若干轮完整对话轨迹，每轮包含：用户提问、工具调用与结果、助手的最终回答。
 
 只返回 JSON，格式如下：
 {
@@ -817,6 +939,9 @@ export class ContextManager {
 
 要求：
 - summary 为完整句子，包含主要结论，不要分点
+- **只依据输入中确实出现的内容**，不要推测或补全未出现的信息
+- 优先保留结论性事实（工具返回的具体数据、助手给出的答案），而不是过程描述
+- 若某轮标注"(无结果)"或"(本轮未产生最终回答)"，如实反映，不要臆测结果
 - keywords 为 3-5 个关键词组成的数组
 - 不要输出 JSON 以外的任何内容`;
 
@@ -826,7 +951,7 @@ export class ContextManager {
         systemPrompt,
         turnsText,
         `主题"${topicTitle}"摘要生成`,
-        600,
+        this.compressionMaxTokens,
         `compression:topic-summary:${topicTitle}`
       );
 

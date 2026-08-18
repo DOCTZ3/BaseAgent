@@ -91,6 +91,10 @@ async function main() {
         web_content: config.context.maxContentTokens,
         dom_tree:    config.context.maxDOMTokens,
       },
+      // 压缩用的是同一个主模型,输出预算默认跟随它
+      compressionMaxTokens: config.context.compressionMaxTokens,
+      modelMaxTokens:       modelConfig.maxTokens,
+      compressionClip:      config.context.compressionClip,
       retry: config.retry,
       logger,
     },
