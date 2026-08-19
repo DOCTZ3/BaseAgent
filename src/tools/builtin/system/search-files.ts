@@ -5,9 +5,13 @@
 import { z } from 'zod';
 import { Tool, ToolContext, ToolResult } from '../../contract.js';
 
+// 单次返回的结果上限。超限报错并告知总数,引导收窄模式 ——
+// 静默截断会让模型以为看到了全部匹配,得出错误结论。
+const MAX_RESULTS = 300;
+
 export class SearchFilesTool implements Tool {
   name = 'search_files';
-  description = '在指定目录下递归搜索匹配模式的文件。支持通配符: * 匹配单段, ** 匹配任意深度。例如: "*.ts" 匹配所有 TypeScript 文件, "**/*.json" 递归匹配所有 JSON 文件。';
+  description = '在指定目录下递归搜索匹配模式的文件。支持通配符: * 匹配单段, ** 匹配任意深度。例如: "*.ts" 匹配所有 TypeScript 文件, "**/*.json" 递归匹配所有 JSON 文件。匹配过多时会报错并提示收窄模式。';
 
   parameters = z.object({
     baseDir: z.string().describe('搜索起始目录'),
@@ -37,6 +41,18 @@ export class SearchFilesTool implements Tool {
         args.pattern,
         args.maxDepth || 10
       );
+
+      if (results.length > MAX_RESULTS) {
+        return {
+          ok: false,
+          error: `模式 "${args.pattern}" 在 "${args.baseDir}" 下匹配到 ${results.length} 个文件,` +
+            `超过单次返回上限 ${MAX_RESULTS}。\n` +
+            `请收窄范围后重试,例如:\n` +
+            `  - 指定更深的起始目录\n` +
+            `  - 用更具体的模式(如 "src/**/*.ts" 而非 "**/*")\n` +
+            `  - 降低 maxDepth`,
+        };
+      }
 
       return {
         ok: true,

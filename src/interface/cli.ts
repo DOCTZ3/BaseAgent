@@ -170,11 +170,8 @@ async function main() {
       compressionThreshold: config.context.compressionThreshold,
       recentTurnsToKeep: config.context.recentTurnsToKeep,
       maxTopicsInContext: config.context.maxTopicsInContext,
-      maxTokensPerToolResult: {
-        file_read: config.context.maxFileTokens,
-        web_content: config.context.maxContentTokens,
-        dom_tree: config.context.maxDOMTokens,
-      },
+      // 高水位兜底：窗口快满但轮次门槛卡住时，突破门槛强制压缩
+      highWaterRatio: config.context.highWaterRatio,
       // 压缩用的是同一个主模型，输出预算默认跟随它（避免硬编码值找不到）
       compressionMaxTokens: config.context.compressionMaxTokens,
       modelMaxTokens: modelConfig.maxTokens,

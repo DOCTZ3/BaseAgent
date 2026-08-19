@@ -23,8 +23,11 @@ const TopicAssignmentSchema = z.object({
   })).min(1),
 });
 
+// 索引条目（不是文章摘要）：只要求「做了什么 + 结果」，越短越好。
+// summary 不设上限校验 —— prompt 已约束 60 字，硬上限会让偶尔超一点的
+// 合理输出被判失败、白走一轮重试再落到占位摘要，得不偿失。
 const TopicSummarySchema = z.object({
-  summary: z.string().min(10),
+  summary: z.string().min(5),
   keywords: z.array(z.string().min(1)).default([]),
 });
 
@@ -33,6 +36,11 @@ const TopicSummarySchema = z.object({
 // 取 4000 是因为推理内容计入输出预算：实测思维链可达 1500+ token，
 // 正文 150~250 token，给小了会让思维链吃光额度、正文为空（finish_reason=length）。
 const FALLBACK_COMPRESSION_MAX_TOKENS = 4000;
+
+// 高水位默认值（占窗口比例）。超过它时突破 recentTurnsToKeep 强制压缩。
+// 0.9 的取舍：与默认阈值 0.7 之间留 20% 缓冲，让常规压缩有充分机会先生效，
+// 只有它压不动（轮次不够）时才动用强制路径。
+const DEFAULT_HIGH_WATER_RATIO = 0.9;
 
 // Turn 结构（完整对话单元）
 export interface Turn {
@@ -54,7 +62,7 @@ export interface Turn {
 export interface TopicSummary {
   id: string;                 // UUID
   title: string;              // 主题名称（3-8 字）
-  summary: string;            // 高密度摘要（150-200 字）
+  summary: string;            // 检索索引（一句话，≤60 字）：做了什么 + 结果
   turn_ids: number[];         // 相关的 Turn ID 列表
   keywords: string[];         // 关键词（3-5 个）
   timestamp: number;          // 最后一个 Turn 的时间
@@ -80,12 +88,17 @@ export interface ContextConfig {
   compressionThreshold: number; // 压缩触发阈值（占窗口比例，如 0.7）
   recentTurnsToKeep: number;    // 压缩时保留的最近轮数
   maxTopicsInContext: number;   // 上下文中最多保留的主题数量（时间滑动窗口）
-  maxTokensPerToolResult: {     // 单次工具结果 token 上限
-    file_read: number;
-    web_content: number;
-    dom_tree: number;
-  };
   logger: Logger;
+
+  // 高水位（占窗口比例）。超过它时 recentTurnsToKeep 让位于「不崩」：
+  // 突破轮次门槛强制压缩，最少保留 1 轮。默认 0.9。
+  // 必须显著高于 compressionThreshold —— 它是兜底，不是常规触发点。
+  highWaterRatio?: number;
+  // 注：原有 maxTokensPerToolResult（单次工具结果 token 上限）已删除。
+  // 它声明了但从未被读取，而且在 context 层做无声截断是错的方向：
+  // 模型会以为看到了全部内容，基于残缺数据推理，比不截断更危险。
+  // 数据大不大是工具的领域知识 —— 由工具自己返回 ok:false + 分块读取提示
+  // （ReadFileTool 已是这个模式），让模型知道发生了什么、下一步怎么做。
   retry?: Partial<RetryConfig>;  // 摘要/主题分析的重试策略
 
   // 压缩调用的输出预算。未传则回退到 modelMaxTokens，再回退到内置兜底值。
@@ -134,7 +147,9 @@ export class ContextManager {
   private currentTurn: Partial<Turn> | null = null;
   private tokenCounter: TokenCounter;
   private archiveDir: string;
-  private needsMidTurnCompression: boolean = false;  // Mid-Turn 压缩标志位
+  // 压缩标志位：由 recordTokenUsage() 按 API 返回的 prompt_tokens 置真，
+  // 由 preparePrompt() 在下次发 prompt 前消费。这是唯一的压缩触发路径。
+  private needsCompression: boolean = false;
   private topicSummaries: Map<string, TopicSummary> = new Map();  // 主题摘要（id -> TopicSummary）
   private activeTurnTopics: Map<number, string> = new Map();      // Turn ID -> Topic ID 映射
   private retryHandler: RetryHandler;
@@ -146,6 +161,8 @@ export class ContextManager {
   private compressionMaxTokens: number;
   // 压缩输入的逐字段截断上限
   private clipLimits: ClipLimits;
+  // 高水位（占窗口比例）：超过它时突破轮次门槛强制压缩
+  private highWaterRatio: number;
 
   constructor(
     private config: ContextConfig,
@@ -161,11 +178,32 @@ export class ContextManager {
 
     this.clipLimits = { ...DEFAULT_CLIP, ...(config.compressionClip ?? {}) };
 
+    // 高水位必须比常规阈值高出一段，否则语义倒置：
+    // 若 threshold=0.8 而 highWater=0.5，常规压缩要等到 80% 才触发，
+    // 而那时早已越过「高水位」→ 每次压缩都走强制路径，
+    // recentTurnsToKeep 永远不生效（兜底变成了常规）。
+    // 故取 max(配置值, 阈值+0.1)，且不静默 —— 被覆盖时告警说明原因。
+    //
+    // 注：阈值本身配得极高时（如 0.95），高水位会被抬到 1.0，
+    // 等于「窗口全满才兜底」，实际兜不住。这种阈值本身就不该用。
+    const wantedHighWater = config.highWaterRatio ?? DEFAULT_HIGH_WATER_RATIO;
+    const minHighWater = Math.min(1, config.compressionThreshold + 0.1);
+    this.highWaterRatio = Math.max(wantedHighWater, minHighWater);
+    if (this.highWaterRatio !== wantedHighWater) {
+      config.logger.warn('高水位与压缩阈值间距不足，已上调', {
+        configured: wantedHighWater,
+        adjusted: this.highWaterRatio,
+        compression_threshold: config.compressionThreshold,
+        reason: '高水位需高于阈值+0.1，否则强制压缩会取代常规压缩'
+      });
+    }
+
     config.logger.debug('压缩参数', {
       compression_max_tokens: this.compressionMaxTokens,
       source: config.compressionMaxTokens ? 'explicit'
         : config.modelMaxTokens ? 'model' : 'fallback',
       clip: this.clipLimits,
+      high_water_ratio: this.highWaterRatio,
     });
     // 重试粒度 = 单次 LLM 调用（每个主题的摘要各自重试，互不影响）
     //
@@ -198,35 +236,20 @@ export class ContextManager {
    */
   async addUserMessage(content: string) {
     // 完成上一个 Turn
+    //
+    // 这里**不做**压缩判断。压缩时机统一由 needsCompression 标志位驱动，
+    // 在 preparePrompt() 里执行（详见该方法注释）。
+    //
+    // 原本这里有一套「Turn 边界检查」，按阈值分保守/激进两条分支：
+    //   - 保守（≤0.7）读上一次 API 返回的 prompt_tokens —— 与标志位用的是
+    //     同一个值、同一个比较，纯重复，只是把同一个结论打两遍日志
+    //   - 激进（>0.7）额外预估 user 消息的 token —— 但 user 消息是所有
+    //     上下文贡献者里最小的一个，真正吃窗口的是工具返回和模型输出，
+    //     而这个预估对那两样完全盲目。属于「对微不足道的部分很精确，
+    //     对主导因素一无所知」的虚假精确
+    // 故两条一并删除。
     if (this.currentTurn?.user_message) {
       this.finalizeTurn();
-
-      // Turn 边界检查：根据阈值选择策略
-      const threshold = this.config.compressionThreshold;
-      let shouldCompress = false;
-
-      if (threshold <= 0.7) {
-        // 保守阈值（≤70%）：直接判断已有 token（留有足够余地）
-        shouldCompress = this.tokenCounter.shouldCompress(
-          this.config.windowSize,
-          threshold
-        );
-      } else {
-        // 激进阈值（>70%）：预估新消息 token 后再判断
-        const currentTokens = this.tokenCounter.getStats().total_prompt;
-        const newTokens = this.tokenCounter.estimate(content);
-        shouldCompress = (currentTokens + newTokens) >=
-          this.config.windowSize * threshold;
-      }
-
-      if (shouldCompress) {
-        this.config.logger.info('触发上下文压缩（Turn 边界）', {
-          threshold: `${this.config.compressionThreshold * 100}%`,
-          current_tokens: this.tokenCounter.getStats().total_prompt,
-          turns: this.turns.length
-        });
-        await this.compress();
-      }
     }
 
     // 开启新 Turn
@@ -344,77 +367,31 @@ export class ContextManager {
   }
 
   /**
-   * 准备 Prompt（检查 Mid-Turn 压缩）
+   * 准备 Prompt（唯一的压缩执行点）
+   *
+   * 压缩时机统一在这里：标志位由 recordTokenUsage() 按 API 实际返回的
+   * prompt_tokens 置真，这里在「下一次发 prompt 之前」消费掉。
+   *
+   * 主循环每步开头都会调本方法，新 Turn 的第一步也会调 —— 那时 user 消息
+   * 已进 messages，所以压缩时机与旧的「Turn 边界检查」完全一致，不会延后，
+   * 也不会多花一次超阈值的调用。故边界检查已删除（见 addUserMessage 注释）。
    */
   async preparePrompt(): Promise<Message[]> {
-    // 检查是否需要 Mid-Turn 压缩
-    if (this.needsMidTurnCompression) {
-      this.config.logger.warn('触发上下文压缩（Mid-Turn）', {
+    if (this.needsCompression) {
+      // debug 而非 warn：这里只是「打算压」，是否真的执行由轮次门槛决定。
+      // Turn 内 token 只增不减，标志位每步都会被重新置真，warn 会按步数刷屏。
+      this.config.logger.debug('检查上下文压缩', {
         current_tokens: this.tokenCounter.getStats().total_prompt,
-        within_turn: true,
         current_turn_id: this.currentTurn?.turn_id
       });
 
-      await this.compressMidTurn();
-      this.needsMidTurnCompression = false;
+      // 先清标志位再执行：压缩本身会调 LLM 生成摘要，
+      // 那些调用不走 recordTokenUsage，不会重入，但保持清位在前更稳妥
+      this.needsCompression = false;
+      await this.runCompression();
     }
 
     return this.messages;
-  }
-
-  /**
-   * 压缩上下文（Turn 级别）
-   */
-  private async compress() {
-    // 完成当前 Turn
-    this.finalizeTurn();
-
-    if (this.turns.length <= this.config.recentTurnsToKeep) {
-      this.config.logger.warn('Turn 数不足，跳过压缩', { turns: this.turns.length });
-      return;
-    }
-
-    // 分离最近和早期 Turn
-    const recentTurns = this.turns.slice(-this.config.recentTurnsToKeep);
-    const oldTurns = this.turns.slice(0, -this.config.recentTurnsToKeep);
-
-    this.config.logger.info('开始压缩', {
-      total_turns: this.turns.length,
-      to_archive: oldTurns.length,
-      to_keep: recentTurns.length
-    });
-
-    // 归档早期 Turn
-    await this.archiveTurns(oldTurns);
-
-    // 主题聚类压缩
-    await this.compressWithTopicClustering(oldTurns);
-
-    // 重建消息列表
-    const initialSystemMessage = this.messages.find(m => m.role === 'system');
-    const recentMessages = this.flattenTurns(recentTurns);
-
-    // 生成上下文消息
-    const contextMessages = this.buildContextMessages(initialSystemMessage, oldTurns.length);
-
-    this.messages = [
-      ...contextMessages,
-      ...recentMessages
-    ];
-
-    // 更新 Turn 列表
-    this.turns = recentTurns;
-
-    this.compressionCount++;
-
-    this.config.logger.info('压缩完成', {
-      archived: oldTurns.length,
-      messages_after: this.messages.length,
-      topics_count: this.topicSummaries.size
-    });
-
-    // 验证消息结构
-    this.validateMessageStructure();
   }
 
   /**
@@ -526,18 +503,27 @@ export class ContextManager {
   }
 
   /**
-   * Mid-Turn 压缩（当前 Turn 未完成时触发）
+   * 执行压缩（唯一压缩路径）
+   *
+   * 只压缩**已完成**的 Turn，进行中的 Turn 原样保留：
+   * 先把当前 Turn 的消息取出，重建完再追加回去。
+   *
+   * 这样一份实现同时覆盖两种时机：
+   * - Turn 内溢出（一轮里连读几个大文件）：当前 Turn 有内容，被保护
+   * - Turn 边界溢出（新一轮刚开始）：当前 Turn 只有 user 消息，
+   *   取出再追加的结果与「边界压缩」完全一致
+   * 所以不需要单独的边界压缩分支。
    */
-  private async compressMidTurn() {
+  private async runCompression() {
     // 只压缩已完成的 Turn
     if (this.turns.length === 0) {
-      this.config.logger.warn('没有可压缩的 Turn（当前 Turn 未完成）', {
+      this.config.logger.debug('没有可压缩的 Turn（当前 Turn 未完成）', {
         current_turn_id: this.currentTurn?.turn_id
       });
       return;
     }
 
-    // 保存当前 Turn 的消息
+    // 保存当前 Turn 的消息（进行中的 Turn 不参与压缩）
     const currentTurnMessages = this.getCurrentTurnMessages();
 
     this.config.logger.debug('保存当前 Turn 消息', {
@@ -545,20 +531,63 @@ export class ContextManager {
       messages_count: currentTurnMessages.length
     });
 
-    // Bug 修复：直接压缩已完成的 Turn，不调用 compress()（它会 finalizeTurn）
-    if (this.turns.length <= this.config.recentTurnsToKeep) {
-      this.config.logger.warn('Turn 数不足，跳过 Mid-Turn 压缩', { turns: this.turns.length });
-      return;
+    // 高水位：窗口快满时，「保留最近 N 轮」这个语义让位于「不崩」。
+    //
+    // recentTurnsToKeep 是硬门槛，正常情况下它保证最近对话完整。但它卡住时
+    // 原本没有任何补救：单轮很大（一轮里连读十几个文件）完全可能在攒够
+    // N+1 轮之前就撑破窗口，那时压缩会一直静默跳过，直到 API 报错。
+    //
+    // 取舍：宁可少保留几轮完整对话，也不能让整个会话崩掉
+    // （与「压缩失败降级而非中断」同一条原则）。
+    // 最少保留 1 轮 —— 进行中的那轮必须留，否则请求本身就不完整。
+    const tokens = this.tokenCounter.getStats().total_prompt;
+    const highWaterMark = this.config.windowSize * this.highWaterRatio;
+    const overHighWater = tokens >= highWaterMark;
+
+    let keepCount = this.config.recentTurnsToKeep;
+    if (this.turns.length <= keepCount) {
+      if (!overHighWater) {
+        // 还没到高水位：等轮次攒够自然会压，属正常状态，debug 即可
+        this.config.logger.debug('Turn 数不足，跳过压缩', {
+          turns: this.turns.length,
+          recent_turns_to_keep: keepCount
+        });
+        return;
+      }
+
+      // 已过高水位仍压不动 —— 这是真正危险的情况，必须让它可见
+      keepCount = Math.max(1, this.turns.length - 1);
+      this.config.logger.warn('已过高水位，突破轮次门槛强制压缩', {
+        current_tokens: tokens,
+        high_water_mark: Math.round(highWaterMark),
+        window_size: this.config.windowSize,
+        turns: this.turns.length,
+        configured_keep: this.config.recentTurnsToKeep,
+        forced_keep: keepCount
+      });
+
+      if (this.turns.length <= 1) {
+        // 只有 1 个已完成 Turn，压它也腾不出空间。
+        // 此时溢出必然来自当前轮的工具返回 —— 该由工具自己限制返回量
+        // （见 ContextConfig 上关于 maxTokensPerToolResult 的注释）。
+        this.config.logger.error('上下文接近上限但无可压缩内容', {
+          current_tokens: tokens,
+          window_size: this.config.windowSize,
+          hint: '单轮内工具返回过大，应由工具分块返回，或将大上下文任务交给子 agent'
+        });
+        return;
+      }
     }
 
     // 分离最近和早期 Turn
-    const recentTurns = this.turns.slice(-this.config.recentTurnsToKeep);
-    const oldTurns = this.turns.slice(0, -this.config.recentTurnsToKeep);
+    const recentTurns = this.turns.slice(-keepCount);
+    const oldTurns = this.turns.slice(0, -keepCount);
 
-    this.config.logger.info('开始 Mid-Turn 压缩', {
+    this.config.logger.info('开始压缩', {
       total_turns: this.turns.length,
       to_archive: oldTurns.length,
-      to_keep: recentTurns.length
+      to_keep: recentTurns.length,
+      forced: overHighWater && keepCount < this.config.recentTurnsToKeep
     });
 
     // 归档早期 Turn
@@ -927,22 +956,35 @@ export class ContextManager {
       .map(t => this.renderTurnTrace(t, false))
       .join('\n\n');
 
-    const systemPrompt = `你是一个摘要助手。请为主题"${topicTitle}"的对话生成摘要。
+    // 定位：这是**检索索引**，不是文章摘要。
+    // 它的唯一用途是让模型判断「这段历史里有什么、需不需要去翻原文」，
+    // 翻的动作由 read_file 读归档完成。所以只要可判别，不要完整。
+    //
+    // 原 prompt 写死「150-200 字」，模型的 reasoning 里直接写了
+    // 「可能我们需要写足字数……内容有限，我们可以扩展描述」—— 是被字数硬指标
+    // 逼着注水，产出「用户直接询问……助手即时回应……最后以……结束」这种
+    // 过程复述。故改为只给上限、并显式禁止叙述体。
+    const systemPrompt = `你在为一段已归档的对话生成**检索索引**（不是文章摘要）。
 
-输入是若干轮完整对话轨迹，每轮包含：用户提问、工具调用与结果、助手的最终回答。
+主题："${topicTitle}"
+输入是若干轮对话轨迹，每轮包含：用户提问、工具调用与结果、助手的最终回答。
 
-只返回 JSON，格式如下：
+用途：这条索引会常驻上下文，供模型判断「要不要去读归档原文」。
+所以只需让人一眼看出**做了什么、结果是什么**，细节留在原文里。
+
+只返回 JSON：
 {
-  "summary": "150-200 字的高密度摘要，保留关键信息和决策",
+  "summary": "一句话，不超过 60 字",
   "keywords": ["关键词1", "关键词2", "关键词3"]
 }
 
 要求：
-- summary 为完整句子，包含主要结论，不要分点
-- **只依据输入中确实出现的内容**，不要推测或补全未出现的信息
-- 优先保留结论性事实（工具返回的具体数据、助手给出的答案），而不是过程描述
-- 若某轮标注"(无结果)"或"(本轮未产生最终回答)"，如实反映，不要臆测结果
-- keywords 为 3-5 个关键词组成的数组
+- summary **不超过 60 字**，越短越好；没有下限，内容少就写得更短
+- 只写「做了什么 + 结果」。禁止过程叙述，不要写"用户询问…助手回应…最后…"
+- 保留可检索的具体值（文件名、路径、数字、结论），丢掉客套与铺垫
+- **只依据输入中确实出现的内容**，不推测、不补全
+- 若某轮标注"(无结果)"或"(本轮未产生最终回答)"，如实反映
+- keywords 为 3-5 个便于检索的关键词
 - 不要输出 JSON 以外的任何内容`;
 
     try {
@@ -1030,13 +1072,15 @@ export class ContextManager {
   }) {
     this.tokenCounter.recordUsage(usage);
 
-    // Mid-Turn 检查：每次 LLM 调用后实时检查
+    // 每次 LLM 调用后按 API 实际返回的 prompt_tokens 判断。
+    // 这是压缩的唯一触发源：用真实值而非预估，覆盖工具返回和模型输出
+    // 带来的增长（这两者才是吃窗口的主因）。
     if (this.tokenCounter.shouldCompress(
       this.config.windowSize,
       this.config.compressionThreshold
     )) {
-      this.needsMidTurnCompression = true;
-      this.config.logger.debug('Mid-Turn 压缩标志位已设置', {
+      this.needsCompression = true;
+      this.config.logger.debug('压缩标志位已设置', {
         current_tokens: this.tokenCounter.getStats().total_prompt,
         threshold: `${this.config.compressionThreshold * 100}%`
       });

@@ -33,6 +33,10 @@ export interface AgentConfig {
     compressionThreshold: number;  // 压缩触发阈值(占窗口比例)
     recentTurnsToKeep: number;     // 压缩时保留的最近轮数
     maxTopicsInContext: number;    // 上下文中最多保留的主题数量（时间滑动窗口）
+
+    // 高水位（占窗口比例）。超过它时 recentTurnsToKeep 让位于「不崩」：
+    // 突破轮次门槛强制压缩，最少保留 1 轮。兜底机制，不是常规触发点。
+    highWaterRatio: number;
     maxDOMTokens: number;          // DOM/无障碍树单次上限
     maxContentTokens: number;      // 网页正文单次上限
     maxFileTokens: number;         // 文件读取单次上限
@@ -133,6 +137,10 @@ export const defaultConfig: AgentConfig = {
     compressionThreshold: process.env.CONTEXT_COMPRESSION_THRESHOLD ? parseFloat(process.env.CONTEXT_COMPRESSION_THRESHOLD) : 0.7,
     recentTurnsToKeep: process.env.CONTEXT_RECENT_TURNS ? parseInt(process.env.CONTEXT_RECENT_TURNS) : 10,
     maxTopicsInContext: process.env.CONTEXT_MAX_TOPICS ? parseInt(process.env.CONTEXT_MAX_TOPICS) : 10,
+    // 高水位兜底：默认 0.9，与阈值 0.7 之间留 20% 缓冲
+    highWaterRatio: process.env.CONTEXT_HIGH_WATER_RATIO
+      ? parseFloat(process.env.CONTEXT_HIGH_WATER_RATIO)
+      : 0.9,
     maxDOMTokens: process.env.CONTEXT_MAX_DOM_TOKENS ? parseInt(process.env.CONTEXT_MAX_DOM_TOKENS) : 20_000,
     maxContentTokens: process.env.CONTEXT_MAX_CONTENT_TOKENS ? parseInt(process.env.CONTEXT_MAX_CONTENT_TOKENS) : 10_000,
     maxFileTokens: process.env.CONTEXT_MAX_FILE_TOKENS ? parseInt(process.env.CONTEXT_MAX_FILE_TOKENS) : 10_000,
