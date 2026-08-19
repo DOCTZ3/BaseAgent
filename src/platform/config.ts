@@ -70,6 +70,13 @@ export interface AgentConfig {
     retryableErrors?: string[];  // 可重试错误特征,未配置则用内置默认表
   };
 
+  // 子 agent(一次性子任务执行器)
+  subAgent: {
+    enabled: boolean;    // 是否注册 spawn_subagent 工具
+    maxSteps: number;    // 单个子 agent 的步数预算
+    maxCount: number;    // 单次会话内最多 spawn 多少个(防连续下放烧钱)
+  };
+
   // 可观测:LLM 调用留痕(本地调试用)
   trace: {
     enabled: boolean;    // 是否把每次调用的线格式请求/响应写盘
@@ -170,6 +177,13 @@ export const defaultConfig: AgentConfig = {
       ? process.env.RETRY_RETRYABLE_ERRORS.split(',').map(s => s.trim()).filter(Boolean)
       : undefined,
   },
+  subAgent: {
+    enabled: process.env.SUBAGENT_ENABLED !== 'false',
+    // 子 agent 的任务通常是「遍历读取」，步数需求比主循环低但不能太紧
+    maxSteps: process.env.SUBAGENT_MAX_STEPS ? parseInt(process.env.SUBAGENT_MAX_STEPS) : 15,
+    // 配额:防止主 agent 连续下放导致成本失控
+    maxCount: process.env.SUBAGENT_MAX_COUNT ? parseInt(process.env.SUBAGENT_MAX_COUNT) : 5,
+  },
   trace: {
     // 默认开启:本地调试的主要手段,开销只有一次同步写盘
     enabled: process.env.TRACE_ENABLED !== 'false',
@@ -211,6 +225,7 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     },
     security: { ...defaultConfig.security, ...overrides.security },
     retry: { ...defaultConfig.retry, ...overrides.retry },
+    subAgent: { ...defaultConfig.subAgent, ...overrides.subAgent },
     trace: { ...defaultConfig.trace, ...overrides.trace },
   };
 }

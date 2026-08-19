@@ -38,6 +38,7 @@
 │    · planner       复杂任务的多步拆解(可选增强)           │
 │    · llm-client    封装 LLM API 调用                       │
 │    · context       上下文管理:Turn 级别 + 主题聚类压缩     │
+│    · sub-agent     一次性子 agent(独立上下文,只回传结论)  │
 │    · memory        长期记忆:用户偏好/历史(接 storage)     │
 │    · token-counter Token 统计和阈值判断                   │
 │    职责:理解意图、决定调哪个工具、串联多步、错误恢复        │
@@ -306,9 +307,15 @@ interface TopicSummary {
   理由:context 层无声截断会让模型以为看到了全部、基于残缺数据推理(如据残缺目录
   断言「没有 .py 文件」);且只有工具懂自己的数据结构,能给出有意义的恢复路径。
 - **大上下文任务由模型自己决定下放子 agent**:需要吞大量上下文的子任务
-  (遍历代码库、批量抓取)交给子 agent,只把高密度摘要注入主 agent。
+  (遍历代码库、批量抓取)交给子 agent,只把最终回答交回主 agent。
   从源头避免主上下文膨胀比事后压缩更根本 —— 这也是高水位只需做「兜底」的前提。
-  决策权在模型,框架只提供能力和边界。
+  决策权在模型,框架只提供能力和边界。三条约束:
+  ①**结构上杜绝递归** —— 子 agent 继承父 registry 全部工具但跳过 `needs` 含
+  `'agent'` 的,不靠深度计数去兜;②**安全边界不放宽** —— 共享父级 `signal` 与
+  `confirm`,权限仍由 `needs` + SecurityGuard 两层管住;③**结果即蒸馏** ——
+  直接返回 `final_response`,不再多调一次 LLM 做摘要。
+  起步只做 stateless;stateful + LRU 驻留池留作后续增量。
+  接口定义在 tools 层、实现在 core 层并由入口注入,避免 executors → core 反向依赖。
 - **压缩产物是检索索引,不是文章摘要**:目标 60 字以内,只写「做了什么 + 结果」,
   禁止过程叙述。它常驻上下文,用途是让模型判断「要不要读归档原文」,
   翻阅由 `read_file` 完成,所以只需可判别、不需完整。
@@ -344,14 +351,15 @@ interface TopicSummary {
 
 **Tools 层**:
 - Contract / Registry / Runner (调用管线)
-- 内置工具:Echo / GetCurrentTime
-- 系统工具:ReadFile / WriteFile / ListFiles / SearchFiles
+- 内置工具:Echo / GetCurrentTime / SpawnSubAgent
+- 系统工具:ReadFile / WriteFile / ListFiles / SearchFiles (均自带返回量上限)
 
 **Core 层**:
 - LLMClient (接口) + DeepSeekAdapter (实现,含 trace 钩子)
 - TokenCounter (Token 统计和阈值判断)
 - ContextManager (Turn 管理 + 主题聚类压缩 + 结构化输出)
 - Orchestrator (ReAct 主循环)
+- LocalSubAgentRunner (一次性子 agent:独立上下文,无递归,只回传结论)
 
 **Interface 层**:
 - CLI (REPL / 单发两种模式,斜杠命令 + 每轮可观测回显)
@@ -375,7 +383,7 @@ interface TopicSummary {
 
 **高级特性**:
 - Code 模式(CodeAct 范式)
-- 子 Agent 支持
+- 子 Agent 的 stateful 模式(保留上下文可续传)+ LRU 驻留池
 
 ---
 

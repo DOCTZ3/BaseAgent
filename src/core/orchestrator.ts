@@ -12,6 +12,9 @@ export interface OrchestratorConfig {
   logger: Logger;
   context?: ContextManager;  // 可选的上下文管理器
   modelKey?: 'main' | 'fast' | 'reasoning';  // 指定使用哪个模型配置
+  // trace 标签前缀。默认 'main-loop'，子 agent 传 'subagent:<id>'，
+  // 这样同一份 trace 里能区分调用来源、按子 agent 归因 token 与步数
+  traceLabelPrefix?: string;
 }
 
 export interface AgentTurn {
@@ -59,7 +62,7 @@ export class Orchestrator {
       const response = await this.llmClient.complete({
         messages: currentMessages,
         tools: this.toolRegistry.getAllDescriptions(),
-        traceLabel: `main-loop:step-${step}`,
+        traceLabel: `${this.config.traceLabelPrefix ?? 'main-loop'}:step-${step}`,
       });
 
       // 记录 Token 使用量（如果有 Context）

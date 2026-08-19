@@ -8,6 +8,7 @@ import {
   ToolResult,
   ToolContext,
   ConfirmRequest,
+  SubAgentRunner,
 } from './contract.js';
 import { ToolRegistry } from './registry.js';
 import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard } from '../platform/index.js';
@@ -20,6 +21,9 @@ export interface RunnerConfig {
   onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
   allowDangerousTools: boolean;
   fsSandboxPaths: string[];
+  // 子 agent 执行器(实现在 core 层,由入口注入)。
+  // 未提供 = 子 agent 功能未启用,spawn 工具会返回 ok:false 说明原因
+  subAgentRunner?: SubAgentRunner;
 }
 
 export class ToolRunner {
@@ -105,6 +109,10 @@ export class ToolRunner {
         executors.browser = null; // 占位
       } else if (need === 'http') {
         executors.http = null; // 占位
+      } else if (need === 'agent') {
+        // 子 agent 执行器由入口注入（实现在 core 层，tools 只认接口）。
+        // 未注入时保持 undefined，工具自己返回 ok:false 报「未启用」
+        executors.agent = this.config.subAgentRunner;
       }
     }
 

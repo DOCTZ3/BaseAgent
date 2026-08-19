@@ -8,3 +8,4 @@ export * from './mock-llm-client.js';
 export * from './orchestrator.js';
 export * from './token-counter.js';
 export * from './context.js';
+export * from './sub-agent.js';

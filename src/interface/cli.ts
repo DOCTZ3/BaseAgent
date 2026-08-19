@@ -31,7 +31,12 @@ import {
   type TraceSummary,
 } from '../platform/index.js';
 import { ToolRegistry, ToolRunner } from '../tools/index.js';
-import { ContextManager, DeepSeekAdapter, Orchestrator } from '../core/index.js';
+import {
+  ContextManager,
+  DeepSeekAdapter,
+  Orchestrator,
+  LocalSubAgentRunner,
+} from '../core/index.js';
 import {
   EchoTool,
   GetCurrentTimeTool,
@@ -39,6 +44,7 @@ import {
   ListFilesTool,
   SearchFilesTool,
   WriteFileTool,
+  SpawnSubAgentTool,
 } from '../tools/builtin/index.js';
 
 const HELP = `
@@ -134,25 +140,21 @@ async function main() {
   registry.register(new ListFilesTool());
   registry.register(new SearchFilesTool());
   registry.register(new WriteFileTool());
+  if (config.subAgent.enabled) {
+    registry.register(new SpawnSubAgentTool());
+  }
 
   const abortController = new AbortController();
 
   // 危险工具的真实终端确认（复用主 rl，避免两个 readline 抢 stdin）
   let confirmFn: (prompt: string) => Promise<boolean>;
 
-  const runner = new ToolRunner(registry, {
-    sessionId,
-    logger,
-    signal: abortController.signal,
-    onConfirmRequired: async (req) => {
-      const detail = JSON.stringify(req.args);
-      return confirmFn(`${YELLOW}需要确认${RESET} ${req.toolName} ${dim(detail)}`);
-    },
-    allowDangerousTools: config.security.allowDangerousTools,
-    fsSandboxPaths: config.security.fsSandboxPaths,
-  });
+  const onConfirmRequired = async (req: { toolName: string; args: Record<string, unknown> }) => {
+    const detail = JSON.stringify(req.args);
+    return confirmFn(`${YELLOW}需要确认${RESET} ${req.toolName} ${dim(detail)}`);
+  };
 
-  // ---------- LLM + 上下文 ----------
+  // ---------- LLM ----------
   const llmClient = new DeepSeekAdapter({
     apiKey: modelConfig.apiKey,
     baseURL: modelConfig.baseURL!,
@@ -163,22 +165,48 @@ async function main() {
     logger,
   });
 
+  // 子 agent 的上下文配置与主 agent 同构（sessionId/logger 由 runner 各自填）
+  const contextTuning = {
+    windowSize: config.context.windowSize,
+    compressionThreshold: config.context.compressionThreshold,
+    recentTurnsToKeep: config.context.recentTurnsToKeep,
+    maxTopicsInContext: config.context.maxTopicsInContext,
+    highWaterRatio: config.context.highWaterRatio,
+    compressionMaxTokens: config.context.compressionMaxTokens,
+    modelMaxTokens: modelConfig.maxTokens,
+    compressionClip: config.context.compressionClip,
+    retry: config.retry,
+  };
+
+  // 子 agent 执行器：实现在 core 层，经 ToolRunner 注入到 ctx.executors.agent。
+  // 共享 signal 与 confirm —— 下放任务不放宽安全边界
+  const subAgentRunner = config.subAgent.enabled
+    ? new LocalSubAgentRunner(llmClient, registry, {
+        parentSessionId: sessionId,
+        logger,
+        signal: abortController.signal,
+        onConfirmRequired,
+        allowDangerousTools: config.security.allowDangerousTools,
+        fsSandboxPaths: config.security.fsSandboxPaths,
+        maxSteps: config.subAgent.maxSteps,
+        maxCount: config.subAgent.maxCount,
+        contextConfig: contextTuning,
+      })
+    : undefined;
+
+  const runner = new ToolRunner(registry, {
+    sessionId,
+    logger,
+    signal: abortController.signal,
+    onConfirmRequired,
+    allowDangerousTools: config.security.allowDangerousTools,
+    fsSandboxPaths: config.security.fsSandboxPaths,
+    subAgentRunner,
+  });
+
+  // ---------- 上下文 ----------
   const context = new ContextManager(
-    {
-      sessionId,
-      windowSize: config.context.windowSize,
-      compressionThreshold: config.context.compressionThreshold,
-      recentTurnsToKeep: config.context.recentTurnsToKeep,
-      maxTopicsInContext: config.context.maxTopicsInContext,
-      // 高水位兜底：窗口快满但轮次门槛卡住时，突破门槛强制压缩
-      highWaterRatio: config.context.highWaterRatio,
-      // 压缩用的是同一个主模型，输出预算默认跟随它（避免硬编码值找不到）
-      compressionMaxTokens: config.context.compressionMaxTokens,
-      modelMaxTokens: modelConfig.maxTokens,
-      compressionClip: config.context.compressionClip,
-      retry: config.retry,
-      logger,
-    },
+    { ...contextTuning, sessionId, logger },
     llmClient
   );
   await context.initialize();
@@ -194,7 +222,12 @@ async function main() {
   context.addSystemMessage(
     '你是 BaseAgent，一个可以调用工具完成任务的 AI 助手。' +
     '需要读写文件、查询时间等操作时使用提供的工具，不要臆测工具结果。' +
-    '工具返回错误时，说明原因而不是反复重试同一路径。'
+    '工具返回错误时，说明原因而不是反复重试同一路径。' +
+    (config.subAgent.enabled
+      ? '遇到需要读取大量内容才能得出结论的任务（遍历目录逐个读文件、批量搜索比对），' +
+        '用 spawn_subagent 下放给子 agent，避免原始内容占满当前上下文。' +
+        '一两次工具调用能完成的事直接自己做。'
+      : '')
   );
 
   // ---------- 启动信息 ----------
@@ -211,6 +244,9 @@ async function main() {
   console.log(dim(`  留痕      ${config.trace.enabled ? recorder.traceDir : '已关闭'}`));
   console.log(dim(`  沙箱      ${config.security.fsSandboxPaths.join(', ') || '(空)'}`));
   console.log(dim(`  危险工具  ${config.security.allowDangerousTools ? '已启用(需确认)' : '已禁用'}`));
+  console.log(dim(`  子 agent  ${config.subAgent.enabled
+    ? `已启用,最多 ${config.subAgent.maxCount} 个,各 ${config.subAgent.maxSteps} 步`
+    : '已禁用'}`));
   console.log();
 
   const rl = readline.createInterface({
