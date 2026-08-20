@@ -150,6 +150,27 @@ interface CompletionResponse {
 - Adapter 模式:DeepSeekAdapter / OpenAIAdapter / ...
 - 支持 reasoning (DeepSeek) 和 response_format (JSON 强制)
 
+### Orchestrator (ReAct 主循环)
+
+```typescript
+interface AgentRunResult {
+  answer: string;
+  // complete    正常给出最终回答
+  // max_steps   触达步数上限、由收尾调用产出结论(可能不完整)
+  // no_response 模型既无工具调用也无内容
+  stopReason: 'complete' | 'max_steps' | 'no_response';
+  steps: number;              // 主循环实际步数(收尾调用不计入)
+}
+
+run(initialMessages: Message[]): Promise<AgentRunResult>
+```
+
+**关键设计**:返回对象而非裸字符串 —— 退出路径有三条,字符串只能表达一种
+(`no_response` 以前返回一句写死的话、与真实回答同通道,CLI 会把内部状态当回答打出)。
+用联合类型而非布尔,将来加「用户取消」只需加成员。
+子 agent 必须把 `max_steps` 转成 `SubAgentResult.truncated` 继续上传:截断是嵌套的,
+中间任何一层吞掉信号,主 agent 就会把半成品当定论。
+
 ### ContextManager (上下文管理)
 
 ```typescript
@@ -169,7 +190,7 @@ interface Turn {
 interface TopicSummary {
   id: string;
   title: string;              // 主题名称(如"文件操作")
-  summary: string;            // 高密度摘要(150-200字)
+  summary: string;            // 检索索引(≤60 字):做了什么 + 结果
   turn_ids: number[];         // 关联的 Turn
   keywords: string[];
   timestamp: number;          // 按此排序(时间滑动窗口)
@@ -178,8 +199,8 @@ interface TopicSummary {
 
 **关键设计**:
 - Turn 级别管理(不是消息级别),确保压缩时对话完整
-- 主题聚类压缩:LLM 分析主题 → 生成摘要 → 按时间窗口保留最新 N 个
-- 双重检查:Turn 边界 + Mid-Turn 防超窗口
+- 主题聚类压缩:LLM 分析主题 → 生成索引 → 按时间窗口保留最新 N 个
+- 压缩触发只有一处:标志位由 `recordTokenUsage()` 置真、`preparePrompt()` 消费
 - 归档到 `.claude/sessions/{sessionId}/` (JSONL 格式)
 - **`final_response` 必须由 orchestrator 显式写回**(`addFinalResponse`):它是压缩后重建
   「保留轮次」时答案的唯一来源。不写回则模型看不到自己此前的回答,且保留轮次只剩
@@ -248,7 +269,18 @@ interface TopicSummary {
 - **平台 = PC**:个人开发者唯一能真正操作「外部世界」的地方(手机被系统权限墙挡死)。
 - **工具作为独立一层 + 可插拔**:加能力 = 写新 Tool 塞进注册表,内核零改动。
 - **模型不绑定厂商**:DeepSeek V4 起步,但内核只对话中立的 llm-client,换模型 = 加 adapter。
-- **主循环有刹车**:`maxSteps` 按任务分级(问答 3~5 / 默认 20)+ 重复调用检测 + 反向通道取消,防失控烧钱/死循环。
+- **主循环有刹车,但到顶不硬停**:触达 `maxSteps` 时不抛异常,而是追加
+  「已达上限,请给结论并说明未完成部分」的提示,再调一次**不带 tools** 的 LLM 收尾
+  (不占常规步数;收尾自身失败才抛 `MaxStepsExceededError`)。
+  - 理由:硬停丢掉整轮探索的全部成果。子 agent 尤其贵 —— 跑满 15 步读了十几个文件,
+    抛异常后主 agent 只收到「执行失败」,token 白花且拿不到部分结果
+  - 不传 tools 是协议层约束:仅在提示里说「不要调工具」,模型仍可能返回 tool_calls
+  - 必须要求模型说清**未完成部分**,否则后续补齐是盲的。但刻意**不给重试建议** ——
+    新子 agent 是全新上下文,不知道上一个卡在哪,大概率相似范围重跑撞同一面墙;
+    是否补齐由模型看着缺口自己判断(实测模型据此缩小范围后 2 步完成)
+  - 提示借**最后一条工具结果**注入(`_system_note` 键),而非新加 user 消息 ——
+    `Turn.user_message` 是单数字段,而 `addToolResult` 本就同时写 messages 与 Turn
+  - 重复调用检测:待实现
 - **规划范式起步用纯 ReAct**:orchestrator 单循环即可,planner 留作后续增强,避免过度设计。
 - **两类 LLM 调用分开**:只有 orchestrator 主循环走 ReAct(带工具/刹车);记忆压缩、摘要、分类等是一次性单发调用,直接调 llm-client 的 `complete` 原语,不套循环。
 - **两层权限**:能碰哪类资源 = 工具 `needs` 静态绑死;这一次准不准 = security 运行时按参数判。模型两层都改不了。

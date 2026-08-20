@@ -118,7 +118,11 @@ async function main() {
     },
   ]);
 
-  logger.info('任务结果', { result });
+  logger.info('任务结果', {
+    answer: result.answer,
+    stopReason: result.stopReason,
+    steps: result.steps,
+  });
 
   context.dispose();
 }

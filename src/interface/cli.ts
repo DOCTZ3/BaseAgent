@@ -268,13 +268,23 @@ async function main() {
     const startedAt = Date.now();
 
     try {
-      const result = await orchestrator.run([{ role: 'user', content: input }]);
+      const run = await orchestrator.run([{ role: 'user', content: input }]);
 
       const elapsed = Date.now() - startedAt;
       const statsAfter = context.getStats();
       const newCalls = recorder.since(callsBefore);
 
-      console.log(`\n${bold('回答')}\n${result}\n`);
+      console.log(`\n${bold('回答')}\n${run.answer}\n`);
+
+      // 退出原因单独渲染，不混进回答正文
+      if (run.stopReason === 'max_steps') {
+        console.log(
+          `${YELLOW}注意${RESET} 达到 ${config.execution.maxSteps} 步上限后收尾，` +
+          `结论可能不完整（见回答中自述的未完成部分）`
+        );
+      } else if (run.stopReason === 'no_response') {
+        console.log(`${RED}注意${RESET} 模型未返回有效内容`);
+      }
 
       // 可观测回显：这一轮实际发生了什么
       console.log(dim('─── 本轮 LLM 调用 ───'));

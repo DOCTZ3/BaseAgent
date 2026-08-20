@@ -143,19 +143,32 @@ export class LocalSubAgentRunner implements SubAgentRunner {
         ? `任务：${request.task}\n\n背景信息：\n${request.context}`
         : request.task;
 
-      const answer = await orchestrator.run([{ role: 'user', content: userContent }]);
+      const run = await orchestrator.run([{ role: 'user', content: userContent }]);
 
       const stats = context.getStats();
+      const truncated = run.stopReason === 'max_steps';
+
       logger.info('子 agent 完成', {
         sub_agent_id: subAgentId,
+        stop_reason: run.stopReason,
         turns: stats.turns,
         prompt_tokens: stats.tokens.total_prompt,
         completion_tokens: stats.tokens.total_completion,
       });
 
+      if (truncated) {
+        // 必须往上传：子 agent 的截断是嵌套的，中间任何一层吞掉这个信号，
+        // 主 agent 就会把半成品当定论用
+        logger.warn('子 agent 因步数上限提前收尾', {
+          sub_agent_id: subAgentId,
+          max_steps: this.config.maxSteps,
+        });
+      }
+
       return {
         ok: true,
-        answer,
+        answer: run.answer,
+        truncated,
         stats: {
           subAgentId,
           steps: stats.tokens.turns.length,

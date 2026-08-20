@@ -60,6 +60,18 @@ export class SpawnSubAgentTool implements Tool {
       ok: true,
       data: {
         answer: result.answer,
+        // 截断信号必须透给模型:布尔字段供代码判断,note 供模型读
+        // ——一个布尔值埋在长 JSON 里模型容易扫过去。
+        // note 刻意不含重试建议:新子 agent 是全新上下文,不知道上一个读到哪,
+        // 大概率用相似范围重跑、撞同一面墙。是否补齐由模型看着「未完成部分」自己判断
+        ...(result.truncated
+          ? {
+              truncated: true,
+              note:
+                '该子 agent 因达到步数上限提前收尾,上面的结论可能不完整。' +
+                '请参考它自述的「未完成部分」再决定下一步。',
+            }
+          : {}),
         // 暴露统计让模型(和 trace)知道这次下放的成本
         sub_agent: result.stats,
         remaining_quota: runner.remainingQuota(),

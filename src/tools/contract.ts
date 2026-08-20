@@ -40,6 +40,10 @@ export interface SubAgentResult {
   ok: boolean;
   answer?: string;    // 子 agent 的最终回答(本身即是对整个探索过程的蒸馏)
   error?: string;
+  // 子 agent 因步数上限提前收尾 → 结论可能不完整。
+  // 必须一路传到主 agent:截断是嵌套的,中间任何一层吞掉这个信号,
+  // 主 agent 就会把半成品当定论用
+  truncated?: boolean;
   stats?: {
     subAgentId: string;
     steps: number;         // 实际执行的主循环步数

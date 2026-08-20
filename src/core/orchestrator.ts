@@ -22,6 +22,42 @@ export interface AgentTurn {
   currentStep: number;
 }
 
+/**
+ * run() 的结果
+ *
+ * 用对象而非裸字符串：退出路径有三条，但字符串只能表达一种。
+ * 尤其 no_response 那条以前返回一句写死的话，和真实回答走同一通道，
+ * 调用方无法区分「模型给了答案」和「模型没给答案」。
+ */
+export interface AgentRunResult {
+  answer: string;
+  /**
+   * complete    正常给出最终回答
+   * max_steps   触达步数上限、由收尾调用产出结论（结论可能不完整）
+   * no_response 模型既无工具调用也无内容
+   */
+  stopReason: 'complete' | 'max_steps' | 'no_response';
+  steps: number;   // 主循环实际执行的步数（收尾调用不计入）
+}
+
+/**
+ * 触达上限时塞进最后一条工具结果的提示
+ *
+ * 借工具结果的通道传递，而不是新加一条 user 消息 —— 因为 Turn.user_message
+ * 是单数字段，容不下第二条 user，硬塞要改 Turn 结构和两处重建函数。
+ * 而 addToolResult 本来就同时写 messages 和 Turn，两边自动一致。
+ *
+ * 用 `_system_note` 这个键名标明它不是工具返回的数据；放进对象内部而非
+ * 拼在 JSON 之后，否则会破坏合法性。
+ *
+ * 刻意**不给重试建议**：新子 agent 是全新上下文，不知道上一个读到哪、卡在哪，
+ * 大概率用相似范围重跑、撞同一面墙。要不要补齐由模型看着「未完成部分」自己判断。
+ */
+function buildWrapUpNote(maxSteps: number): string {
+  return `已达到步数上限（${maxSteps} 步），不要再调用工具。` +
+    `请基于现有信息给出结论，并明确说明哪些部分尚未完成。`;
+}
+
 export class Orchestrator {
   constructor(
     private llmClient: LLMClient,
@@ -30,7 +66,7 @@ export class Orchestrator {
     private config: OrchestratorConfig,
   ) {}
 
-  async run(initialMessages: Message[]): Promise<string> {
+  async run(initialMessages: Message[]): Promise<AgentRunResult> {
     const context = this.config.context;
 
     // 如果有 Context 管理器，使用它管理消息
@@ -99,16 +135,27 @@ export class Orchestrator {
           });
         }
 
+        // 本步是否已是最后一步：若是，把「该收尾了」随工具结果一并告知模型。
+        // 写入时就带上，而不是事后回头改历史消息 —— 后者会让 messages 与 Turn 不一致
+        const isLastStep = step >= this.config.maxSteps;
+
         // 依次执行工具(后续可支持并行)
-        for (const toolCall of response.toolCalls) {
+        for (let i = 0; i < response.toolCalls.length; i++) {
+          const toolCall = response.toolCalls[i];
           const result = await this.toolRunner.run({
             id: toolCall.id,
             name: toolCall.name,
             args: toolCall.args,
           });
 
+          // 只挂在最后一个工具结果上，避免同一提示重复 N 遍
+          const isLastResult = i === response.toolCalls.length - 1;
+          const payload = (isLastStep && isLastResult)
+            ? { ...result, _system_note: buildWrapUpNote(this.config.maxSteps) }
+            : result;
+
           // 添加工具结果
-          const resultContent = JSON.stringify(result);
+          const resultContent = JSON.stringify(payload);
           if (context) {
             context.addToolResult(toolCall.id, resultContent);
           } else {
@@ -145,15 +192,86 @@ export class Orchestrator {
           this.config.logger.info('会话统计', stats);
         }
 
-        return response.content;
+        return { answer: response.content, stopReason: 'complete', steps: step };
       }
 
-      // 无工具调用 + 无内容 → 异常
+      // 无工具调用 + 无内容 → 模型无有效响应
+      // 用 stopReason 表达，不再把这句写死的话混进正常回答通道
       this.config.logger.warn('模型未返回内容且无工具调用');
-      return '任务未完成:模型无有效响应';
+      return {
+        answer: '任务未完成:模型无有效响应',
+        stopReason: 'no_response',
+        steps: step,
+      };
     }
 
-    // 到达最大步数
-    throw new MaxStepsExceededError(this.config.maxSteps);
+    // 到达最大步数：不硬停，再给模型一次机会收尾
+    return this.wrapUp(step);
+  }
+
+  /**
+   * 触达步数上限后的收尾调用
+   *
+   * 为什么不直接抛 MaxStepsExceededError：那样会丢掉整轮探索的全部成果。
+   * 子 agent 场景尤其贵 —— 跑满 15 步读了十几个文件，抛异常后主 agent 只收到
+   * 一句「执行失败」，那些 token 白花，且拿不到任何部分结果。
+   *
+   * 关键点：
+   * - **不传 tools**：光在提示里说「不要调用工具」不够硬，模型仍可能返回
+   *   tool_calls 让流程卡住；请求里不带 tools 从协议层杜绝
+   * - **不占常规步数**：在循环外执行，否则会陷入「为了收尾又超限」的死结
+   * - 收尾要求模型说清**未完成的部分** —— 有了缺口描述，后续无论是模型自己补
+   *   还是用户接手，都是有靶子的；没有它，任何重试都是盲的
+   */
+  private async wrapUp(step: number): Promise<AgentRunResult> {
+    const context = this.config.context;
+    const prefix = this.config.traceLabelPrefix ?? 'main-loop';
+
+    this.config.logger.warn('达到步数上限，转入收尾', {
+      max_steps: this.config.maxSteps,
+    });
+
+    try {
+      const currentMessages = context ? await context.preparePrompt() : [];
+
+      const response = await this.llmClient.complete({
+        messages: currentMessages,
+        // 刻意不传 tools
+        traceLabel: `${prefix}:final-wrap`,
+      });
+
+      if (context && response.usage) {
+        context.recordTokenUsage({
+          prompt_tokens: response.usage.prompt_tokens,
+          completion_tokens: response.usage.completion_tokens,
+          prompt_cache_hit_tokens: response.usage.prompt_cache_hit_tokens,
+        });
+      }
+
+      if (!response.content) {
+        // 不传 tools 时协议上不该发生；仍兜底，不再重试
+        this.config.logger.error('收尾调用未返回内容');
+        return {
+          answer: `任务因达到步数上限（${this.config.maxSteps} 步）中止，且未能生成结论。`,
+          stopReason: 'max_steps',
+          steps: step,
+        };
+      }
+
+      if (context) {
+        context.addFinalResponse(response.content, response.reasoning ?? undefined);
+      }
+
+      this.config.logger.info('收尾完成', { steps: step });
+      return { answer: response.content, stopReason: 'max_steps', steps: step };
+
+    } catch (error) {
+      // 收尾本身失败（网络/限流）→ 没有任何可返回的内容，退回抛错。
+      // MaxStepsExceededError 因此保留用途，只是从「必然抛出」变成「极少抛出」
+      this.config.logger.error('收尾调用失败', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw new MaxStepsExceededError(this.config.maxSteps);
+    }
   }
 }
