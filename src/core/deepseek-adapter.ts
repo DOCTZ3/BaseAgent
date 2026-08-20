@@ -143,8 +143,11 @@ export class DeepSeekAdapter implements LLMClient {
         },
       });
 
+      // 关键修复：不透传原始错误消息（会包含网络错误特征如 "ECONNRESET"），
+      // 避免外层 RetryHandler 匹配到并再次重试，导致调用次数相乘（4×4=16）。
+      // 保留错误类型（如 APIConnectionError）方便排查，但消息统一为 "LLM API 调用失败"
       throw new LLMError(
-        error instanceof Error ? error.message : '未知错误',
+        `LLM API 调用失败${error instanceof Error ? ` (${error.name})` : ''}`,
         true
       );
     }
