@@ -103,23 +103,17 @@ interface Tool {
   run(args: T, ctx: ToolContext): Promise<ToolResult>;
 }
 
-interface ToolContext {
-  executors: Record<string, Executor>;  // runner 按 needs 注入
+interface ToolContext {          // runner 组装,是唯一的资源注入点
+  executors: Record<string, Executor>;  // 按 needs 注入(含 agent = 子 agent)
   confirm: (prompt: string) => Promise<boolean>;
   signal: AbortSignal;          // 用户取消
 }
 
-interface ToolResult {
-  ok: boolean;
-  data?: unknown;
-  error?: string;
-}
+interface ToolResult { ok: boolean; data?: unknown; error?: string }
 ```
 
-**关键设计**:
-- 工具通过 `needs` 声明依赖,不直接 import executor
-- `ToolContext` 是唯一的资源注入点
-- 所有错误包装为 `ToolResult{ok:false}`,不炸主循环
+**关键设计**:工具通过 `needs` 声明依赖、不直接 import executor;
+所有错误包装为 `ToolResult{ok:false}`,不炸主循环。
 
 ### LLMClient (Provider 中立接口)
 
@@ -141,12 +135,21 @@ interface CompletionResponse {
   reasoning?: string;           // DeepSeek reasoning_content
   toolCalls: ToolCall[];
   finishReason: string;
-  usage: { prompt_tokens: number; completion_tokens: number; prompt_cache_hit_tokens?: number };
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    prompt_cache_hit_tokens?: number;  // 缓存命中
+    reasoning_tokens?: number;         // 思维链消耗(已含在 completion_tokens 内)
+  };
 }
 ```
 
 **关键设计**:
 - 内核只依赖接口,不依赖具体厂商
+- **用量字段的厂商差异由 adapter 吸收**:缓存命中在 DeepSeek 是顶层
+  `prompt_cache_hit_tokens`、在 OpenAI/中转站是嵌套 `prompt_tokens_details.cached_tokens`,
+  两种都认并兜底为 0(实测中转站格式变过,只读一种会让命中率静默归零)。
+  跨层传 `usage` 整体透传、不逐字段列举 —— 列举会让新增字段被静默丢掉
 - Adapter 模式:DeepSeekAdapter / OpenAIAdapter / ...
 - 支持 reasoning (DeepSeek) 和 response_format (JSON 强制)
 
@@ -201,7 +204,11 @@ interface TopicSummary {
 - Turn 级别管理(不是消息级别),确保压缩时对话完整
 - 主题聚类压缩:LLM 分析主题 → 生成索引 → 按时间窗口保留最新 N 个
 - 压缩触发只有一处:标志位由 `recordTokenUsage()` 置真、`preparePrompt()` 消费
-- 归档到 `.claude/sessions/{sessionId}/` (JSONL 格式)
+- 归档到 `<traceDir>/{sessionId}/archive/`,与 LLM 留痕 `calls/` 并列在同一会话目录下。
+  不放隐藏目录:**模型自己要读它**(压缩后被提示用 `read_file` 回溯早期对话),
+  沙箱若收窄会把它指向读不到的路径;你排查「当时到底聊了什么」也要能直接翻到。
+  注入给模型的路径统一用正斜杠 —— `path.join` 在 Windows 上产出反斜杠,
+  模型把它当 JSON 参数传回时还得转义
 - **`final_response` 必须由 orchestrator 显式写回**(`addFinalResponse`):它是压缩后重建
   「保留轮次」时答案的唯一来源。不写回则模型看不到自己此前的回答,且保留轮次只剩
   提问和工具往返
@@ -242,25 +249,17 @@ interface TopicSummary {
 
 ## 上下文管理策略
 
-| 场景 | 策略 | 阈值 |
+| 场景 | 策略 | 默认阈值 |
 |------|------|------|
-| **长会话历史** | 主题聚类压缩 | 70% 窗口 (700K tokens) |
-| **压缩保留** | 最近 N 轮完整 Turn | 默认 10 轮 |
-| **主题数量** | 时间滑动窗口 | 默认保留 10 个主题 |
-| **文件读取** | 单次截断 | 10K tokens |
-| **网页内容** | 单次截断 | 10K tokens |
-| **DOM 树** | 单次截断 | 20K tokens |
+| **长会话历史** | 主题聚类压缩 | 70% 窗口 |
+| **窗口告急** | 突破轮次门槛强制压缩 | 90% 窗口(高水位) |
+| **压缩保留** | 最近 N 轮完整 Turn | 10 轮 |
+| **主题数量** | 时间滑动窗口 | 10 个 |
+| **工具返回过大** | 由**工具自己**报错并给收窄建议 | 各工具自定 |
 
-**压缩时机**:
-- Turn 边界检查(新 Turn 开始前)
-- Mid-Turn 检查(每次 LLM 调用后实时统计)
-
-**压缩流程**:
-1. 保留最近 N 轮完整 Turn
-2. 旧 Turn → LLM 分析主题 → 按主题聚类
-3. 每个主题生成摘要(TopicSummary)
-4. 按时间排序,保留最新 M 个主题
-5. 摘要插入 system 消息,旧 Turn 归档到磁盘
+**压缩流程**:保留最近 N 轮 → 旧 Turn 交 LLM 分析主题并聚类 → 每主题生成
+检索索引(≤60 字) → 按时间保留最新 M 个 → 索引插入 system 消息、旧 Turn 归档到磁盘。
+触发只有一处:`recordTokenUsage()` 置标志位、`preparePrompt()` 消费(详见设计决策)。
 
 ---
 
