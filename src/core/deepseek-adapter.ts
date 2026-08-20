@@ -100,11 +100,7 @@ export class DeepSeekAdapter implements LLMClient {
         toolCalls,
         finishReason: choice.finish_reason === 'tool_calls' ? 'tool_calls' :
                       choice.finish_reason === 'length' ? 'length' : 'stop',
-        usage: completion.usage ? {
-          prompt_tokens: completion.usage.prompt_tokens,
-          completion_tokens: completion.usage.completion_tokens,
-          prompt_cache_hit_tokens: (completion.usage as any).prompt_cache_hit_tokens
-        } : undefined
+        usage: completion.usage ? this.extractUsage(completion.usage) : undefined
       };
 
       this.config.logger.debug('LLM 响应', {
@@ -152,6 +148,40 @@ export class DeepSeekAdapter implements LLMClient {
         true
       );
     }
+  }
+
+  /**
+   * 提取 token 用量,兼容两种缓存字段格式
+   *
+   * 各家/各网关对「缓存命中」的字段名不统一:
+   * - DeepSeek 官方:顶层 `prompt_cache_hit_tokens`
+   * - OpenAI 标准(多数中转站):嵌套 `prompt_tokens_details.cached_tokens`
+   *
+   * 实测中转站(api.with7.cn)的响应格式变过 —— 早期两个字段都给,后来只给标准字段,
+   * 于是只读 DeepSeek 那个顶层字段会静默拿到 undefined、缓存命中率恒为 0%,
+   * 而后台明明有命中。所以两种都认,取先有值的那个。
+   *
+   * 顺带取出 reasoning_tokens:排查「思维链吃光输出预算导致正文为空」时,
+   * 这个值是关键证据(实测出现过 1535 token 全花在推理上)。
+   *
+   * Provider 差异在 adapter 层吸收,内核的中立格式不受影响。
+   */
+  private extractUsage(usage: OpenAI.Completions.CompletionUsage) {
+    const raw = usage as any;
+
+    const cached =
+      raw.prompt_cache_hit_tokens              // DeepSeek 官方
+      ?? raw.prompt_tokens_details?.cached_tokens;  // OpenAI 标准
+
+    const reasoning = raw.completion_tokens_details?.reasoning_tokens;
+
+    return {
+      prompt_tokens: usage.prompt_tokens,
+      completion_tokens: usage.completion_tokens,
+      // 显式转数字并兜底 0：两种字段都缺时不该让下游拿到 undefined
+      prompt_cache_hit_tokens: typeof cached === 'number' ? cached : 0,
+      ...(typeof reasoning === 'number' ? { reasoning_tokens: reasoning } : {}),
+    };
   }
 
   private convertMessages(messages: LLMRequest['messages']): OpenAI.Chat.ChatCompletionMessageParam[] {

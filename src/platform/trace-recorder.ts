@@ -13,7 +13,9 @@
 // - 写盘失败绝不影响主流程：留痕是辅助手段，不能反过来搞崩被观测的程序
 // - 同步写入。CLI 场景下调用频率低（每次都要等模型），换取「进程崩了也不丢」
 //
-// 落盘位置：traces/<sessionId>/（项目根下的可见目录，方便直接翻）
+// 落盘位置：traces/<sessionId>/calls/（项目根下的可见目录，方便直接翻）
+// 同一会话的对话归档在 traces/<sessionId>/archive/ —— 一个会话的全部产物
+// 集中在同一个会话目录下，两类 index 各在自己的子目录里，不会看错
 //
 // 使用示例：
 //   const recorder = new TraceRecorder({ sessionId, logger });
@@ -62,7 +64,9 @@ export class TraceRecorder {
 
   constructor(private config: TraceRecorderConfig) {
     this.enabled = config.enabled ?? true;
-    this.dir = path.join(config.baseDir ?? 'traces', config.sessionId);
+    // 落在 <baseDir>/<sessionId>/calls/ —— 与同一会话的归档（archive/）并列。
+    // 两者共用会话目录，但各自有 index 文件，分子目录避免混淆
+    this.dir = path.join(config.baseDir ?? 'traces', config.sessionId, 'calls');
   }
 
   /** 传给 Adapter 的 onTrace。绑定 this，可直接作为回调传递 */

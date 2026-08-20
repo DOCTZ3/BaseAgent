@@ -176,6 +176,8 @@ async function main() {
     modelMaxTokens: modelConfig.maxTokens,
     compressionClip: config.context.compressionClip,
     retry: config.retry,
+    // 归档与 LLM 留痕共用会话目录：<dir>/<sessionId>/archive|calls
+    sessionsDir: config.trace.dir,
   };
 
   // 子 agent 执行器：实现在 core 层，经 ToolRunner 注入到 ctx.executors.agent。

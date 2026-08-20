@@ -40,7 +40,12 @@ export interface LLMResponse {
   usage?: {                        // Token 使用量(来自 API)
     prompt_tokens: number;
     completion_tokens: number;
+    // 缓存命中。各家字段名不统一(DeepSeek 顶层 prompt_cache_hit_tokens /
+    // OpenAI 嵌套 prompt_tokens_details.cached_tokens),差异由 adapter 吸收
     prompt_cache_hit_tokens?: number;
+    // 思维链消耗。它计入 completion_tokens,单独取出用于排查
+    // 「推理吃光输出预算导致正文为空」
+    reasoning_tokens?: number;
   };
 }
 

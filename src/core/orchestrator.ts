@@ -102,12 +102,10 @@ export class Orchestrator {
       });
 
       // 记录 Token 使用量（如果有 Context）
+      // 整个 usage 直接透传：逐字段列举时新增字段会被静默丢掉
+      // （缓存命中失效就是这类问题，只是发生在 adapter 那一层）
       if (context && response.usage) {
-        context.recordTokenUsage({
-          prompt_tokens: response.usage.prompt_tokens,
-          completion_tokens: response.usage.completion_tokens,
-          prompt_cache_hit_tokens: response.usage.prompt_cache_hit_tokens
-        });
+        context.recordTokenUsage(response.usage);
       }
 
       // 如果有工具调用
@@ -240,12 +238,9 @@ export class Orchestrator {
         traceLabel: `${prefix}:final-wrap`,
       });
 
+      // 整个 usage 透传，理由同主循环那一处
       if (context && response.usage) {
-        context.recordTokenUsage({
-          prompt_tokens: response.usage.prompt_tokens,
-          completion_tokens: response.usage.completion_tokens,
-          prompt_cache_hit_tokens: response.usage.prompt_cache_hit_tokens,
-        });
+        context.recordTokenUsage(response.usage);
       }
 
       if (!response.content) {

@@ -90,6 +90,10 @@ export interface ContextConfig {
   maxTopicsInContext: number;   // 上下文中最多保留的主题数量（时间滑动窗口）
   logger: Logger;
 
+  // 会话产物根目录（默认 'traces'，与 LLM 留痕共用同一个会话目录）。
+  // 归档实际落在 <sessionsDir>/<sessionId>/archive/
+  sessionsDir?: string;
+
   // 高水位（占窗口比例）。超过它时 recentTurnsToKeep 让位于「不崩」：
   // 突破轮次门槛强制压缩，最少保留 1 轮。默认 0.9。
   // 必须显著高于 compressionThreshold —— 它是兜底，不是常规触发点。
@@ -169,7 +173,17 @@ export class ContextManager {
     private llmClient: LLMClient
   ) {
     this.tokenCounter = new TokenCounter(config.logger);
-    this.archiveDir = path.join('.claude', 'sessions', config.sessionId);
+    // 归档落在 <sessionsDir>/<sessionId>/archive/，与 LLM 留痕（calls/）并列。
+    //
+    // 不放 .claude/：那是隐藏目录，两个理由——
+    // ①**模型自己要读它**（压缩后提示它用 read_file 回溯早期对话），
+    //   沙箱若收窄到某个子目录，模型会被指去一个读不到的路径然后撞墙
+    // ②你排查时要看「当时到底聊了什么」，藏在隐藏目录里翻不到
+    this.archiveDir = path.join(
+      config.sessionsDir ?? 'traces',
+      config.sessionId,
+      'archive'
+    );
 
     this.compressionMaxTokens =
       config.compressionMaxTokens
@@ -491,11 +505,16 @@ export class ContextManager {
     }
 
     // 归档提示
+    //
+    // 路径统一用正斜杠：path.join 在 Windows 上产出反斜杠，而模型要把这个路径
+    // 当参数传回 read_file，反斜杠在 JSON 里还得转义，容易出错。
+    // Node 的 fs 在 Windows 上两种分隔符都接受，所以正斜杠是安全的。
+    const archivePath = this.archiveDir.split(path.sep).join('/');
     messages.push({
       role: 'system',
-      content: `[早期的 ${archivedCount} 轮对话已归档到 ${this.archiveDir}/
-索引文件：${path.join(this.archiveDir, 'index.json')}
-详细内容：${path.join(this.archiveDir, 'turn-XXX.json')}
+      content: `[早期的 ${archivedCount} 轮对话已归档到 ${archivePath}/
+索引文件：${archivePath}/index.json
+详细内容：${archivePath}/turn-XXX.json
 需要回顾早期对话时，可用 read_file 工具查看]`
     });
 
@@ -1069,6 +1088,7 @@ export class ContextManager {
     prompt_tokens: number;
     completion_tokens: number;
     prompt_cache_hit_tokens?: number;
+    reasoning_tokens?: number;
   }) {
     this.tokenCounter.recordUsage(usage);
 
