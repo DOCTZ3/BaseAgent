@@ -62,6 +62,20 @@ export interface AgentConfig {
     allowDangerousTools: boolean;  // 是否启用危险工具
   };
 
+  // CodeAct:Python 沙箱(浏览器能力经此提供,不做独立 BrowserDriver)
+  python: {
+    enabled: boolean;          // 是否注册 execute_python 工具
+    pythonPath: string;        // python 可执行文件(装了 venv 就指向 venv 里那个)
+    workDir: string;           // 代码的 cwd,模型写的相对路径落在这里
+    timeout: number;           // 单次执行超时(ms)
+    maxStdoutBytes: number;    // stdout 上限:防 print 整页 HTML 炸上下文
+    maxStderrBytes: number;    // stderr 上限:traceback 通常不长
+    // chromium 的 user-data-dir。登录态由 chromium 自己读写(SQLite/LevelDB),
+    // 框架不解析内容、只提供路径,经 BROWSER_PROFILE_DIR 注入子进程。
+    // 同时进 fs 工具的 deny 列表:里面的 cookie 等价于活凭证
+    browserProfileDir: string;
+  };
+
   // 重试配置（幂等操作:LLM 调用/结构化输出解析）
   retry: {
     maxRetries: number;          // 最大重试次数(不含首次尝试)
@@ -168,6 +182,23 @@ export const defaultConfig: AgentConfig = {
     fsSandboxPaths: process.env.FS_SANDBOX_PATHS ? process.env.FS_SANDBOX_PATHS.split(',') : [],
     allowDangerousTools: process.env.ALLOW_DANGEROUS_TOOLS === 'true',
   },
+  python: {
+    // 默认关闭:需要先装好 python 环境和依赖库,装好再显式开
+    enabled: process.env.PYTHON_ENABLED === 'true',
+    pythonPath: process.env.PYTHON_PATH || 'python',
+    workDir: process.env.PYTHON_WORK_DIR || 'sandbox',
+    // 比工具默认超时宽:浏览器启动 + 页面加载本身就要几秒
+    timeout: process.env.PYTHON_TIMEOUT ? parseInt(process.env.PYTHON_TIMEOUT) : 120_000,
+    // 50KB ≈ 1.2 万 token。够放几百条提取结果,又拦得住整页 HTML
+    maxStdoutBytes: process.env.PYTHON_MAX_STDOUT_BYTES
+      ? parseInt(process.env.PYTHON_MAX_STDOUT_BYTES)
+      : 50 * 1024,
+    maxStderrBytes: process.env.PYTHON_MAX_STDERR_BYTES
+      ? parseInt(process.env.PYTHON_MAX_STDERR_BYTES)
+      : 8 * 1024,
+    // 不放 workDir 内:那里是模型的工作区,profile 混在里面容易被误删/误读
+    browserProfileDir: process.env.BROWSER_PROFILE_DIR || '.browser-profile',
+  },
   retry: {
     maxRetries: process.env.RETRY_MAX_ATTEMPTS ? parseInt(process.env.RETRY_MAX_ATTEMPTS) : 3,
     baseDelay: process.env.RETRY_BASE_DELAY ? parseInt(process.env.RETRY_BASE_DELAY) : 1000,
@@ -224,6 +255,7 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
       },
     },
     security: { ...defaultConfig.security, ...overrides.security },
+    python: { ...defaultConfig.python, ...overrides.python },
     retry: { ...defaultConfig.retry, ...overrides.retry },
     subAgent: { ...defaultConfig.subAgent, ...overrides.subAgent },
     trace: { ...defaultConfig.trace, ...overrides.trace },

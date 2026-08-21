@@ -13,3 +13,8 @@ test-*.js
 # LLM 调用留痕（本地调试产物，含完整对话内容）
 # 用 traces* 覆盖实验目录（如 traces-compress-test/），避免误提交
 traces*/
+
+# Python 沙箱工作区与浏览器 profile（本地运行产物）
+# profile 里的 cookie 等价于活凭证，绝不能进版本库
+sandbox/
+.browser-profile/

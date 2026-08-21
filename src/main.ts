@@ -10,6 +10,7 @@ import {
   loadConfig,
 } from './platform/index.js';
 import { ToolRegistry, ToolRunner } from './tools/index.js';
+import { PythonExecutor } from './executors/index.js';
 import { ContextManager, DeepSeekAdapter, Orchestrator } from './core/index.js';
 import {
   EchoTool,
@@ -18,7 +19,9 @@ import {
   ListFilesTool,
   SearchFilesTool,
   WriteFileTool,
+  ExecutePythonTool,
 } from './tools/builtin/index.js';
+import path from 'path';
 
 async function main() {
   // ① 加载配置(全部从环境变量读,有默认值兜底)
@@ -53,9 +56,28 @@ async function main() {
   registry.register(new ListFilesTool());
   registry.register(new SearchFilesTool());
   registry.register(new WriteFileTool());
+  if (config.python.enabled) {
+    registry.register(new ExecutePythonTool());
+  }
 
   // ④ 创建 Runner
   const abortController = new AbortController();
+
+  // Python 沙箱(CodeAct 底座)。浏览器能力经此提供,不做独立 BrowserDriver。
+  // profile 用绝对路径:要同时注入子进程和进 fs deny 列表,相对路径两边解析基准不同
+  const browserProfileDir = path.resolve(config.python.browserProfileDir);
+  const pythonExecutor = config.python.enabled
+    ? new PythonExecutor({
+        pythonPath:     config.python.pythonPath,
+        workDir:        path.resolve(config.python.workDir),
+        timeout:        config.python.timeout,
+        maxStdoutBytes: config.python.maxStdoutBytes,
+        maxStderrBytes: config.python.maxStderrBytes,
+        env: { BROWSER_PROFILE_DIR: browserProfileDir },
+        logger,
+      })
+    : undefined;
+
   const runner = new ToolRunner(registry, {
     sessionId: 'session-001',
     logger,
@@ -66,6 +88,9 @@ async function main() {
     },
     allowDangerousTools: config.security.allowDangerousTools,
     fsSandboxPaths:      config.security.fsSandboxPaths,
+    // profile 里的 cookie 等价于活凭证,不能让 read_file 读进上下文并跟着 trace 落盘
+    fsDeniedPaths:       config.python.enabled ? [browserProfileDir] : [],
+    pythonExecutor,
   });
 
   // ⑤ 创建 LLM Client

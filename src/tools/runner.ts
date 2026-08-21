@@ -12,7 +12,7 @@ import {
 } from './contract.js';
 import { ToolRegistry } from './registry.js';
 import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard } from '../platform/index.js';
-import { FsDriver } from '../executors/index.js';
+import { FsDriver, PythonExecutor } from '../executors/index.js';
 
 export interface RunnerConfig {
   sessionId: string;
@@ -21,6 +21,12 @@ export interface RunnerConfig {
   onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
   allowDangerousTools: boolean;
   fsSandboxPaths: string[];
+  // 文件工具够不到的目录(优先于白名单)。浏览器 profile 走这里:
+  // 里面的 cookie 等价于活凭证,被 read_file 读进上下文会跟着 trace 落盘
+  fsDeniedPaths?: string[];
+  // Python 沙箱执行器(CodeAct 底座)。未提供 = 代码执行未启用,
+  // execute_python 会返回 ok:false 说明原因
+  pythonExecutor?: PythonExecutor;
   // 子 agent 执行器(实现在 core 层,由入口注入)。
   // 未提供 = 子 agent 功能未启用,spawn 工具会返回 ok:false 说明原因
   subAgentRunner?: SubAgentRunner;
@@ -33,8 +39,11 @@ export class ToolRunner {
     private registry: ToolRegistry,
     private config: RunnerConfig,
   ) {
-    // 初始化文件系统执行器(带沙箱)
-    const securityGuard = new SecurityGuard(config.fsSandboxPaths);
+    // 初始化文件系统执行器(带沙箱:白名单 + 凭证目录黑名单)
+    const securityGuard = new SecurityGuard(
+      config.fsSandboxPaths,
+      config.fsDeniedPaths ?? [],
+    );
     this.fsDriver = new FsDriver(securityGuard);
   }
 
@@ -105,8 +114,9 @@ export class ToolRunner {
     for (const need of tool.needs) {
       if (need === 'fs') {
         executors.fs = this.fsDriver;
-      } else if (need === 'browser') {
-        executors.browser = null; // 占位
+      } else if (need === 'python') {
+        // 由入口注入。未注入时保持 undefined，工具自己返回 ok:false 报「未启用」
+        executors.python = this.config.pythonExecutor;
       } else if (need === 'http') {
         executors.http = null; // 占位
       } else if (need === 'agent') {

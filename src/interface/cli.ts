@@ -31,6 +31,7 @@ import {
   type TraceSummary,
 } from '../platform/index.js';
 import { ToolRegistry, ToolRunner } from '../tools/index.js';
+import { PythonExecutor } from '../executors/index.js';
 import {
   ContextManager,
   DeepSeekAdapter,
@@ -45,6 +46,7 @@ import {
   SearchFilesTool,
   WriteFileTool,
   SpawnSubAgentTool,
+  ExecutePythonTool,
 } from '../tools/builtin/index.js';
 
 const HELP = `
@@ -140,6 +142,9 @@ async function main() {
   registry.register(new ListFilesTool());
   registry.register(new SearchFilesTool());
   registry.register(new WriteFileTool());
+  if (config.python.enabled) {
+    registry.register(new ExecutePythonTool());
+  }
   if (config.subAgent.enabled) {
     registry.register(new SpawnSubAgentTool());
   }
@@ -196,6 +201,23 @@ async function main() {
       })
     : undefined;
 
+  // ---------- Python 沙箱(CodeAct) ----------
+  // 浏览器能力经此提供：沙箱预装 Playwright，模型自己写代码驱动。
+  // profile 目录用绝对路径：要同时注入子进程和进 fs deny 列表，相对路径两边解析基准不同
+  const browserProfileDir = path.resolve(config.python.browserProfileDir);
+  const pythonExecutor = config.python.enabled
+    ? new PythonExecutor({
+        pythonPath: config.python.pythonPath,
+        workDir: path.resolve(config.python.workDir),
+        timeout: config.python.timeout,
+        maxStdoutBytes: config.python.maxStdoutBytes,
+        maxStderrBytes: config.python.maxStderrBytes,
+        // 模型代码里读 os.environ["BROWSER_PROFILE_DIR"]，不硬编码路径
+        env: { BROWSER_PROFILE_DIR: browserProfileDir },
+        logger,
+      })
+    : undefined;
+
   const runner = new ToolRunner(registry, {
     sessionId,
     logger,
@@ -203,6 +225,9 @@ async function main() {
     onConfirmRequired,
     allowDangerousTools: config.security.allowDangerousTools,
     fsSandboxPaths: config.security.fsSandboxPaths,
+    // profile 里的 cookie 等价于活凭证，不能让 read_file 读进上下文并跟着 trace 落盘
+    fsDeniedPaths: config.python.enabled ? [browserProfileDir] : [],
+    pythonExecutor,
     subAgentRunner,
   });
 
@@ -229,6 +254,22 @@ async function main() {
       ? '遇到需要读取大量内容才能得出结论的任务（遍历目录逐个读文件、批量搜索比对），' +
         '用 spawn_subagent 下放给子 agent，避免原始内容占满当前上下文。' +
         '一两次工具调用能完成的事直接自己做。'
+      : '') +
+    // CodeAct 的核心约定：筛选必须发生在沙箱里。这条不写清楚，模型会把
+    // 整页 HTML / 整个文件 print 出来，一次就烧掉几十万 token
+    (config.python.enabled
+      ? '解析 docx/pdf/excel、抓取网页、数据清洗转换等任务，用 execute_python 写代码完成，' +
+        '不要自己手工推断二进制格式。沙箱已预装 playwright、python-docx、openpyxl、' +
+        'pypdf、pandas、requests、beautifulsoup4。' +
+        '只有 print 出来的内容会回到你的上下文且有体积上限，' +
+        '务必在代码内先提取过滤再打印，绝不要 print 整页 HTML 或整个文件。' +
+        '页面结构未知时先用 page.locator("body").aria_snapshot() 拿语义树,' +
+        '或用 locator(...).count() 数条目,不要 print(page.content())。' +
+        '注意 page.accessibility 在新版 Playwright 已移除。' +
+        '浏览器一律用 launch_persistent_context(os.environ["BROWSER_PROFILE_DIR"])，' +
+        '登录态会自动持久化，不要自己造 profile 路径。' +
+        '需要登录时用 headless=False 打开窗口让用户手动完成，再用 page.wait_for_url 等待，' +
+        '绝不要在代码里填写账号密码。'
       : '')
   );
 
@@ -249,6 +290,12 @@ async function main() {
   console.log(dim(`  子 agent  ${config.subAgent.enabled
     ? `已启用,最多 ${config.subAgent.maxCount} 个,各 ${config.subAgent.maxSteps} 步`
     : '已禁用'}`));
+  console.log(dim(`  代码执行  ${config.python.enabled
+    ? `已启用 ${config.python.pythonPath},cwd=${config.python.workDir},stdout 上限 ${Math.round(config.python.maxStdoutBytes / 1024)}KB`
+    : '已禁用 (PYTHON_ENABLED=true 开启)'}`));
+  if (config.python.enabled) {
+    console.log(dim(`  浏览器    profile=${browserProfileDir} (已加入 fs 拒绝列表)`));
+  }
   console.log();
 
   const rl = readline.createInterface({

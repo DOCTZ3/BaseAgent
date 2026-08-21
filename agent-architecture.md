@@ -51,15 +51,15 @@
 │    · registry      注册表:名册 + 名字→工具 映射            │
 │    · runner        调用管线:校验/权限/日志/重试            │
 │    · builtin\      内置组:时间、计算、记事、查询           │
-│    · browser\      浏览器组(重点扩展):导航/点击/填表/抓取  │
+│    · code\         execute_python:CodeAct 的唯一入口       │
 │    · system\       系统组:文件操作(读/写/列表/搜索)        │
 │    职责:具体能力实现,申明 needs 依赖,runner 注入资源       │
 └───────────────────────────┬──────────────────────────────┘
-                            │ needs: ['fs', 'browser', ...]
+                            │ needs: ['fs', 'python', ...]
 ┌───────────────────────────┴──────────────────────────────┐
 │  executors/  执行器 / 资源层                              │
 │    · fs-driver     文件系统封装,集成 security 白名单       │
-│    · browser-driver  Playwright 包装(导航/DOM/截图)       │
+│    · python-executor  子进程执行代码(⚠️ 无隔离,主环境权限) │
 │    · http-client   HTTP 请求(抓 API / 下载文件)           │
 │    职责:操作真实资源,被 runner 按工具 needs 动态注入       │
 └───────────────────────────┬──────────────────────────────┘
@@ -98,7 +98,7 @@ interface Tool {
   name: string;
   description: string;
   parameters: ZodSchema;        // Zod 校验参数
-  needs: readonly ResourceType[];  // 声明依赖资源 ['fs', 'browser', ...]
+  needs: readonly ResourceType[];  // 声明依赖资源 ['fs', 'python', ...]
   danger: boolean;              // 是否危险操作(写入/删除)
   run(args: T, ctx: ToolContext): Promise<ToolResult>;
 }
@@ -229,7 +229,7 @@ interface TopicSummary {
    }
    ```
    - 工具声明能碰哪类资源
-   - 框架限制:没声明 'browser' 就拿不到 BrowserDriver
+   - 框架限制:没声明 'python' 就拿不到 PythonExecutor
 
 2. **动态层 (SecurityGuard)**:
    ```typescript
@@ -365,6 +365,49 @@ interface TopicSummary {
     `reasoning_content` 回填、`tool_calls` 结构都在转换那一步才成型
   - 失败调用同样留痕:定位 4xx 时请求体比错误消息有用
   - 留痕写盘失败只告警,绝不影响主流程
+- **浏览器是代码里的一个库,不是独立模块层**:不做 BrowserDriver、不做浏览器工具组、
+  不做意图分流。框架只提供 `execute_python` + 环境预装 Playwright,导航/读 DOM/提取
+  全由模型写代码决定。
+  - 理由一(核心):**筛选发生在子进程内,不在上下文里**。`browser_get_dom()` 这类工具会把
+    整页 HTML(常 500KB~2MB)灌进上下文;而 `page.locator('.price').all_inner_texts()`
+    让 HTML 全程留在子进程,只有蒸馏结果回流。这比「工具自限返回量」更根本 ——
+    截断会让模型基于残缺数据推理,提取不会
+  - 理由二:长尾场景无穷(iframe/上传/截图/拦 XHR),逐个做工具做不完;
+    `page.evaluate()` 一条就覆盖了「浏览器能做的一切」
+  - 代价:模型首次访问陌生页面时不知道选择器。靠 prompt 约定解决 ——
+    先 `locator.aria_snapshot()`(语义树,2MB → 5~20KB)或 `locator.count()`
+    渐进收窄,而不是 `print(page.content())`
+  - 因此 `execute_python` 必须对 **stdout 设上限**并在超限时给收窄建议:
+    这是本方案里唯一需要框架兜底的地方(同「工具结果大小由工具自己管」)
+- **⚠️ 已知缺口:`execute_python` 绕开了两层权限模型**:
+  - 代码在子进程里以**当前 OS 用户的全部权限**运行。PythonExecutor 做的是资源管控
+    (超时 / stdout 上限 / 进程树回收),**不是安全边界**
+  - `needs` + SecurityGuard 那套之所以成立,前提是「框架能看懂工具入参」;
+    而这里入参就是一整段任意代码。`FS_SANDBOX_PATHS` 管不住 `open()`,
+    网络也无限制。`danger: true` 只保证调用前弹一次确认,确认之后即全权限
+  - 于是当前存在两个动作空间:`tool_calls` 受两层权限管,Python 只受「用户点过同意」管。
+    这是路线的固有性质,不是实现疏漏 —— 参数检查无法约束图灵完备的输入
+  - 唯一主动收紧的一处:父进程 env **按白名单继承**,不全量透传。
+    `process.env` 里有 `DEEPSEEK_API_KEY`,全量继承则模型一行
+    `print(os.environ['DEEPSEEK_API_KEY'])` 就能把它打进上下文并跟着 trace 落盘。
+    这不构成隔离(代码仍可读 `.env` 文件),只是不把凭证直接递到手里
+  - 真隔离需要进程之外的边界:容器 / 独立低权用户 / seccomp。属于待实现,
+    在那之前 `PYTHON_ENABLED` 默认关闭,开启即代表接受上述范围
+- **登录态靠 chromium 的 user-data-dir 持久化,不靠框架解析**:
+  - 用 `launch_persistent_context(dir)` 而非 `storage_state`:后者只搬 cookie +
+    localStorage(用 IndexedDB 存 token 的站点会漏)且要显式存盘;前者是整个 profile、
+    关闭时自动落盘,少一个「模型忘了存」的失败点
+  - 框架**不生成也不解析** profile 内容,只提供目录路径(经环境变量
+    `BROWSER_PROFILE_DIR` 注入子进程)。目录内容由 chromium 自己读写(SQLite/LevelDB),
+    因此不存在「按站点适配注入格式」的问题 —— cookie 对浏览器就是不透明键值对
+  - 密码不进上下文:登录由用户在 `headless=False` 窗口里手动完成、代码用
+    `wait_for_url` 等待。让模型 `fill('#password', ...)` 会把明文密码写进 trace 和压缩摘要
+  - 故障只在**行为层**判定与修复:查页面上有没有登录按钮 → 失效就删目录重走引导。
+    profile 是缓存不是权威源,不需要理解它为什么坏
+  - profile 目录必须进 SecurityGuard deny 列表:里面的 cookie 等价于活凭证,
+    一个 `read_file` 就能读进上下文并跟着 trace 落盘。这是软边界(沙箱进程本身必须能读写),
+    配合 prompt 约定「只用 `BROWSER_PROFILE_DIR`」+ stdout 上限兜底;
+    硬隔离需把浏览器移进独立容器、Python 经 CDP 连接,留作后续
 
 ---
 
@@ -378,12 +421,15 @@ interface TopicSummary {
 - TraceRecorder (LLM 调用留痕,本地可观测)
 
 **Executors 层**:
-- FsDriver (文件系统,集成 SecurityGuard)
+- FsDriver (文件系统,集成 SecurityGuard 白名单 + 凭证目录黑名单)
+- PythonExecutor (子进程执行代码:超时 / stdout 上限 / env 白名单继承 / 进程树回收)
+  —— ⚠️ 无隔离,见上方「已知缺口」
 
 **Tools 层**:
 - Contract / Registry / Runner (调用管线)
 - 内置工具:Echo / GetCurrentTime / SpawnSubAgent
 - 系统工具:ReadFile / WriteFile / ListFiles / SearchFiles (均自带返回量上限)
+- 代码工具:execute_python (`danger: true`,默认关闭,需 `PYTHON_ENABLED=true`)
 
 **Core 层**:
 - LLMClient (接口) + DeepSeekAdapter (实现,含 trace 钩子)
@@ -398,11 +444,7 @@ interface TopicSummary {
 ### ⏳ 待实现
 
 **Executors 层**:
-- BrowserDriver (Playwright 封装)
 - HttpClient
-
-**Tools 层**:
-- Browser 工具组(导航/点击/填表/抓取)
 
 **Core 层**:
 - Memory 模块(长期记忆)
@@ -413,7 +455,16 @@ interface TopicSummary {
 - GUI (图形界面 - 预留)
 
 **高级特性**:
-- Code 模式(CodeAct 范式)
+- **Code 模式(CodeAct 范式)** —— 目前只完成了执行底座(`execute_python` 仍是
+  ReAct 循环里的一个普通工具,与 `read_file` 平级)。真正的 CodeAct 要把
+  **动作空间本身变成代码**:模型不发 JSON 而发一段代码,现有工具在那段代码里
+  作为函数可调用(`for f in search_files("*.ts"): ...`),循环与条件下沉到代码中,
+  一次 LLM 调用完成整轮遍历而非 N 轮往返。
+  缺的核心机制是**工具桥** —— 子进程内的 Python 目前没有任何回调 TS 侧的通道
+- 代码执行的真隔离(容器 / 独立低权用户 / seccomp)—— 见上方「已知缺口」,
+  在此之前 `PYTHON_ENABLED` 默认关闭
+- 环境预装 Playwright + 持久 profile 登录引导(依赖手工装库,尚未验证)
+- 浏览器常驻实例(CDP 连接,跨轮次保持页面停留位置)
 - 子 Agent 的 stateful 模式(保留上下文可续传)+ LRU 驻留池
 
 ---
@@ -424,16 +475,20 @@ interface TopicSummary {
 |------|------|
 | 语言 | TypeScript (ES modules) |
 | LLM | DeepSeek V4 (1M context) |
-| 浏览器自动化 | Playwright |
+| 浏览器自动化 | Playwright(装在 Python 环境内,非 TS 侧依赖) |
+| 代码执行 | Python 子进程(⚠️ 无隔离,主环境权限) |
 | 持久化 | SQLite |
 | 参数校验 | Zod |
-| 测试 | 手写集成测试(`test-*.js`,仅本地,不入库) |
+| 测试 | Vitest 单元测试(`src/**/*.test.ts`)+ 手写集成测试 |
 | 日志 | 自研 ConsoleLogger |
 
 ---
 
 ## 下一步
 
-1. 实现 BrowserDriver + 浏览器工具组
-2. Memory 模块(长期记忆)
-3. Planner 模块(多步任务拆解)
+1. 装 Playwright + 依赖库,验证浏览器路径(持久 profile 登录引导实际能否跑通)
+2. 代码执行的隔离边界(容器 / 独立低权用户)—— 解掉「已知缺口」那条
+3. CodeAct 的工具桥:让子进程内的 Python 能回调 TS 侧工具,
+   动作空间才真正变成代码
+4. Memory 模块(长期记忆)
+5. Planner 模块(多步任务拆解)

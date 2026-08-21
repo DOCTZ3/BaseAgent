@@ -6,7 +6,11 @@ import { z } from 'zod';
 import { Logger } from '../platform/index.js';
 
 // 工具可访问资源类型
-export type ResourceType = 'fs' | 'browser' | 'http' | 'agent';
+//
+// 没有 'browser':浏览器不是独立资源层,而是 Python 沙箱里预装的一个库
+// (Playwright)。模型经 execute_python 自行驱动,见架构文档
+// 「浏览器是沙箱里的一个库,不是独立模块层」。
+export type ResourceType = 'fs' | 'python' | 'http' | 'agent';
 
 // 工具上下文:runner 组装、传给工具的"工具箱"
 export interface ToolContext {
@@ -15,8 +19,8 @@ export interface ToolContext {
   signal: AbortSignal;
   confirm(request: ConfirmRequest): Promise<boolean>;
   executors: {
-    fs?: unknown;      // 文件系统执行器(后续实现)
-    browser?: unknown; // 浏览器执行器(后续实现)
+    fs?: unknown;      // 文件系统执行器
+    python?: unknown;  // Python 沙箱执行器(CodeAct 的执行底座)
     http?: unknown;    // HTTP 客户端(后续实现)
     agent?: SubAgentRunner;  // 子 agent 执行器(实现在 core 层,见下方接口注释)
   };
