@@ -62,6 +62,14 @@ export interface AgentConfig {
     allowDangerousTools: boolean;  // 是否启用危险工具
   };
 
+  // 多模态:图片输入
+  vision: {
+    // 是否注册 view_image 工具。
+    // 必须与模型能力匹配:非视觉模型收到图片会返回 400
+    // ("This model does not support image")
+    enabled: boolean;
+  };
+
   // CodeAct:Python 沙箱(浏览器能力经此提供,不做独立 BrowserDriver)
   python: {
     enabled: boolean;          // 是否注册 execute_python 工具
@@ -182,6 +190,11 @@ export const defaultConfig: AgentConfig = {
     fsSandboxPaths: process.env.FS_SANDBOX_PATHS ? process.env.FS_SANDBOX_PATHS.split(',') : [],
     allowDangerousTools: process.env.ALLOW_DANGEROUS_TOOLS === 'true',
   },
+  vision: {
+    // 默认关闭:开了但模型不支持图片,调用会 400。
+    // 换上 deepseek-v4-flash-vision-exp 这类视觉模型后再显式开
+    enabled: process.env.VISION_ENABLED === 'true',
+  },
   python: {
     // 默认关闭:需要先装好 python 环境和依赖库,装好再显式开
     enabled: process.env.PYTHON_ENABLED === 'true',
@@ -255,6 +268,7 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
       },
     },
     security: { ...defaultConfig.security, ...overrides.security },
+    vision: { ...defaultConfig.vision, ...overrides.vision },
     python: { ...defaultConfig.python, ...overrides.python },
     retry: { ...defaultConfig.retry, ...overrides.retry },
     subAgent: { ...defaultConfig.subAgent, ...overrides.subAgent },

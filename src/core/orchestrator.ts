@@ -2,8 +2,8 @@
 // Core 层:主循环 Orchestrator(集成 Context 管理)
 // ============================================
 
-import { LLMClient, Message } from './llm-client.js';
-import { ToolRunner, ToolRegistry } from '../tools/index.js';
+import { LLMClient, Message, ContentPart } from './llm-client.js';
+import { ToolRunner, ToolRegistry, type ImageAttachment } from '../tools/index.js';
 import { Logger, MaxStepsExceededError } from '../platform/index.js';
 import { ContextManager } from './context.js';
 
@@ -43,9 +43,10 @@ export interface AgentRunResult {
 /**
  * 触达上限时塞进最后一条工具结果的提示
  *
- * 借工具结果的通道传递，而不是新加一条 user 消息 —— 因为 Turn.user_message
- * 是单数字段，容不下第二条 user，硬塞要改 Turn 结构和两处重建函数。
- * 而 addToolResult 本来就同时写 messages 和 Turn，两边自动一致。
+ * 借工具结果的通道传递，而不是新加一条 user 消息 —— 这样它天然落在
+ * assistant/tool 的配对之内，不必关心「插在哪里才合法」。
+ * （Turn 改平铺存储后，新加 user 消息也不再是障碍，可走 addObservation()；
+ * 但借工具结果通道更省一条消息。）
  *
  * 用 `_system_note` 这个键名标明它不是工具返回的数据；放进对象内部而非
  * 拼在 JSON 之后，否则会破坏合法性。
@@ -84,6 +85,9 @@ export class Orchestrator {
 
     const messages = context ? [] : [...initialMessages];  // Context 模式下不用本地数组
     let step = 0;
+
+    // 本步工具产出的图片，攒到全部 tool 响应写完后再注入（见下方注入处注释）
+    const pendingAttachments: ImageAttachment[] = [];
 
     this.config.logger.info('开始主循环', { maxSteps: this.config.maxSteps });
 
@@ -152,8 +156,14 @@ export class Orchestrator {
             ? { ...result, _system_note: buildWrapUpNote(this.config.maxSteps) }
             : result;
 
+          // 附件不进 tool 消息：OpenAI 兼容接口的 role:'tool' content 只接受字符串，
+          // 图片块只允许出现在 user 消息里。剥出来单独注入（见下方）
+          const { attachments, ...rest } = payload as typeof payload & {
+            attachments?: ImageAttachment[];
+          };
+
           // 添加工具结果
-          const resultContent = JSON.stringify(payload);
+          const resultContent = JSON.stringify(rest);
           if (context) {
             context.addToolResult(toolCall.id, resultContent);
           } else {
@@ -163,6 +173,47 @@ export class Orchestrator {
               content: resultContent,
             });
           }
+
+          // 图片以 user 消息承载。必须排在全部 tool 消息之后 ——
+          // assistant 声明 N 个 tool_call 后，API 要求紧跟 N 条 tool 响应，
+          // 中间插入 user 会让序列非法并直接 400
+          if (attachments?.length) {
+            pendingAttachments.push(...attachments);
+          }
+        }
+
+        // 所有 tool 响应写完后再注入图片，此时序列已完整
+        if (pendingAttachments.length > 0) {
+          const parts: ContentPart[] = [
+            {
+              type: 'text',
+              text: `以下是工具返回的图片（${pendingAttachments
+                .map(a => a.label)
+                .join('、')}）：`,
+            },
+            ...pendingAttachments.map(a => ({
+              type: 'image' as const,
+              data: a.data,
+              mimeType: a.mimeType,
+              detail: a.detail,
+              label: a.label,
+              width: a.width,
+              height: a.height,
+            })),
+          ];
+
+          this.config.logger.info('注入图片附件', {
+            count: pendingAttachments.length,
+            labels: pendingAttachments.map(a => a.label),
+          });
+
+          if (context) {
+            context.addObservation(parts);
+          } else {
+            messages.push({ role: 'user', content: parts });
+          }
+
+          pendingAttachments.length = 0;
         }
 
         // 继续循环,把工具结果喂回模型

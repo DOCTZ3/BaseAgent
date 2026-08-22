@@ -109,7 +109,14 @@ interface ToolContext {          // runner 组装,是唯一的资源注入点
   signal: AbortSignal;          // 用户取消
 }
 
-interface ToolResult { ok: boolean; data?: unknown; error?: string }
+interface ToolResult {
+  ok: boolean;
+  data?: unknown;
+  error?: string;
+  // 需要让模型「看见」的二进制产物(图片)。由 orchestrator 注入成 user 消息,
+  // 不能塞进 data —— tool 消息的 content 只接受字符串
+  attachments?: ImageAttachment[];
+}
 ```
 
 **关键设计**:工具通过 `needs` 声明依赖、不直接 import executor;
@@ -129,6 +136,19 @@ interface CompletionRequest {
   tools?: ToolSchema[];         // Function calling
   responseFormat?: 'text' | 'json_object';  // 结构化输出(中立表达)
 }
+
+// 多模态内容块(中立表达,不含厂商结构)
+type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string;
+      detail?: 'low' | 'original'; label?: string };
+
+// 图片只允许出现在 user 消息 —— 由类型系统表达,不靠运行时检查
+type Message =
+  | { role: 'system';    content: string }
+  | { role: 'user';      content: string | ContentPart[] }
+  | { role: 'assistant'; content: string; reasoning?: string; toolCalls?: ToolCall[] }
+  | { role: 'tool';      toolCallId: string; content: string };
 
 interface CompletionResponse {
   content: string | null;
@@ -152,6 +172,11 @@ interface CompletionResponse {
   跨层传 `usage` 整体透传、不逐字段列举 —— 列举会让新增字段被静默丢掉
 - Adapter 模式:DeepSeekAdapter / OpenAIAdapter / ...
 - 支持 reasoning (DeepSeek) 和 response_format (JSON 强制)
+- **图片用中立块表达,不照抄线格式**:内核只说「有一张图,什么类型,数据是什么」,
+  `image_url: { url: 'data:...' }` 只出现在 adapter 里。
+  照抄 OpenAI 结构会让厂商细节焊死在 `Message` 上,换 Claude
+  (`source: { type:'base64', media_type, data }`)时要改的地方遍布全项目。
+  base64 存裸数据、`data:` 前缀由 adapter 拼,同理
 
 ### Orchestrator (ReAct 主循环)
 
@@ -177,18 +202,16 @@ run(initialMessages: Message[]): Promise<AgentRunResult>
 ### ContextManager (上下文管理)
 
 ```typescript
+// 按对话顺序**平铺**存储,不按 assistant_iterations 分组
 interface Turn {
   turn_id: number;
-  user_message: Message;
-  // 一次迭代 = 一次 LLM 响应。模型可能并行返回多个 tool_call,必须全部记录
-  assistant_iterations: Array<{
-    reasoning?: string;
-    tool_calls?: ToolCall[];
-    tool_results?: ToolResult[];
-  }>;
-  final_response?: Message;
+  messages: Message[];   // [0] 必为用户提问;中间任意;末尾可能是最终回答
   timestamp: number;
 }
+
+// 取值靠位置约定,不靠专门字段
+turnUserMessage(turn)    // messages[0]
+turnFinalResponse(turn)  // 末尾不带 tool_calls 的 assistant
 
 interface TopicSummary {
   id: string;
@@ -202,6 +225,17 @@ interface TopicSummary {
 
 **关键设计**:
 - Turn 级别管理(不是消息级别),确保压缩时对话完整
+- **平铺存储,因为分组结构是「有损」的**:只有被显式建模的字段才能重建回来,
+  漏建模 = 静默丢数据。实际踩到两次:①`addAssistantMessage` 没存 `content`,
+  重建时硬写 `''`,模型调工具时同时说的话在压缩后全部消失;②工具产出的图片
+  要另起一条 user 消息承载,而旧结构 `user_message` 是单数字段装不下,
+  于是 Mid-Turn 压缩时图片被丢弃 —— 但 tool 响应还写着「图片已附加」,
+  模型会基于不存在的观察作答。
+  平铺后重建就是 `[...turn.messages]`,**没有重建逻辑就没有重建 bug**,
+  将来加视频/音频也不必再动 Turn 结构
+- **顺序合法性由写入时保证,不靠重建时拼对**:`add*` 方法按调用顺序 append,
+  重建只是摊平。工具观察经 `addObservation()` 写入(形式上是 user 消息但
+  不触发 `finalizeTurn`,否则一轮会被劈成两半)
 - 主题聚类压缩:LLM 分析主题 → 生成索引 → 按时间窗口保留最新 N 个
 - 压缩触发只有一处:标志位由 `recordTokenUsage()` 置真、`preparePrompt()` 消费
 - 归档到 `<traceDir>/{sessionId}/archive/`,与 LLM 留痕 `calls/` 并列在同一会话目录下。
@@ -212,9 +246,15 @@ interface TopicSummary {
 - **`final_response` 必须由 orchestrator 显式写回**(`addFinalResponse`):它是压缩后重建
   「保留轮次」时答案的唯一来源。不写回则模型看不到自己此前的回答,且保留轮次只剩
   提问和工具往返
-- **并行 tool_call 必须完整记录**:`Turn` 用复数 `tool_calls`/`tool_results`。只存第一个
-  会让压缩后重建出「assistant 声明 N 个 tool_call、却只有 1 条 tool 响应」的非法序列,
-  API 直接 400。消息结构校验因此逐个核对 `tool_call_id`,而不是只看「下一条是不是 tool」
+- **并行 tool_call 的配对不能断**:assistant 声明 N 个 tool_call 后,必须紧跟 N 条
+  tool 响应,中间插入任何消息(包括工具观察那条 user)都会让序列非法并 400。
+  平铺存储天然满足 —— 存的就是已经合法的顺序;要守的纪律落在 orchestrator:
+  `addObservation()` 必须在该轮**全部** `addToolResult()` 之后调用。
+  消息结构校验逐个核对 `tool_call_id`,而不是只看「下一条是不是 tool」
+- **压缩渲染必须区分「用户提问」与「工具观察」**:平铺后两者都是 `role:'user'`,
+  靠位置区分(`messages[0]` 是提问,之后的是观察)。混为一谈会让压缩模型把截图
+  写成「用户说过的话」—— 即下方「压缩注入假事实」那条。
+  工具结果按 `tool_call_id` 配对标注工具名,不按下标 —— 并行乱序返回时下标会错位
 
 ---
 
@@ -278,7 +318,9 @@ interface TopicSummary {
     新子 agent 是全新上下文,不知道上一个卡在哪,大概率相似范围重跑撞同一面墙;
     是否补齐由模型看着缺口自己判断(实测模型据此缩小范围后 2 步完成)
   - 提示借**最后一条工具结果**注入(`_system_note` 键),而非新加 user 消息 ——
-    `Turn.user_message` 是单数字段,而 `addToolResult` 本就同时写 messages 与 Turn
+    这样它天然落在 assistant/tool 的配对之内,不必关心「插在哪里才合法」
+    (平铺存储后新加 user 消息也不再是障碍,可经 `addObservation()` 走,
+    但借工具结果通道更省一条消息)
   - 重复调用检测:待实现
 - **规划范式起步用纯 ReAct**:orchestrator 单循环即可,planner 留作后续增强,避免过度设计。
 - **两类 LLM 调用分开**:只有 orchestrator 主循环走 ReAct(带工具/刹车);记忆压缩、摘要、分类等是一次性单发调用,直接调 llm-client 的 `complete` 原语,不套循环。
@@ -288,10 +330,10 @@ interface TopicSummary {
 - **所有报错回流 loop**:参数不合法/权限拒绝/工具抛异常一律包成 `ToolResult{ok:false}` 返回,永不炸主循环。
 - **存储格式 JSONL**:对话历史/记忆序列化用 JSONL(易追加/流式读/调试),配合 SQLite 做索引和按 session_id 查询。
 - **Context 压缩采用 Turn 级别管理**:
-  - 一个 Turn = user_message + assistant_iterations + final_response,避免压缩不完整对话
+  - 一个 Turn = 用户提问起、到最终回答止的完整消息序列(按顺序平铺存储),
+    避免压缩不完整对话
   - 主题聚类压缩作为唯一模式(已删除线性压缩)
   - 时间滑动窗口(按 timestamp 排序,不是 LRU)
-  - 双重检查:Turn 边界 + Mid-Turn 防超窗口
 - **主题窗口机制**:
   - 按时间排序保留最新 N 个主题(不是 LRU)
   - 理由:对话的时间局部性 >> 访问局部性,用户很少跳回旧主题
@@ -408,6 +450,31 @@ interface TopicSummary {
     一个 `read_file` 就能读进上下文并跟着 trace 落盘。这是软边界(沙箱进程本身必须能读写),
     配合 prompt 约定「只用 `BROWSER_PROFILE_DIR`」+ stdout 上限兜底;
     硬隔离需把浏览器移进独立容器、Python 经 CDP 连接,留作后续
+- **图片是模型「要求看图」的带内信道,不是输入侧的旁路**:
+  模型的输出只有文本和 tool_calls,改不了请求体,所以它无法自己把图片塞进上下文。
+  于是流程是「模型调 `view_image` → 框架读盘编码 → **下一轮**注入成 user 消息」,
+  模型全程不需要知道 wire 格式,它只是「调了个工具,然后就看见了」。
+  - 图片走 `ToolResult.attachments` 而非 `data`:OpenAI 兼容接口的 `role:'tool'`
+    消息 content 只接受字符串,图片块只允许出现在 user 消息里
+    (DeepSeek 对 system/assistant 带图直接返回 400)
+  - 注入时机必须在**全部 tool 响应写完之后**:assistant 声明 N 个 tool_call 后
+    API 要求紧跟 N 条 tool 响应,中间插一条 user 会让序列非法并 400
+  - **图片作为「工具观察」进入 `Turn.messages`,随对话保留**:经 `addObservation()`
+    写入,压缩后由 `flattenTurns` 原样重建。
+    代价是历史截图每步重发 —— 但 append-only 保住了 KV cache 前缀(历史 token 走
+    缓存价),而为省这点 token 去改上下文中间的内容反而会破坏前缀匹配。
+    真的累积过多时由已有的压缩机制归档老轮次,**不做滑动窗口**。
+    对应的 prompt 约定也随之改变:不是「看到关键信息就写成文字」(那是图片会消失
+    时的补救),而是「旧图只反映截图当时的状态,页面变了要重新截」
+  - **截图是便宜通道,不该劝模型少用**:每张图 ≤384 token(服务端先缩放,
+    2000×2000 与 5000×5000 消耗相同),而同一页面的 `aria_snapshot` 文本
+    往往要 1000~3000 token。token 估算因此按上限计,**不能按 base64 字符数算** ——
+    一张 1MB 截图的 base64 有 130 万字符,按字符算会让压缩阈值判断彻底失真
+  - trace 落盘前把 data URL 负载换成 `<stripped 1.2MB>`:不剥则单个
+    `call-NNN.json` 就有几 MB,trace 是为了「能翻」,翻不动就失去意义
+  - 格式按**文件内容**(magic bytes)判断而非扩展名 —— DeepSeek 也是按内容判的,
+    改名成 .png 的 bmp 会在服务端 400。超配额(单边 >8192px / >32MiB)时
+    返回 `ok:false` + 可直接照抄的 PIL 缩放代码,不引入图像库
 
 ---
 
@@ -430,6 +497,7 @@ interface TopicSummary {
 - 内置工具:Echo / GetCurrentTime / SpawnSubAgent
 - 系统工具:ReadFile / WriteFile / ListFiles / SearchFiles (均自带返回量上限)
 - 代码工具:execute_python (`danger: true`,默认关闭,需 `PYTHON_ENABLED=true`)
+- 视觉工具:view_image (默认关闭,需 `VISION_ENABLED=true` + 视觉模型)
 
 **Core 层**:
 - LLMClient (接口) + DeepSeekAdapter (实现,含 trace 钩子)
@@ -463,8 +531,9 @@ interface TopicSummary {
   缺的核心机制是**工具桥** —— 子进程内的 Python 目前没有任何回调 TS 侧的通道
 - 代码执行的真隔离(容器 / 独立低权用户 / seccomp)—— 见上方「已知缺口」,
   在此之前 `PYTHON_ENABLED` 默认关闭
-- 环境预装 Playwright + 持久 profile 登录引导(依赖手工装库,尚未验证)
-- 浏览器常驻实例(CDP 连接,跨轮次保持页面停留位置)
+- 浏览器常驻实例(CDP 连接,跨轮次保持页面停留位置)—— 当前每轮
+  `with sync_playwright()` 结束即关闭浏览器,所以「上一轮打开的页面下一轮接着点」
+  做不到。`launch_persistent_context` 只保住登录态,保不住页面停留位置
 - 子 Agent 的 stateful 模式(保留上下文可续传)+ LRU 驻留池
 
 ---
@@ -486,7 +555,7 @@ interface TopicSummary {
 
 ## 下一步
 
-1. 装 Playwright + 依赖库,验证浏览器路径(持久 profile 登录引导实际能否跑通)
+1. 浏览器常驻实例(CDP):让「上一轮打开的页面,下一轮接着操作」成为可能
 2. 代码执行的隔离边界(容器 / 独立低权用户)—— 解掉「已知缺口」那条
 3. CodeAct 的工具桥:让子进程内的 Python 能回调 TS 侧工具,
    动作空间才真正变成代码

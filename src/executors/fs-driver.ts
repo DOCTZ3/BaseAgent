@@ -20,6 +20,17 @@ export class FsDriver {
   }
 
   /**
+   * 读取文件原始字节
+   *
+   * 图片等二进制文件不能走 readFile 的 utf-8 解码 —— 那会把字节流破坏成
+   * 替换字符，base64 编码出来的东西服务端根本认不出格式。
+   */
+  async readFileBytes(filePath: string): Promise<Buffer> {
+    this.securityGuard.assertFsAccess(filePath);
+    return await fs.readFile(filePath);
+  }
+
+  /**
    * 列出目录内容
    */
   async listDirectory(dirPath: string): Promise<string[]> {

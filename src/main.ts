@@ -20,6 +20,7 @@ import {
   SearchFilesTool,
   WriteFileTool,
   ExecutePythonTool,
+  ViewImageTool,
 } from './tools/builtin/index.js';
 import path from 'path';
 
@@ -58,6 +59,9 @@ async function main() {
   registry.register(new WriteFileTool());
   if (config.python.enabled) {
     registry.register(new ExecutePythonTool());
+  }
+  if (config.vision.enabled) {
+    registry.register(new ViewImageTool());
   }
 
   // ④ 创建 Runner

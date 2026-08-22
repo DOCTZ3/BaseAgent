@@ -3,7 +3,7 @@
 // ============================================
 
 import OpenAI from 'openai';
-import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage, TraceSink } from './llm-client.js';
+import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage, TraceSink, ContentPart } from './llm-client.js';
 import { Logger, LLMError, RetryHandler, RetryConfig } from '../platform/index.js';
 
 export interface DeepSeekConfig {
@@ -187,12 +187,41 @@ export class DeepSeekAdapter implements LLMClient {
     };
   }
 
+  /**
+   * 中立内容块 → OpenAI 线格式
+   *
+   * 这是项目里唯一知道 `image_url: { url: 'data:...' }` 长什么样的地方。
+   * 内核用的中立格式（{type:'image', data, mimeType}）不带厂商结构，
+   * 换 Claude 时只改这个方法。
+   */
+  private convertParts(parts: ContentPart[]): OpenAI.Chat.ChatCompletionContentPart[] {
+    return parts.map(part => {
+      if (part.type === 'text') {
+        return { type: 'text' as const, text: part.text };
+      }
+
+      return {
+        type: 'image_url' as const,
+        image_url: {
+          // base64 存的是裸数据，data: 前缀在这里拼 —— 存裸数据才能换厂商
+          url: `data:${part.mimeType};base64,${part.data}`,
+          ...(part.detail ? { detail: part.detail as 'low' | 'high' | 'auto' } : {}),
+        },
+      };
+    });
+  }
+
   private convertMessages(messages: LLMRequest['messages']): OpenAI.Chat.ChatCompletionMessageParam[] {
     return messages.map(msg => {
       if (msg.role === 'system') {
         return { role: 'system', content: msg.content };
       } else if (msg.role === 'user') {
-        return { role: 'user', content: msg.content };
+        // 纯文本走原路：绝大多数消息是这种，不要无谓地包成单元素数组
+        // （包了会让 prompt cache 的 key 变化，白丢缓存命中）
+        if (typeof msg.content === 'string') {
+          return { role: 'user', content: msg.content };
+        }
+        return { role: 'user', content: this.convertParts(msg.content) };
       } else if (msg.role === 'assistant') {
         // 有工具调用时，content 必须是 null 或不存在（不能是空字符串）
         if (msg.toolCalls && msg.toolCalls.length > 0) {

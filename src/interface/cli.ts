@@ -37,6 +37,7 @@ import {
   DeepSeekAdapter,
   Orchestrator,
   LocalSubAgentRunner,
+  messageToText,
 } from '../core/index.js';
 import {
   EchoTool,
@@ -47,6 +48,7 @@ import {
   WriteFileTool,
   SpawnSubAgentTool,
   ExecutePythonTool,
+  ViewImageTool,
 } from '../tools/builtin/index.js';
 
 const HELP = `
@@ -144,6 +146,9 @@ async function main() {
   registry.register(new WriteFileTool());
   if (config.python.enabled) {
     registry.register(new ExecutePythonTool());
+  }
+  if (config.vision.enabled) {
+    registry.register(new ViewImageTool());
   }
   if (config.subAgent.enabled) {
     registry.register(new SpawnSubAgentTool());
@@ -270,6 +275,16 @@ async function main() {
         '登录态会自动持久化，不要自己造 profile 路径。' +
         '需要登录时用 headless=False 打开窗口让用户手动完成，再用 page.wait_for_url 等待，' +
         '绝不要在代码里填写账号密码。'
+      : '') +
+    // 截图其实是便宜通道：单图 ≤384 token，而同一页面的 aria_snapshot 文本
+    // 往往要 1000~3000 token。所以不劝模型少截图
+    (config.vision.enabled
+      ? '你可以看图:用 view_image 查看本地图片(截图、图表、扫描件),' +
+        '调用后图片会出现在你的下一轮上下文里。' +
+        '页面渲染是否正常、元素有没有被遮挡、验证码内容这类问题,' +
+        '截图后 view_image 比读 DOM 更直接。' +
+        '图片会随对话保留,但它反映的是**当时**的页面状态;' +
+        '页面变化后请重新截图,不要依据旧图判断当前状态。'
       : '')
   );
 
@@ -293,6 +308,9 @@ async function main() {
   console.log(dim(`  代码执行  ${config.python.enabled
     ? `已启用 ${config.python.pythonPath},cwd=${config.python.workDir},stdout 上限 ${Math.round(config.python.maxStdoutBytes / 1024)}KB`
     : '已禁用 (PYTHON_ENABLED=true 开启)'}`));
+  console.log(dim(`  图片输入  ${config.vision.enabled
+    ? `已启用 view_image (每图 ≤384 token)`
+    : '已禁用 (VISION_ENABLED=true 开启,需视觉模型)'}`));
   if (config.python.enabled) {
     console.log(dim(`  浏览器    profile=${browserProfileDir} (已加入 fs 拒绝列表)`));
   }
@@ -435,7 +453,8 @@ async function main() {
         const tc = m.role === 'assistant' && m.toolCalls?.length
           ? ` ${CYAN}[tool_calls: ${m.toolCalls.map(t => t.name).join(', ')}]${RESET}`
           : '';
-        const preview = (m.content ?? '').replace(/\s+/g, ' ').slice(0, 70);
+        // 图片折成 [图片 xxx] 占位：base64 直接打出来会糊满整个终端
+        const preview = messageToText(m.content ?? '').replace(/\s+/g, ' ').slice(0, 70);
         console.log(`  ${String(i).padStart(3)} ${m.role.padEnd(9)}${tc} ${dim(preview)}`);
       });
       console.log();

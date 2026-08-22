@@ -59,15 +59,51 @@ export class TokenCounter {
   }
 
   /**
-   * 预估消息列表的 token 数
+   * 预估单张图片的 token 数
+   *
+   * DeepSeek 在推理前会按长宽比缩放：小于约 384×384 的放大，更大的缩到
+   * 约 800×800 等效像素。因此**每张图存在 384 token 的上限** ——
+   * 2000×2000 和 5000×5000 消耗相同。
+   *
+   * 这个上限意味着截图其实是很便宜的通道：一张图 ≤384 token，
+   * 而同一页面的 aria_snapshot 文本往往要 1000~3000 token。
+   * 所以 prompt 里不该劝模型「少截图」，那是基于错误成本模型的建议。
+   *
+   * detail:'low' 会先缩到 512×512，按像素比例约为上限的 41%。
    */
-  estimateMessages(messages: Array<{ role: string; content: string | null }>): number {
+  estimateImage(detail?: 'low' | 'high' | 'original' | 'auto'): number {
+    const CAP = 384;
+    return detail === 'low' ? Math.round(CAP * (512 * 512) / (800 * 800)) : CAP;
+  }
+
+  /**
+   * 预估消息列表的 token 数
+   *
+   * content 可能是纯字符串，也可能是多模态内容块数组（含图片）。
+   * 图片按上限计，不能只算它折叠后的占位文字 —— 那会让压缩阈值判断
+   * 严重低估真实上下文大小。
+   */
+  estimateMessages(
+    messages: Array<{
+      role: string;
+      content: string | null | Array<{ type: string; text?: string; detail?: 'low' | 'high' | 'original' | 'auto' }>;
+    }>
+  ): number {
     // OpenAI 的消息格式每条有固定开销（约 4 tokens）
     const messageOverhead = messages.length * 4;
+
     const contentTokens = messages.reduce((sum, msg) => {
-      const content = msg.content || '';
-      return sum + this.estimate(content);
+      const content = msg.content;
+      if (!content) return sum;
+
+      if (typeof content === 'string') return sum + this.estimate(content);
+
+      return sum + content.reduce((inner, part) => {
+        if (part.type === 'image') return inner + this.estimateImage(part.detail);
+        return inner + this.estimate(part.text ?? '');
+      }, 0);
     }, 0);
+
     return messageOverhead + contentTokens;
   }
 

@@ -56,6 +56,38 @@ export interface TraceSummary {
   file?: string;
 }
 
+/**
+ * 递归把 base64 图片数据换成占位符
+ *
+ * 一张 1080p 截图的 data URL 约 1~3MB，直接 JSON.stringify 会让单个
+ * call-NNN.json 涨到几 MB —— trace 是为了「能翻」，翻不动就失去意义。
+ * 换掉的是 data URL 的负载部分，保留 mime 类型和体积，定位问题够用。
+ */
+function stripImageData(value: unknown): unknown {
+  if (typeof value === 'string') {
+    // data:image/png;base64,iVBOR... → data:image/png;base64,<stripped 1.2MB>
+    const m = /^(data:[^;]+;base64,)(.+)$/s.exec(value);
+    if (m && m[2].length > 1024) {
+      const bytes = Math.round((m[2].length * 3) / 4);
+      const size = bytes >= 1024 * 1024
+        ? `${(bytes / 1024 / 1024).toFixed(1)}MB`
+        : `${Math.round(bytes / 1024)}KB`;
+      return `${m[1]}<stripped ${size}>`;
+    }
+    return value;
+  }
+
+  if (Array.isArray(value)) return value.map(stripImageData);
+
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = stripImageData(v);
+    return out;
+  }
+
+  return value;
+}
+
 export class TraceRecorder {
   private dir: string;
   private enabled: boolean;
@@ -127,8 +159,9 @@ export class TraceRecorder {
           started_at: new Date(event.startedAt).toISOString(),
           duration_ms: event.durationMs,
           attempts: event.attempts,
-          wire_request: event.wireRequest,
-          wire_response: event.wireResponse,
+          // 剥掉 base64 图片：不剥的话单文件几 MB，trace 就翻不动了
+          wire_request: stripImageData(event.wireRequest),
+          wire_response: stripImageData(event.wireResponse),
           parsed: event.parsed,
           error: event.error,
         }, null, 2)

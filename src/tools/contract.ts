@@ -78,11 +78,42 @@ export interface ToolCall {
   args: Record<string, unknown>;
 }
 
+// ============================================
+// 工具附件(多模态回传)
+// ============================================
+//
+// 为什么需要单独的字段、不能塞进 data:
+// OpenAI 兼容接口的 `role:'tool'` 消息 content 只接受字符串,图片内容块只允许出现在
+// user 消息里(DeepSeek 对 system/assistant 带图直接返回 400)。
+// 所以工具"给模型看一张图"必须由框架另起一条 user 消息承载 ——
+// 工具只声明"我产出了一张图",转成线格式由 adapter 负责,工具不碰厂商格式。
+//
+// 这也是模型唯一能"要求读图"的通路:它的输出只有文本和 tool_calls,
+// 改不了请求体。于是流程是「模型调 view_image → 框架读盘编码 → 下一轮注入」。
+
+export interface ImageAttachment {
+  kind: 'image';
+  /** 原始字节的 base64(不含 data: 前缀,前缀由 adapter 拼) */
+  data: string;
+  mimeType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+  /** 来源标注,注入时作为文字说明,也用于压缩摘要和 trace 里替代 base64 */
+  label: string;
+  width?: number;
+  height?: number;
+  /** 'low' 让服务端先缩到 512×512,省 token;要看清小字用 'original' */
+  detail?: 'low' | 'high' | 'original' | 'auto';
+}
+
 // 工具结果
 export interface ToolResult {
   ok: boolean;
   data?: unknown;
   error?: string;
+  /**
+   * 需要让模型"看见"的二进制产物。
+   * 由 orchestrator 在写入工具结果后注入成 user 消息(见上方注释)。
+   */
+  attachments?: ImageAttachment[];
 }
 
 // 工具参数定义(JSON Schema,用 Zod 生成)

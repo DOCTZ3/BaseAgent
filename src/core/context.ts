@@ -7,7 +7,7 @@ import path from 'path';
 import { z } from 'zod';
 import { Logger, RetryHandler, RetryConfig, RetryableError } from '../platform/index.js';
 import { TokenCounter } from './token-counter.js';
-import { LLMClient, Message } from './llm-client.js';
+import { LLMClient, Message, ContentPart, messageToText } from './llm-client.js';
 
 // ============================================
 // LLM 结构化输出 Schema
@@ -43,19 +43,48 @@ const FALLBACK_COMPRESSION_MAX_TOKENS = 4000;
 const DEFAULT_HIGH_WATER_RATIO = 0.9;
 
 // Turn 结构（完整对话单元）
+//
+// 按**对话顺序平铺**存储，不再按 assistant_iterations 分组。
+//
+// 为什么改：分组结构是「有损」的 —— 只有被显式建模的字段才能重建回来。
+// 实际踩到两次：
+//   ① assistant 调工具时同时说的话（content）压根没存，重建时硬写 ''，
+//      压缩后模型看不到自己当时的思路
+//   ② 工具产出的图片要另起一条 user 消息承载（tool 消息的 content 只能是字符串），
+//      而旧结构的 user_message 是单数字段，装不下第二条，于是 Mid-Turn 压缩时
+//      图片被静默丢弃 —— 但 tool 响应还写着「图片已附加」，模型会基于
+//      不存在的观察作答
+// 平铺之后重建就是 `[...turn.messages]`，没有重建逻辑就没有重建 bug，
+// 将来新增视频/音频等内容类型也不需要再动 Turn 结构。
+//
+// 顺序约定（由 add* 方法的调用顺序保证，不做运行时推断）：
+//   messages[0]  必为用户提问（addUserMessage 开启新 Turn 时写入）
+//   中间          assistant / tool / 工具观察（addObservation 注入的 user 消息）
+//   末尾          可能是 final_response，也可能没有
+//                （跑满 maxSteps、no_response、或轮次进行中）
+//
+// 注意 messages[0] 之后出现的 role:'user' 是**工具观察**而非用户发言 ——
+// 压缩渲染必须区分，否则会把截图当成用户说过的话喂给压缩模型（注入假事实）。
 export interface Turn {
   turn_id: number;
-  user_message: Message;
-  // 一次迭代 = 一次 LLM 响应。模型可能并行返回多个 tool_call，必须全部记录：
-  // 只存第一个会导致压缩后重建出「assistant 声明 N 个 tool_call 但只有 1 个 tool 响应」
-  // 的消息序列，API 直接 400。
-  assistant_iterations: Array<{
-    reasoning?: string;
-    tool_calls?: Array<{ id: string; name: string; args: unknown }>;
-    tool_results?: Array<{ tool_call_id: string; content: string }>;
-  }>;
-  final_response?: Message;
+  messages: Message[];
   timestamp: number;
+}
+
+/** 取用户提问（按构造必为首条） */
+export function turnUserMessage(turn: Turn): Message | undefined {
+  return turn.messages[0];
+}
+
+/** 取最终回答：末尾的 assistant 消息且不带 tool_calls */
+export function turnFinalResponse(turn: Turn): Message | undefined {
+  for (let i = turn.messages.length - 1; i >= 0; i--) {
+    const m = turn.messages[i];
+    if (m.role === 'assistant') {
+      return m.toolCalls?.length ? undefined : m;
+    }
+  }
+  return undefined;
 }
 
 // 主题摘要（聚类压缩）
@@ -68,18 +97,35 @@ export interface TopicSummary {
   timestamp: number;          // 最后一个 Turn 的时间
 }
 
-// 归档索引（扩展支持主题）
+// 归档索引（单层：一轮一条，自包含）
+//
+// 原本是 turns[] + topics[] 两个数组，靠 topic_id ↔ turn_ids 双向引用关联。
+// 改成单层的两个理由：
+//   ① 模型读索引是为了「定位到某轮去读原文」，跨数组查引用纯属负担
+//   ② 更要紧的是两个数组语义不一致 —— topics[] 取自 this.topicSummaries，
+//      那是「上下文当前还记得的主题」，会被 pruneTopics 按滑动窗口删掉；
+//      而 turns[] 是「磁盘上所有归档轮次」。会话越长两者越对不上，
+//      模型会基于一份自相矛盾的索引做判断
+//
+// 代价：失去「按主题分组浏览」。但主题分组的价值在上下文里那份摘要
+// （已带轮次号），索引只需能定位。同一主题的多轮共享同一段 did，
+// 有轻微重复，换来每条记录自包含、不会因 prune 而失联。
 export interface ArchiveIndex {
   session_id: string;
   turns: Array<{
     turn: number;
-    summary: string;
-    tools_used: string[];
-    timestamp: number;
     file: string;
-    topic_id?: string;        // 关联的主题 ID
+    timestamp: number;
+    /** 所属主题标题。仅存字符串，去掉 topic_id 那层间接 */
+    topic?: string;
+    /**
+     * 这轮**做了什么 + 结果**，取自主题摘要。
+     * 原先存的是用户提问（`extractTurnSummary` 截 messages[0]），
+     * 但提问回答不了「这轮有没有我要找的信息」—— 而那是索引存在的唯一理由
+     */
+    did?: string;
+    tools_used: string[];
   }>;
-  topics: TopicSummary[];     // 主题摘要列表
 }
 
 export interface ContextConfig {
@@ -148,7 +194,9 @@ const DEFAULT_CLIP: ClipLimits = {
 export class ContextManager {
   private messages: Message[] = [];
   private turns: Turn[] = [];
-  private currentTurn: Partial<Turn> | null = null;
+  // 平铺结构下 Turn 从创建起就是完整形状（messages 至少含用户提问），
+  // 不需要 Partial —— 少一层可选性，也就少一处「字段可能不存在」的分支
+  private currentTurn: Turn | null = null;
   private tokenCounter: TokenCounter;
   private archiveDir: string;
   // 压缩标志位：由 recordTokenUsage() 按 API 返回的 prompt_tokens 置真，
@@ -156,6 +204,9 @@ export class ContextManager {
   private needsCompression: boolean = false;
   private topicSummaries: Map<string, TopicSummary> = new Map();  // 主题摘要（id -> TopicSummary）
   private activeTurnTopics: Map<number, string> = new Map();      // Turn ID -> Topic ID 映射
+  // 已归档的轮次号（累计，来自 index.json）。归档提示要列真实文件名，
+  // 而不是 turn-XXX.json 这种模型没法直接用的占位符
+  private archivedTurnIds: number[] = [];
   private retryHandler: RetryHandler;
   // 实际执行过的压缩次数（跳过的不计）。上层靠它判断「这一轮是否压缩了」——
   // 不能用 turns 数量反推：turns 要到下一轮开始才递增，新会话第一轮会误报。
@@ -248,7 +299,7 @@ export class ContextManager {
   /**
    * 添加用户消息（开启新 Turn）
    */
-  async addUserMessage(content: string) {
+  async addUserMessage(content: string | ContentPart[]) {
     // 完成上一个 Turn
     //
     // 这里**不做**压缩判断。压缩时机统一由 needsCompression 标志位驱动，
@@ -262,20 +313,44 @@ export class ContextManager {
     //     而这个预估对那两样完全盲目。属于「对微不足道的部分很精确，
     //     对主导因素一无所知」的虚假精确
     // 故两条一并删除。
-    if (this.currentTurn?.user_message) {
+    if (this.currentTurn && this.currentTurn.messages.length > 0) {
       this.finalizeTurn();
     }
 
-    // 开启新 Turn
+    // 开启新 Turn：user 消息是首条，位置本身就是「这是用户提问」的标记
     const userMsg: Message = { role: 'user', content };
     this.messages.push(userMsg);
 
     this.currentTurn = {
       turn_id: this.turns.length + 1,
-      user_message: userMsg,
-      assistant_iterations: [],
+      messages: [userMsg],
       timestamp: Date.now()
     };
+  }
+
+  /**
+   * 注入工具产出的观察（图片/未来的音视频），属于当前 Turn 的中间过程
+   *
+   * 为什么不能复用 addUserMessage：后者会 finalizeTurn() 并开启新 Turn，
+   * 把一轮劈成两半、破坏 assistant/tool 的配对关系。
+   *
+   * 形式上是 user 消息（图片块只允许出现在 user 里 —— tool 消息的 content
+   * 只接受字符串，实测塞进 tool 的成功率 91%，走 user 是 98%），
+   * 但语义上是「工具观察」，压缩渲染时必须与用户发言区分开。
+   *
+   * 调用纪律：必须在该次迭代**所有** addToolResult 之后调用。
+   * assistant 声明 N 个 tool_call 后，API 要求紧跟 N 条 tool 响应，
+   * 中途插入 user 消息会让序列非法并直接 400。
+   */
+  addObservation(content: ContentPart[]) {
+    const msg: Message = { role: 'user', content };
+    this.messages.push(msg);
+    this.currentTurn?.messages.push(msg);
+
+    this.config.logger.debug('注入工具观察', {
+      turn_id: this.currentTurn?.turn_id,
+      images: content.filter(p => p.type === 'image').length,
+    });
   }
 
   /**
@@ -294,13 +369,10 @@ export class ContextManager {
     };
     this.messages.push(msg);
 
-    // 记录到当前 Turn（并行 tool_call 全部保留）
-    if (this.currentTurn) {
-      this.currentTurn.assistant_iterations!.push({
-        reasoning,
-        tool_calls: toolCalls && toolCalls.length > 0 ? [...toolCalls] : undefined
-      });
-    }
+    // 平铺存储：整条消息原样进 Turn。
+    // 旧结构只存 reasoning + tool_calls、丢掉 content，重建时硬写 ''，
+    // 于是模型调工具时同时说的话在压缩后全部消失
+    this.currentTurn?.messages.push(msg);
   }
 
   /**
@@ -313,59 +385,45 @@ export class ContextManager {
       content
     };
     this.messages.push(msg);
-
-    // 追加到当前 Turn 最后一次迭代的结果列表
-    // （一次迭代有 N 个 tool_call 就会有 N 次 addToolResult，逐个 append）
-    if (this.currentTurn && this.currentTurn.assistant_iterations!.length > 0) {
-      const lastIter = this.currentTurn.assistant_iterations![this.currentTurn.assistant_iterations!.length - 1];
-      if (!lastIter.tool_results) {
-        lastIter.tool_results = [];
-      }
-      lastIter.tool_results.push({ tool_call_id: toolCallId, content });
-    }
+    this.currentTurn?.messages.push(msg);
   }
 
   /**
    * 记录本轮最终回复（模型无工具调用、直接给出答案时）
    *
-   * 必须调用：Turn.final_response 是压缩后重建「保留轮次」的唯一答案来源。
-   * 不记录会导致模型看不到自己之前的回答（flattenTurns 只能重放 user 消息和工具往返）。
+   * 必须调用：它是压缩后重建「保留轮次」时答案的唯一来源。
+   * 不记录会导致模型看不到自己之前的回答（重建出的轮次只剩提问和工具往返）。
    */
   addFinalResponse(content: string, reasoning?: string) {
     const msg: Message = { role: 'assistant', content, reasoning };
     this.messages.push(msg);
-
-    if (this.currentTurn) {
-      this.currentTurn.final_response = msg;
-    }
+    this.currentTurn?.messages.push(msg);
   }
 
   /**
    * 完成当前 Turn
    */
   private finalizeTurn() {
-    if (!this.currentTurn || !this.currentTurn.user_message) {
+    if (!this.currentTurn) {
       return;
     }
 
-    // 检查是否有 assistant 响应：工具迭代或最终回复，有其一即算完整
-    // （模型直接回答的轮次没有 iterations，只有 final_response，不能当不完整丢掉）
-    const hasIterations = (this.currentTurn.assistant_iterations?.length ?? 0) > 0;
-    if (!hasIterations && !this.currentTurn.final_response) {
-      this.config.logger.warn('Turn 不完整：没有 assistant 响应', { turn_id: this.currentTurn.turn_id });
+    // 只有用户提问、没有任何 assistant 响应 → 轮次不完整，不入库。
+    // 注意「完整」不要求有 final_response：跑满 maxSteps 或 no_response 的轮次
+    // 只有工具往返，同样是有效历史
+    const hasAssistant = this.currentTurn.messages.some(m => m.role === 'assistant');
+    if (!hasAssistant) {
+      this.config.logger.warn('Turn 不完整：没有 assistant 响应', {
+        turn_id: this.currentTurn.turn_id,
+      });
       return;
     }
 
-    // 直接回答的轮次没有 iterations，补空数组以满足 Turn 结构
-    if (!this.currentTurn.assistant_iterations) {
-      this.currentTurn.assistant_iterations = [];
-    }
-
-    this.turns.push(this.currentTurn as Turn);
+    this.turns.push(this.currentTurn);
     this.config.logger.debug('Turn 已完成', {
       turn_id: this.currentTurn.turn_id,
-      iterations: this.currentTurn.assistant_iterations.length,
-      has_final_response: !!this.currentTurn.final_response
+      messages: this.currentTurn.messages.length,
+      has_final_response: !!turnFinalResponse(this.currentTurn),
     });
     this.currentTurn = null;
   }
@@ -487,20 +545,51 @@ export class ContextManager {
       messages.push(initialSystemMessage);
     }
 
-    // 主题摘要（按时间排序）
+    // 早期对话的主题目录（按轮次先后排列）
     if (this.topicSummaries.size > 0) {
-      // 按时间排序（最新的在前）
-      const sortedTopics = Array.from(this.topicSummaries.values())
-        .sort((a, b) => b.timestamp - a.timestamp);
+      // 只列「轮次 + 标题 + 关键词」，**不含摘要正文**。
+      //
+      // 摘要正文只留在 index.json 的 did 字段里，两个理由：
+      //   ① 内容副本：did 与这里是同一份文字，模型按提示去读 index.json
+      //      等于把它再注入一遍
+      //   ② 更要紧的是**摘要会抑制回溯**：实测模型拿到摘要后在 reasoning 里
+      //      权衡「要不要查归档」，结论是「摘要已经足够明确」，于是直接照着
+      //      60 字摘要复述细节。廉价的近似答案挤掉了准确答案，而它看起来可信
+      //
+      // 标题足以回答「历史里有没有关于 X 的内容」（发现），又不足以让模型
+      // 以为自己已经知道细节（必须去读）。这不是为了省 token ——
+      // 10 个主题块也就 700 token，在 1M 窗口里可忽略。
+      //
+      // 关键词保留：它是把用户提问匹配到主题的主要信号，去掉会让「发现」变弱，
+      // 而发现失败（模型答「历史里没有」）比多读一次文件糟得多。
+      // 代价是关键词偶尔会带出具体数值（如「发烧38.2℃」），仍有泄漏可能。
+      const byTurn = Array.from(this.topicSummaries.values())
+        .map(t => ({
+          topic: t,
+          // 无轮次号的主题（异常情况）排到最后，不让 Infinity 污染排序
+          first: t.turn_ids.length > 0 ? Math.min(...t.turn_ids) : Number.MAX_SAFE_INTEGER,
+        }))
+        // 按轮次**升序**：判断「第一次是什么」只能靠先后顺序，
+        // 倒序排列会让模型把最近的当成最早的
+        .sort((a, b) => a.first - b.first);
 
-      const topicsText = sortedTopics.map(topic => {
-        const keywordsText = topic.keywords.length > 0 ? `\n关键词: ${topic.keywords.join(', ')}` : '';
-        return `## ${topic.title}\n${topic.summary}${keywordsText}`;
-      }).join('\n\n---\n\n');
+      const topicsText = byTurn.map(({ topic }) => {
+        const turns = [...topic.turn_ids].sort((a, b) => a - b);
+        const range = turns.length === 0 ? '轮次未知'
+          : turns.length === 1 ? `第 ${turns[0]} 轮`
+          : `第 ${turns[0]}-${turns[turns.length - 1]} 轮`;
+        const kw = topic.keywords.length > 0 ? `（${topic.keywords.join('、')}）` : '';
+        return `- ${range}：${topic.title}${kw}`;
+      }).join('\n');
 
       messages.push({
         role: 'system',
-        content: `[历史对话主题摘要 - 共 ${sortedTopics.length} 个主题]\n\n${topicsText}`
+        content:
+          `[早期对话的主题目录 - 共 ${byTurn.length} 个主题，按轮次先后排列]\n\n` +
+          `${topicsText}\n\n` +
+          `以上**只有标题**，不含对话内容。它的用途是让你判断「某个话题在不在历史里、` +
+          `在第几轮」。要知道当时具体说了什么、看了什么，必须按轮次号读归档原文` +
+          `（见下一条）。不要仅凭标题和关键词推测细节。`
       });
     }
 
@@ -510,12 +599,33 @@ export class ContextManager {
     // 当参数传回 read_file，反斜杠在 JSON 里还得转义，容易出错。
     // Node 的 fs 在 Windows 上两种分隔符都接受，所以正斜杠是安全的。
     const archivePath = this.archiveDir.split(path.sep).join('/');
+
+    // 列出真实存在的轮次，而不是 turn-XXX.json 占位符 ——
+    // 模型没法把 XXX 直接当参数传给 read_file，还得先去读索引猜文件名。
+    // 同时避免「早期的 N 轮」这种表述：N 只是本批数量，模型会理解成
+    // 「历史总共只有 N 轮」，从而不去找更早的内容
+    const ids = this.archivedTurnIds.length > 0
+      ? this.archivedTurnIds
+      : Array.from({ length: archivedCount }, (_, i) => i + 1);
+    const fileList = ids
+      .map(id => `${archivePath}/turn-${String(id).padStart(3, '0')}.json`)
+      .join('\n  ');
+
     messages.push({
       role: 'system',
-      content: `[早期的 ${archivedCount} 轮对话已归档到 ${archivePath}/
-索引文件：${archivePath}/index.json
-详细内容：${archivePath}/turn-XXX.json
-需要回顾早期对话时，可用 read_file 工具查看]`
+      content: `[早期对话已全部归档，当前上下文只保留最近若干轮 + 上方主题目录]
+
+第 ${ids[0]} 至第 ${ids[ids.length - 1]} 轮（共 ${ids.length} 轮）的**完整原文**在：
+  ${fileList}
+
+用 read_file 直接读上面对应轮次的文件，就能拿到当时的原始对话。
+上方目录已给出「哪个话题在第几轮」，通常可以直接定位到文件、不必先读索引。
+
+若目录里找不到相关话题，再读索引逐轮查看：
+  ${archivePath}/index.json
+
+被问到早期对话的具体内容（说过哪句话、看过哪张图、第几轮做了什么）时，
+先读原文再回答 —— 目录只有标题，据此推测细节会出错。]`
     });
 
     return messages;
@@ -609,11 +719,11 @@ export class ContextManager {
       forced: overHighWater && keepCount < this.config.recentTurnsToKeep
     });
 
-    // 归档早期 Turn
-    await this.archiveTurns(oldTurns);
-
-    // 主题聚类压缩
+    // 顺序要紧：先聚类再归档。
+    // archiveTurns 要在索引里写 topic_id，而 Turn→Topic 的映射是
+    // compressWithTopicClustering 填的 —— 反过来的话查到的永远是 undefined。
     await this.compressWithTopicClustering(oldTurns);
+    await this.archiveTurns(oldTurns);
 
     // 重建消息列表（不包含当前 Turn）
     const initialSystemMessage = this.messages.find(m => m.role === 'system');
@@ -646,61 +756,22 @@ export class ContextManager {
    * 提取当前 Turn 的消息（用于 Mid-Turn 压缩）
    */
   private getCurrentTurnMessages(): Message[] {
-    if (!this.currentTurn) return [];
-
-    const messages: Message[] = [];
-
-    // 添加 user 消息
-    if (this.currentTurn.user_message) {
-      messages.push(this.currentTurn.user_message);
-    }
-
-    // 添加已完成的 assistant iterations
-    if (this.currentTurn.assistant_iterations) {
-      for (const iter of this.currentTurn.assistant_iterations) {
-        // assistant 消息：并行 tool_call 必须全部带上，
-        // 否则重建出的序列会「声明 N 个但只回 1 个」，API 直接 400
-        if (iter.tool_calls && iter.tool_calls.length > 0) {
-          messages.push({
-            role: 'assistant',
-            content: '',
-            toolCalls: iter.tool_calls.map(tc => ({
-              id: tc.id,
-              name: tc.name,
-              args: tc.args as Record<string, unknown>
-            })),
-            reasoning: iter.reasoning
-          });
-        }
-
-        // 每个 tool_call 对应一条 tool 消息
-        for (const result of iter.tool_results ?? []) {
-          messages.push({
-            role: 'tool',
-            toolCallId: result.tool_call_id,
-            content: result.content
-          });
-        }
-      }
-    }
-
-    // 已给出最终回复但尚未 finalize 的轮次，回复也要一起搬回去
-    if (this.currentTurn.final_response) {
-      messages.push(this.currentTurn.final_response);
-    }
-
-    return messages;
+    // 平铺存储后这里不再有「重建」——原样返回即可。
+    // 旧实现从 assistant_iterations 拼装，凡是没被建模的东西都会丢：
+    // assistant 的 content 被硬写成 ''，工具产出的图片（另起的 user 消息）
+    // 整条消失，而 tool 响应还写着「图片已附加」，模型会基于不存在的观察作答
+    return this.currentTurn ? [...this.currentTurn.messages] : [];
   }
 
   /**
    * 归档 Turn 到文件系统
    */
   private async archiveTurns(turns: Turn[]) {
-    const index: ArchiveIndex = {
-      session_id: this.config.sessionId,
-      turns: [],
-      topics: Array.from(this.topicSummaries.values())
-    };
+    // 必须**合并**已有索引，不能重建。
+    // 原实现每次压缩都从空数组重写，于是索引里只剩最后一批 —— 磁盘上明明有
+    // turn-001/002/003，index.json 却只记 turn 3。而给模型的提示恰恰是叫它
+    // 「读 index.json 回溯早期对话」，于是更早的轮次它永远发现不了。
+    const index = await this.readArchiveIndex();
 
     for (const turn of turns) {
       const filename = `turn-${String(turn.turn_id).padStart(3, '0')}.json`;
@@ -709,23 +780,36 @@ export class ContextManager {
       // 写入完整 Turn
       await fs.writeFile(filepath, JSON.stringify(turn, null, 2));
 
-      // 更新索引（一次迭代可能并行调多个工具，全部计入）
-      const toolsUsed = turn.assistant_iterations
-        .flatMap(iter => (iter.tool_calls ?? []).map(tc => tc.name))
-        .filter(Boolean) as string[];
+      // 更新索引（一轮可能并行调多个工具，全部计入）
+      const toolsUsed = turn.messages
+        .filter(m => m.role === 'assistant')
+        .flatMap(m => (m.toolCalls ?? []).map(tc => tc.name))
+        .filter(Boolean);
 
-      // 查找 Turn 关联的主题
-      const topicId = this.activeTurnTopics.get(turn.turn_id);
+      // 主题标题与摘要就地展开进条目，不留 topic_id 那层间接 ——
+      // 于是即使这个主题此后被 pruneTopics 从上下文里删掉，
+      // 归档条目里的「做了什么」依然完整
+      const topic = this.activeTurnTopics.get(turn.turn_id);
+      const summary = topic ? this.topicSummaries.get(topic) : undefined;
 
-      index.turns.push({
+      // 同一轮不会归档两次，但重复写入时以最新为准，避免索引里出现两条
+      const entry = {
         turn: turn.turn_id,
-        summary: this.extractTurnSummary(turn),
-        tools_used: [...new Set(toolsUsed)],  // 去重
-        timestamp: turn.timestamp,
         file: filename,
-        topic_id: topicId  // 关联主题 ID
-      });
+        timestamp: turn.timestamp,
+        topic: summary?.title,
+        // did 缺失时退回用户提问：主题分析失败（降级路径）时总比没有好，
+        // 但正常情况下这里是「做了什么 + 结果」
+        did: summary?.summary ?? this.extractTurnSummary(turn),
+        tools_used: [...new Set(toolsUsed)],  // 去重
+      };
+      const existing = index.turns.findIndex(t => t.turn === turn.turn_id);
+      if (existing >= 0) index.turns[existing] = entry;
+      else index.turns.push(entry);
     }
+
+    // 按轮次号排序：模型要靠它判断「第几轮聊了什么」，乱序会误导
+    index.turns.sort((a, b) => a.turn - b.turn);
 
     // 写入索引文件
     await fs.writeFile(
@@ -733,17 +817,40 @@ export class ContextManager {
       JSON.stringify(index, null, 2)
     );
 
+    // 归档提示里要列出真实存在的轮次，而不是 turn-XXX.json 占位符
+    this.archivedTurnIds = index.turns.map(t => t.turn);
+
     this.config.logger.debug('归档完成', {
       turns: turns.length,
-      topics: index.topics?.length || 0
+      archived_total: index.turns.length,
     });
+  }
+
+  /**
+   * 读取已有归档索引；不存在或损坏时返回空索引
+   *
+   * 损坏不抛错：归档是「回溯早期对话」的辅助手段，读不出来最多丢检索能力，
+   * 不该反过来把压缩（保命机制）搞崩。
+   */
+  private async readArchiveIndex(): Promise<ArchiveIndex> {
+    try {
+      const raw = await fs.readFile(path.join(this.archiveDir, 'index.json'), 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<ArchiveIndex>;
+      return {
+        session_id: parsed.session_id ?? this.config.sessionId,
+        turns: Array.isArray(parsed.turns) ? parsed.turns : [],
+      };
+    } catch {
+      return { session_id: this.config.sessionId, turns: [] };
+    }
   }
 
   /**
    * 提取 Turn 摘要
    */
   private extractTurnSummary(turn: Turn): string {
-    const userContent = turn.user_message.content || '';
+    // 图片折成 [图片 xxx] 占位：base64 截前 100 字符只会得到一段无意义噪声
+    const userContent = messageToText(turnUserMessage(turn)?.content ?? '');
     const summary = userContent.length > 100
       ? userContent.substring(0, 100) + '...'
       : userContent;
@@ -858,40 +965,69 @@ export class ContextManager {
    * @param brief true = 主题分析用（判意图，压缩细节）；false = 摘要生成用（要保留事实）
    */
   private renderTurnTrace(turn: Turn, brief: boolean): string {
-    const lines: string[] = [
-      `[Turn ${turn.turn_id}]`,
-      `用户: ${this.clip(turn.user_message.content ?? '', this.clipLimits.user)}`,
-    ];
+    const lines: string[] = [`[Turn ${turn.turn_id}]`];
+    const final = turnFinalResponse(turn);
 
-    for (const iter of turn.assistant_iterations) {
-      const calls = iter.tool_calls ?? [];
-      const results = iter.tool_results ?? [];
-
-      calls.forEach((tc, i) => {
-        if (brief) {
-          lines.push(`工具: ${tc.name}`);
-        } else {
-          lines.push(`工具调用: ${tc.name}(${this.clip(JSON.stringify(tc.args ?? {}), this.clipLimits.toolArgs)})`);
-          // 按位置配对；缺失时不编造，明确写「无结果」
-          const res = results[i];
-          lines.push(res
-            ? `工具结果: ${this.clip(res.content, this.clipLimits.toolResult)}`
-            : '工具结果: (无结果)');
-        }
-      });
-
-      // 兜底：结果数多于调用数时不丢数据
-      if (!brief && results.length > calls.length) {
-        results.slice(calls.length).forEach(res => {
-          lines.push(`工具结果: ${this.clip(res.content, this.clipLimits.toolResult)}`);
-        });
+    // tool_call_id → 工具名，用于给工具结果标注它属于哪次调用。
+    // 按 id 配对而非按下标：并行调用时下标配对会错位
+    const toolNames = new Map<string, string>();
+    for (const m of turn.messages) {
+      if (m.role === 'assistant') {
+        for (const tc of m.toolCalls ?? []) toolNames.set(tc.id, tc.name);
       }
     }
 
+    turn.messages.forEach((msg, idx) => {
+      if (msg.role === 'user') {
+        // 关键区分：messages[0] 是用户提问，之后的 user 消息是工具观察
+        // （addObservation 注入的截图等）。混为一谈会让压缩模型把截图
+        // 当成用户说过的话写进摘要 —— 即架构文档警告的「压缩注入假事实」。
+        // 图片折成占位标签：base64 送进压缩模型只是噪声，还会重复计费
+        const text = messageToText(msg.content ?? '');
+        if (idx === 0) {
+          lines.push(`用户: ${this.clip(text, this.clipLimits.user)}`);
+        } else if (!brief) {
+          lines.push(`工具观察: ${this.clip(text, this.clipLimits.toolResult)}`);
+        }
+        return;
+      }
+
+      if (msg.role === 'assistant') {
+        const calls = msg.toolCalls ?? [];
+
+        // 最终回答单独渲染（在末尾），这里跳过避免重复
+        if (msg === final) return;
+
+        for (const tc of calls) {
+          if (brief) {
+            lines.push(`工具: ${tc.name}`);
+          } else {
+            lines.push(`工具调用: ${tc.name}(${this.clip(
+              JSON.stringify(tc.args ?? {}), this.clipLimits.toolArgs
+            )})`);
+          }
+        }
+
+        // 调工具时同时说的话：旧结构没存 content，重建时硬写 ''，
+        // 于是模型当时的思路在压缩后完全丢失
+        if (!brief && msg.content) {
+          lines.push(`助手: ${this.clip(messageToText(msg.content), this.clipLimits.answerBrief)}`);
+        }
+        return;
+      }
+
+      if (msg.role === 'tool' && !brief) {
+        const name = toolNames.get(msg.toolCallId);
+        lines.push(`工具结果${name ? `(${name})` : ''}: ${this.clip(
+          msg.content, this.clipLimits.toolResult
+        )}`);
+      }
+    });
+
     // 最终回答是「这轮到底得出了什么结论」的唯一来源
-    if (turn.final_response?.content) {
+    if (final?.content) {
       lines.push(`助手回答: ${this.clip(
-        turn.final_response.content,
+        messageToText(final.content),
         brief ? this.clipLimits.answerBrief : this.clipLimits.answer
       )}`);
     } else {
@@ -1045,40 +1181,12 @@ export class ContextManager {
    * 将 Turn 列表展开为消息列表
    */
   private flattenTurns(turns: Turn[]): Message[] {
-    const messages: Message[] = [];
-
-    for (const turn of turns) {
-      messages.push(turn.user_message);
-
-      for (const iter of turn.assistant_iterations) {
-        // 并行 tool_call 全部重建（漏一个就是 assistant 声明 N 个、tool 只回 M 个 → 400）
-        if (iter.tool_calls && iter.tool_calls.length > 0) {
-          messages.push({
-            role: 'assistant',
-            content: '',
-            toolCalls: iter.tool_calls.map(tc => ({
-              id: tc.id,
-              name: tc.name,
-              args: tc.args as Record<string, unknown>
-            })),
-            reasoning: iter.reasoning
-          });
-        }
-        for (const result of iter.tool_results ?? []) {
-          messages.push({
-            role: 'tool',
-            content: result.content,
-            toolCallId: result.tool_call_id
-          });
-        }
-      }
-
-      if (turn.final_response) {
-        messages.push(turn.final_response);
-      }
-    }
-
-    return messages;
+    // 平铺存储后这里不再有「重建」——按顺序摊平即可。
+    // 旧实现从 assistant_iterations 拼装，凡是没被建模的东西都会丢：
+    // assistant 的 content 被硬写成 ''（模型调工具时说的话全部消失）、
+    // 工具产出的图片（另起的 user 消息）整条不见。
+    // 顺序合法性由存储时的 append 顺序保证，不依赖这里拼对
+    return turns.flatMap(turn => turn.messages);
   }
 
   /**

@@ -4,12 +4,69 @@
 
 import { ToolDescription } from '../tools/index.js';
 
+// ============================================
+// 多模态内容块（中立格式）
+// ============================================
+//
+// 刻意不照抄 OpenAI 的 `image_url: { url: "data:..." }` 结构：
+// 那是线格式，让它渗进内核就等于把厂商细节焊死在 Message 上，
+// 换 Claude（`source: { type: 'base64', media_type, data }`）时要改的地方遍布全项目。
+// 这里只描述「有一张图，什么类型，数据是什么」，转换由 adapter 独占。
+//
+// 图片只允许出现在 user 消息里 —— DeepSeek 对 system/assistant 带图直接返回 400。
+// 这个约束由类型系统表达（只有 user 分支的 content 是联合类型），不靠运行时检查。
+
+export interface TextPart {
+  type: 'text';
+  text: string;
+}
+
+export interface ImagePart {
+  type: 'image';
+  /** 图片原始字节的 base64（不含 `data:` 前缀，前缀由 adapter 拼） */
+  data: string;
+  /** 由文件实际内容判断，而非扩展名 —— DeepSeek 也是按内容判格式的 */
+  mimeType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+  /**
+   * 缩放策略。'low' 会让服务端在推理前缩到 512×512，省 token 且更快；
+   * 需要看清小字（表格/验证码）时用 'original'
+   */
+  detail?: 'low' | 'high' | 'original' | 'auto';
+  /** 人类可读来源标注，用于压缩摘要和 trace 里替代 base64 */
+  label?: string;
+  /** 原始像素尺寸，仅用于日志与 token 估算 */
+  width?: number;
+  height?: number;
+}
+
+export type ContentPart = TextPart | ImagePart;
+
 // 内部中立的消息格式
 export type Message =
   | { role: 'system'; content: string }
-  | { role: 'user'; content: string }
+  | { role: 'user'; content: string | ContentPart[] }
   | { role: 'assistant'; content: string; reasoning?: string; toolCalls?: ToolCallMessage[] }
   | { role: 'tool'; toolCallId: string; content: string };
+
+/** 取消息的纯文本表示：图片折叠成占位标签，供压缩/日志/token 估算使用 */
+export function messageToText(content: string | ContentPart[]): string {
+  if (typeof content === 'string') return content;
+
+  return content
+    .map(part =>
+      part.type === 'text'
+        ? part.text
+        : `[图片${part.label ? ` ${part.label}` : ''}${
+            part.width && part.height ? ` ${part.width}x${part.height}` : ''
+          }]`
+    )
+    .join('\n');
+}
+
+/** 消息里是否含图片 */
+export function hasImage(content: string | ContentPart[]): boolean {
+  return typeof content !== 'string' && content.some(p => p.type === 'image');
+}
 
 export interface ToolCallMessage {
   id: string;

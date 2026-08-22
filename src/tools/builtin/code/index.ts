@@ -3,3 +3,4 @@
 // ============================================
 
 export * from './execute-python.js';
+export * from './view-image.js';
