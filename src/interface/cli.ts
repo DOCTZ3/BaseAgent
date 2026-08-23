@@ -31,7 +31,7 @@ import {
   type TraceSummary,
 } from '../platform/index.js';
 import { ToolRegistry, ToolRunner } from '../tools/index.js';
-import { PythonExecutor } from '../executors/index.js';
+import { PythonExecutor, BrowserManager, BrowserOps } from '../executors/index.js';
 import {
   ContextManager,
   DeepSeekAdapter,
@@ -49,6 +49,8 @@ import {
   SpawnSubAgentTool,
   ExecutePythonTool,
   ViewImageTool,
+  ScreenshotTool,
+  RequestHelpTool,
 } from '../tools/builtin/index.js';
 
 const HELP = `
@@ -152,7 +154,14 @@ async function main() {
   }
   if (config.vision.enabled) {
     registry.register(new ViewImageTool());
+    // 截图需要视觉能力才有意义：图片进了上下文但模型看不见，等于白花 token
+    if (config.python.enabled) {
+      registry.register(new ScreenshotTool());
+    }
   }
+  // request_help 无条件注册：它不碰浏览器、不需要任何执行器，
+  // 只是「暂停并把控制权交回用户」。将来非浏览器场景同样能用
+  registry.register(new RequestHelpTool());
   if (config.subAgent.enabled) {
     registry.register(new SpawnSubAgentTool());
   }
@@ -213,6 +222,22 @@ async function main() {
   // 浏览器能力经此提供：沙箱预装 Playwright，模型自己写代码驱动。
   // profile 目录用绝对路径：要同时注入子进程和进 fs deny 列表，相对路径两边解析基准不同
   const browserProfileDir = path.resolve(config.python.browserProfileDir);
+
+  // ---------- 常驻浏览器(CDP) ----------
+  // 由框架启动而非模型代码启动，浏览器才能跨轮次存活 ——
+  // 「上一轮打开的页面下一轮接着点」就靠这个。
+  // 顺带消掉一个软边界：模型再没机会自己造 profile 路径
+  const browserManager = config.python.enabled
+    ? new BrowserManager({
+        profileDir: browserProfileDir,
+        headless: false,   // 有头：能看见 agent 在做什么，登录引导也自然
+        logger,
+      })
+    : undefined;
+  if (browserManager) {
+    await browserManager.start();   // 失败只告警，不阻塞 CLI
+  }
+
   // 没有工作区就不创建执行器：workDir 为空串会让 path.resolve 解析成 cwd，
   // 写边界随之变成整个项目目录。缺配置时宁可代码执行不可用，不可越界
   const pythonExecutor = config.python.enabled && config.workspace
@@ -223,8 +248,12 @@ async function main() {
         timeout: config.python.timeout,
         maxStdoutBytes: config.python.maxStdoutBytes,
         maxStderrBytes: config.python.maxStderrBytes,
-        // 模型代码里读 os.environ["BROWSER_PROFILE_DIR"]，不硬编码路径
-        env: { BROWSER_PROFILE_DIR: browserProfileDir },
+        env: {
+          // 模型代码里读 os.environ，不硬编码路径
+          BROWSER_PROFILE_DIR: browserProfileDir,
+          // 常驻浏览器的连接地址。空串表示没起来，模型代码会拿到连接失败并改道
+          BROWSER_CDP_URL: browserManager?.cdpUrl ?? '',
+        },
         logger,
       })
     : undefined;
@@ -239,6 +268,11 @@ async function main() {
     // profile 里的 cookie 等价于活凭证，不能让 read_file 读进上下文并跟着 trace 落盘
     fsDeniedPaths: config.python.enabled ? [browserProfileDir] : [],
     pythonExecutor,
+    // 浏览器操作复用 PythonExecutor 跑框架自己写的脚本 ——
+    // TS 侧不再引一份 playwright（几百 MB），而 Python 侧本来就装着
+    browserOps: pythonExecutor && browserManager?.cdpUrl
+      ? new BrowserOps(pythonExecutor, browserManager.cdpUrl)
+      : undefined,
     subAgentRunner,
   });
 
@@ -277,10 +311,17 @@ async function main() {
         '页面结构未知时先用 page.locator("body").aria_snapshot() 拿语义树,' +
         '或用 locator(...).count() 数条目,不要 print(page.content())。' +
         '注意 page.accessibility 在新版 Playwright 已移除。' +
-        '浏览器一律用 launch_persistent_context(os.environ["BROWSER_PROFILE_DIR"])，' +
-        '登录态会自动持久化，不要自己造 profile 路径。' +
-        '需要登录时用 headless=False 打开窗口让用户手动完成，再用 page.wait_for_url 等待，' +
-        '绝不要在代码里填写账号密码。'
+        // 浏览器由框架常驻，模型只连接不启动。这条写错会让它每次开新浏览器，
+        // 跨轮次的页面状态就丢了
+        '浏览器已经由框架启动并常驻（有头窗口，登录态自动持久化）。' +
+        '用 browser = p.chromium.connect_over_cdp(os.environ["BROWSER_CDP_URL"]) 连上去，' +
+        'page = browser.contexts[0].pages[0] 拿到当前页面。' +
+        '不要用 launch 或 launch_persistent_context 自己启动浏览器，' +
+        '也绝对不要调 browser.close() 或 context.close() —— 那会杀掉常驻实例，' +
+        '下一轮就接不上了。需要新标签页时用 browser.contexts[0].new_page()。' +
+        '因为浏览器跨轮次存活，上一轮打开的页面这一轮可以直接接着操作。' +
+        '需要登录时直接 goto 登录页，窗口是可见的，让用户手动完成后用 ' +
+        'page.wait_for_url 等待，绝不要在代码里填写账号密码。'
       : '') +
     // 截图其实是便宜通道：单图 ≤384 token，而同一页面的 aria_snapshot 文本
     // 往往要 1000~3000 token。所以不劝模型少截图
@@ -483,6 +524,7 @@ async function main() {
     await runTurn(singleShot);
     rl.close();
     context.dispose();
+    await browserManager?.stop();
     return;
   }
 
@@ -524,18 +566,28 @@ async function main() {
 
   // 队列跑完后再收尾，避免管道输入时 close 早于最后一轮完成
   const finish = () => {
-    queue.then(() => {
+    queue.then(async () => {
       const s = context.getStats();
       console.log(dim(`\n会话结束: ${s.turns} 轮,${recorder.count()} 次 LLM 调用`));
       if (config.trace.enabled && recorder.count() > 0) {
         console.log(dim(`留痕目录: ${path.resolve(recorder.traceDir)}`));
       }
       context.dispose();
+      // 必须关掉常驻浏览器：它是 detached 的，不会随本进程退出。
+      // 留下来会一直锁着 profile 目录，导致下次启动失败
+      await browserManager?.stop();
       process.exit(0);
     });
   };
 
   rl.on('close', finish);
+
+  // Ctrl+C 走的是 SIGINT，不一定触发 rl 的 close。
+  // 漏掉这条会留下孤儿 chromium —— 而 lock 文件的清理只在下次启动时生效，
+  // 中间这段时间 profile 一直是锁着的
+  process.on('SIGINT', () => {
+    void browserManager?.stop().finally(() => process.exit(0));
+  });
 }
 
 main().catch(error => {

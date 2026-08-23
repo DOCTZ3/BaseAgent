@@ -52,14 +52,17 @@
 │    · runner        调用管线:校验/权限/日志/重试            │
 │    · builtin\      内置组:时间、计算、记事、查询           │
 │    · code\         execute_python(代码) / view_image(看图)  │
+│    · browser\      screenshot / request_help               │
 │    · system\       系统组:文件操作(读/写/列表/搜索)        │
 │    职责:具体能力实现,申明 needs 依赖,runner 注入资源       │
 └───────────────────────────┬──────────────────────────────┘
-                            │ needs: ['fs', 'python', ...]
+                            │ needs: ['fs', 'python', 'browser', ...]
 ┌───────────────────────────┴──────────────────────────────┐
 │  executors/  执行器 / 资源层                              │
 │    · fs-driver     文件系统封装,集成 security 白名单       │
 │    · python-executor  子进程执行代码 + 写边界(audit hook)   │
+│    · browser-manager  常驻 chromium(CDP,跨轮次保持页面)    │
+│    · browser-ops      截图(逻辑在此,Tool 只薄包装)         │
 │    · http-client   HTTP 请求(抓 API / 下载文件)           │
 │    职责:操作真实资源,被 runner 按工具 needs 动态注入       │
 └───────────────────────────┬──────────────────────────────┘
@@ -442,8 +445,43 @@ interface TopicSummary {
     profile 是缓存不是权威源,不需要理解它为什么坏
   - profile 目录必须进 SecurityGuard deny 列表:里面的 cookie 等价于活凭证,
     一个 `read_file` 就能读进上下文并跟着 trace 落盘。这是软边界(沙箱进程本身必须能读写),
-    配合 prompt 约定「只用 `BROWSER_PROFILE_DIR`」+ stdout 上限兜底;
-    硬隔离需把浏览器移进独立容器、Python 经 CDP 连接,留作后续
+    配合 prompt 约定 + stdout 上限兜底
+- **浏览器由框架常驻(CDP),不由模型代码启动**:每轮 `with sync_playwright()` 块结束
+  就关掉 chromium,于是「上一轮打开的页面下一轮接着点」做不到 ——
+  `launch_persistent_context` 只保住登录态,保不住页面停留位置。
+  改成框架启动一个带 `--remote-debugging-port` 的实例,模型代码用
+  `connect_over_cdp` 连上去、不关闭。
+  - 顺带消掉一个软边界:模型再没机会自己造 profile 路径(之前靠 prompt 约定,不可靠)
+  - **关闭必须按 PID 强杀,不能只发 CDP 命令**:实测 `/json/close/<id>` 只关标签页,
+    浏览器进程照旧活着。而进程活着时 profile 目录**完全删不掉**(几百个文件 EBUSY)——
+    所以孤儿不是「多占内存」,而是**下次必然启动失败**
+  - chromium 会 fork 多个进程,`spawn` 返回的 pid 未必持有端口。
+    关闭时按监听端口反查 PID,杀错就等于没杀
+  - 端口不写死 9222:用户自己开着 Chrome 调试就会占用它
+  - Ctrl+C / 崩溃时 `finally` 可能来不及跑,所以把 pid+port 落进 lock 文件,
+    **启动前主动清理**残留。按端口反查而非直接用记录的 pid —— pid 可能已被系统复用
+- **CodeAct 之后,工具层只留代码碰不到的那几件事**:动作空间变成代码后,
+  绝大多数工具应当消失 —— 每保留一个都要在**每次调用**的 prompt 里付 schema 成本,
+  而且「工具和等价代码两条路」会让模型的选择变得不可预测。
+  留在外面的判据只有三条:
+  - **① 产出物无法经代码返回**:stdout 只能载文本。图片进上下文只能经
+    `ToolResult.attachments` 由框架注入成 user 消息 —— 工具桥能让代码**触发**截图,
+    但不能让代码**接收**图片。`screenshot` / `view_image` 属于此类
+  - **② 需要跨出执行单元**:代码块是原子的,中间没有「跟用户说句话然后等他」的位置。
+    `request_help` 要暂停等人操作(可能一分钟以上),模型自己写 `wait_for_url`
+    会死等、agent 卡住且用户看不到提示。`spawn_subagent` 同理(独立上下文与生命周期)
+  - **③ 工具确实比等价代码更好**:`read_file` / `search_files` 自带返回量上限,
+    超限返回 `ok:false` + 收窄建议;而裸 `glob('**/*')` 命中三千个文件、
+    一 `print` 就撑爆上下文。「数据大不大」是领域知识,封在工具里才有效
+  - 按此筛选,现有 11 个工具会缩到 6 个:`screenshot` / `view_image` /
+    `request_help` / `spawn_subagent` / `read_file` / `search_files`。
+    `get_current_time`(`datetime.now()` 一行)、`write_file`(写边界已在 audit hook
+    管住,工具层重复)、`list_files`(与 search 重合)、`echo` 一律进代码;
+    `execute_python` 本身消失 —— 它变成动作空间
+  - 因此**工具桥只暴露留下的那几个**,不做「暴露全部让模型挑」。
+    后者看似保留退路,实际是把取舍推给模型,代价是冗余 + 行为不可预测
+  - 待验:③ 的前提是「模型在代码里不会自己控制返回量」。
+    实测有正面信号(它在抓官网时主动写了 `lines[:60]`),真要做桥时需重测
 - **图片是模型「要求看图」的带内信道,不是输入侧的旁路**:
   模型的输出只有文本和 tool_calls,改不了请求体,所以它无法自己把图片塞进上下文。
   流程是「模型调 `view_image` → 框架读盘编码 → **下一轮**注入成 user 消息」,
@@ -489,13 +527,21 @@ interface TopicSummary {
 - PythonExecutor (子进程执行代码:超时 / stdout 上限 / env 白名单继承 / 进程树回收)
 - WriteGuard (audit hook 写边界:只允许写工作区 + temp,读不限;
   判定在闭包内,模型无法覆盖。详见「代码执行的边界」那条决策)
+- BrowserManager (常驻 chromium:CDP 端口 / 随机端口 / lock 文件清理残留 /
+  按端口反查 PID 强杀。详见「浏览器常驻」那条决策)
+- BrowserOps (截图的具体实现。逻辑放执行器层而非 Tool 内 ——
+  工具桥落地后 Python 侧要复用同一份)
 
 **Tools 层**:
 - Contract / Registry / Runner (调用管线)
 - 内置工具:Echo / GetCurrentTime / SpawnSubAgent
 - 系统工具:ReadFile / WriteFile / ListFiles / SearchFiles (均自带返回量上限)
-- 代码工具:execute_python (`danger: true`,默认关闭,需 `PYTHON_ENABLED=true`)
+- 代码工具:execute_python (默认关闭,需 `PYTHON_ENABLED=true`)
 - 视觉工具:view_image (默认关闭,需 `VISION_ENABLED=true` + 视觉模型)
+- 浏览器工具:screenshot (需 `PYTHON_ENABLED=true` + 视觉模型 ——
+  没有视觉能力时图片进了上下文也看不见)
+- 交互工具:request_help (无条件注册,`needs` 为空 —— 它不碰浏览器,
+  只是暂停并交回控制权,将来非浏览器场景同样可用)
 
 **Core 层**:
 - LLMClient (接口) + DeepSeekAdapter (实现,含 trace 钩子)
@@ -529,9 +575,6 @@ interface TopicSummary {
   缺的核心机制是**工具桥** —— 子进程内的 Python 目前没有任何回调 TS 侧的通道
 - 容器隔离 —— **仅在做服务端形态时才需要**。本地形态下已用 audit hook 写边界
   替代(见「代码执行的边界」),不作为本地路线的待办
-- 浏览器常驻实例(CDP 连接,跨轮次保持页面停留位置)—— 当前每轮
-  `with sync_playwright()` 结束即关闭浏览器,所以「上一轮打开的页面下一轮接着点」
-  做不到。`launch_persistent_context` 只保住登录态,保不住页面停留位置
 - 子 Agent 的 stateful 模式(保留上下文可续传)+ LRU 驻留池
 
 ---
@@ -553,20 +596,23 @@ interface TopicSummary {
 
 ## 下一步
 
-**先验证已交付的部分**:
+**待验证**(已交付但只有单元测试、没实跑过):
 
-- **主题目录是否真能驱动回溯**:上下文里的主题块已从「标题 + 摘要正文」
-  改为只留标题 + 轮次号,理由是摘要会**抑制**模型去读归档原文
-  (实测它 reasoning 里权衡后判断「摘要已足够」,然后照 60 字复述细节)。
-  但这个判断只有一次 trace 作证,标题版也可能只是换个形式继续猜 —— 需实跑确认
+- **screenshot / request_help 的实际效果**:模型会不会在该截图的时候截图;
+  调 `request_help` 后会不会照约定明确说「请切换到浏览器窗口」并**本轮结束**,
+  而不是继续轮询等待。单元测试只覆盖了 `BrowserManager` 的生命周期,
+  prompt 写了不等于模型照做(`page.accessibility` 那次就是先例)
+- **模型能否自己定位登录入口**:导航和点击现在全交给模型写代码
+  (它有 aria_snapshot 和截图)。实测过一次它把 `url` 传成站点首页 ——
+  那时导航还在框架侧,所以用户被扔在首页。现在这一步归模型,需重测
+- **模型是否遵守「不 close 浏览器」**:约定写进了工具描述和系统提示,
+  但一次 `browser.close()` 就会杀掉常驻实例,下一轮接不上
 
 **然后按此顺序**:
 
-1. **浏览器常驻实例(CDP)**:让「上一轮打开的页面,下一轮接着操作」成为可能。
-   排在工具桥之前 —— 它是实际撞到过的限制,纯工程、无未知量
-   (原先排在这里的「隔离边界」已由 audit hook 写边界完成)
-2. **CodeAct 的工具桥**:让子进程内的 Python 能回调 TS 侧工具,
-   动作空间才真正变成代码。架构级改动,需重新设计动作空间
-4. Memory 模块(长期记忆)
-5. Planner 模块(多步任务拆解)—— 刻意排在最后:
+1. **CodeAct 的工具桥**:让子进程内的 Python 能回调 TS 侧工具,
+   动作空间才真正变成代码。架构级改动 —— 桥只暴露筛选后留下的那几个工具,
+   见上方「CodeAct 之后,工具层只留代码碰不到的那几件事」
+2. Memory 模块(长期记忆)
+3. Planner 模块(多步任务拆解)—— 刻意排在最后:
    ReAct 单循环目前还没跑出「明显不够」的证据,提前做属过度设计

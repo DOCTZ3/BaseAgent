@@ -7,10 +7,16 @@ import { Logger } from '../platform/index.js';
 
 // 工具可访问资源类型
 //
-// 没有 'browser':浏览器不是独立资源层,而是 Python 沙箱里预装的一个库
-// (Playwright)。模型经 execute_python 自行驱动,见架构文档
-// 「浏览器是沙箱里的一个库,不是独立模块层」。
-export type ResourceType = 'fs' | 'python' | 'http' | 'agent';
+// 'browser' **只给 screenshot 一个工具**:图片要经 ToolResult.attachments
+// 才能进上下文,而 execute_python 只能回传 stdout —— 模型在代码里截了图自己看不见。
+//
+// 导航、定位元素、点击、DOM 提取一律走代码,不做工具:模型有 aria_snapshot
+// 和截图,按站点差异自己找入口比框架猜选择器准,而且长尾无穷、覆盖不完。
+// 见架构文档「浏览器是代码里的一个库,不是独立模块层」。
+//
+// request_help(暂停并交回控制权)**不需要**这个资源 —— 它不碰浏览器,
+// needs 是空数组。
+export type ResourceType = 'fs' | 'python' | 'browser' | 'http' | 'agent';
 
 // 工具上下文:runner 组装、传给工具的"工具箱"
 export interface ToolContext {
@@ -21,6 +27,7 @@ export interface ToolContext {
   executors: {
     fs?: unknown;      // 文件系统执行器
     python?: unknown;  // Python 沙箱执行器(CodeAct 的执行底座)
+    browser?: unknown; // 常驻浏览器操作(BrowserOps),只给 screenshot
     http?: unknown;    // HTTP 客户端(后续实现)
     agent?: SubAgentRunner;  // 子 agent 执行器(实现在 core 层,见下方接口注释)
   };

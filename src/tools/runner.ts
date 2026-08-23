@@ -12,7 +12,7 @@ import {
 } from './contract.js';
 import { ToolRegistry } from './registry.js';
 import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard, type FsGrant } from '../platform/index.js';
-import { FsDriver, PythonExecutor } from '../executors/index.js';
+import { FsDriver, PythonExecutor, BrowserOps } from '../executors/index.js';
 
 export interface RunnerConfig {
   sessionId: string;
@@ -28,6 +28,8 @@ export interface RunnerConfig {
   // Python 沙箱执行器(CodeAct 底座)。未提供 = 代码执行未启用,
   // execute_python 会返回 ok:false 说明原因
   pythonExecutor?: PythonExecutor;
+  // 常驻浏览器操作。未提供 = screenshot 返回 ok:false 说明原因
+  browserOps?: BrowserOps;
   // 子 agent 执行器(实现在 core 层,由入口注入)。
   // 未提供 = 子 agent 功能未启用,spawn 工具会返回 ok:false 说明原因
   subAgentRunner?: SubAgentRunner;
@@ -118,6 +120,9 @@ export class ToolRunner {
       } else if (need === 'python') {
         // 由入口注入。未注入时保持 undefined，工具自己返回 ok:false 报「未启用」
         executors.python = this.config.pythonExecutor;
+      } else if (need === 'browser') {
+        // 常驻浏览器操作。同样由入口注入，未注入时工具报「未启用」
+        executors.browser = this.config.browserOps;
       } else if (need === 'http') {
         executors.http = null; // 占位
       } else if (need === 'agent') {
