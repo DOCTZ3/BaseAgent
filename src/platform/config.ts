@@ -2,6 +2,29 @@
 // Platform 层:配置管理
 // ============================================
 
+import path from 'path';
+import type { FsGrant } from './security.js';
+
+/**
+ * 解析工作区路径
+ *
+ * 未配置时返回空串,**不回落到 process.cwd()** —— 那会把整个项目目录
+ * (含 src/ 与 .env)交给模型读写,是比"什么都读不到"糟得多的失败模式。
+ * 空串一路传下去的效果是:fs 白名单为空 → 文件工具全部拒绝,
+ * CLI 启动时显式告警(见 cli.ts)。宁可不能干活,不可越界。
+ *
+ * 兼容旧的 FS_SANDBOX_PATHS:那时它是逗号分隔的多路径列表,取第一项。
+ */
+function resolveWorkspace(): string {
+  const explicit = process.env.WORKSPACE?.trim();
+  if (explicit) return path.resolve(explicit);
+
+  const legacy = process.env.FS_SANDBOX_PATHS?.split(',')[0]?.trim();
+  if (legacy) return path.resolve(legacy);
+
+  return '';
+}
+
 // 单个模型配置
 export interface ModelConfig {
   provider: 'deepseek' | 'openai';
@@ -56,9 +79,30 @@ export interface AgentConfig {
     };
   };
 
+  /**
+   * 工作区:agent 唯一的活动范围,也是用户唯一需要配置的路径
+   *
+   * 它同时是三样东西,不再分开配:
+   *   ① fs 工具的白名单根(SecurityGuard)
+   *   ② Python 代码的 cwd —— 模型写的相对路径都落在这里
+   *   ③ Python 写边界的允许范围(audit hook)
+   *
+   * 分开配的问题:改一个忘一个就会错位,出现「fs 工具读得到、Python 写不进」
+   * 这类不一致,而错位不报错、只在运行时表现成模型莫名失败。
+   *
+   * 后续前端的交互形态就是「点一下加号选一个目录」,对应的就是这一项。
+   */
+  workspace: string;
+
   // 安全配置
   security: {
-    fsSandboxPaths: string[];  // 文件系统白名单路径
+    /**
+     * 授权列表(由 workspace 派生,带读写档位)
+     *
+     * 工作区 rw;归档目录 ro —— 模型要读它回溯早期对话,但不能覆盖自己的归档。
+     * 数组形态是为了将来「加号选多个目录」时直接扩展,不必改接口。
+     */
+    fsGrants: FsGrant[];
     allowDangerousTools: boolean;  // 是否启用危险工具
   };
 
@@ -74,7 +118,7 @@ export interface AgentConfig {
   python: {
     enabled: boolean;          // 是否注册 execute_python 工具
     pythonPath: string;        // python 可执行文件(装了 venv 就指向 venv 里那个)
-    workDir: string;           // 代码的 cwd,模型写的相对路径落在这里
+    // 注:代码的 cwd 与写边界都用顶层 workspace,不再单独配 —— 见 workspace 注释
     timeout: number;           // 单次执行超时(ms)
     maxStdoutBytes: number;    // stdout 上限:防 print 整页 HTML 炸上下文
     maxStderrBytes: number;    // stderr 上限:traceback 通常不长
@@ -186,8 +230,24 @@ export const defaultConfig: AgentConfig = {
       answerBrief: process.env.CONTEXT_CLIP_ANSWER_BRIEF ? parseInt(process.env.CONTEXT_CLIP_ANSWER_BRIEF) : 120,
     },
   },
+  // 工作区:唯一需要用户配置的路径。fs 白名单、Python cwd、写边界全部由它派生。
+  // 兼容旧的 FS_SANDBOX_PATHS（取第一项）—— 那时它是逗号分隔的多路径列表
+  workspace: resolveWorkspace(),
   security: {
-    fsSandboxPaths: process.env.FS_SANDBOX_PATHS ? process.env.FS_SANDBOX_PATHS.split(',') : [],
+    // 未配置时必须是**空数组**而不是 ['']：空串在 path.resolve 下等于 cwd，
+    // 那会把整个项目目录（含 src/ 和 .env）当成白名单交给模型 ——
+    // 比「什么都读不到」糟得多的失败模式
+    //
+    // 归档目录由框架自动加入，不要用户配：压缩后模型会被提示用 read_file
+    // 回溯早期对话（traces/<session>/archive/），读不到就等于历史彻底丢失。
+    // 它只需可读 —— Python 的写边界仍只允许工作区，写不进这里
+    fsGrants: resolveWorkspace()
+      ? [
+          { path: resolveWorkspace(), mode: 'rw' as const },
+          // ro：模型要读归档回溯早期对话，但不能覆盖自己的归档
+          { path: path.resolve(process.env.TRACE_DIR || 'traces'), mode: 'ro' as const },
+        ]
+      : [],
     allowDangerousTools: process.env.ALLOW_DANGEROUS_TOOLS === 'true',
   },
   vision: {
@@ -199,7 +259,6 @@ export const defaultConfig: AgentConfig = {
     // 默认关闭:需要先装好 python 环境和依赖库,装好再显式开
     enabled: process.env.PYTHON_ENABLED === 'true',
     pythonPath: process.env.PYTHON_PATH || 'python',
-    workDir: process.env.PYTHON_WORK_DIR || 'sandbox',
     // 比工具默认超时宽:浏览器启动 + 页面加载本身就要几秒
     timeout: process.env.PYTHON_TIMEOUT ? parseInt(process.env.PYTHON_TIMEOUT) : 120_000,
     // 50KB ≈ 1.2 万 token。够放几百条提取结果,又拦得住整页 HTML

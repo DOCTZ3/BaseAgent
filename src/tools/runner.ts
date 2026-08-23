@@ -11,7 +11,7 @@ import {
   SubAgentRunner,
 } from './contract.js';
 import { ToolRegistry } from './registry.js';
-import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard } from '../platform/index.js';
+import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard, type FsGrant } from '../platform/index.js';
 import { FsDriver, PythonExecutor } from '../executors/index.js';
 
 export interface RunnerConfig {
@@ -20,8 +20,9 @@ export interface RunnerConfig {
   signal: AbortSignal;
   onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
   allowDangerousTools: boolean;
-  fsSandboxPaths: string[];
-  // 文件工具够不到的目录(优先于白名单)。浏览器 profile 走这里:
+  // 授权列表(带 ro/rw 档位)。未授权的路径读和写都会被拒
+  fsGrants: FsGrant[];
+  // 文件工具够不到的目录(优先于授权列表)。浏览器 profile 走这里:
   // 里面的 cookie 等价于活凭证,被 read_file 读进上下文会跟着 trace 落盘
   fsDeniedPaths?: string[];
   // Python 沙箱执行器(CodeAct 底座)。未提供 = 代码执行未启用,
@@ -39,9 +40,9 @@ export class ToolRunner {
     private registry: ToolRegistry,
     private config: RunnerConfig,
   ) {
-    // 初始化文件系统执行器(带沙箱:白名单 + 凭证目录黑名单)
+    // 初始化文件系统执行器(授权列表 + 凭证目录黑名单)
     const securityGuard = new SecurityGuard(
-      config.fsSandboxPaths,
+      config.fsGrants,
       config.fsDeniedPaths ?? [],
     );
     this.fsDriver = new FsDriver(securityGuard);

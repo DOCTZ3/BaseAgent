@@ -1,88 +1,149 @@
 // ============================================
-// 安全模块:沙箱权限检查
+// 安全模块:文件系统授权检查
 // ============================================
+//
+// 三档判定(「授权才有权限」):
+//   ① deny 列表  —— 优先于一切,即使落在授权范围内也拒绝(存放活凭证的目录)
+//   ② 授权路径   —— rw 可读写 / ro 只读
+//   ③ 其余       —— 读和写都拒绝
+//
+// **未授权也不可读**是刻意的:能读任意文件是 prompt 注入的主要入口
+// (读到 .ssh / .env 再借浏览器发出去),而外发这条路在本地形态下拦不住,
+// 所以只能在入口侧收紧。
+//
+// 读写必须分开判,不能共用一次检查:归档目录要让模型**读**(压缩后回溯早期
+// 对话),但绝不能让它**写** —— 否则模型可以覆盖自己的归档。同理,用户临时
+// 指定一份文档通常只需要读权限,不该顺带给写。
+//
+// 因此 mode 是**必填参数**、不给默认值:默认值会让漏传的调用点静默落到
+// 宽松的一侧,而这类疏漏不会报错,只会变成安全缺口。
 
 import * as path from 'path';
 import * as fs from 'fs';
 
+/** 本次访问的意图 */
+export type FsMode = 'read' | 'write';
+
+/** 授权级别 */
+export type FsPermission = 'ro' | 'rw';
+
+export interface FsGrant {
+  path: string;
+  mode: FsPermission;
+}
+
+interface Grant {
+  root: string;
+  mode: FsPermission;
+}
+
 export class SecurityGuard {
+  private grants: Grant[];
+  private denied: string[];
+
   /**
-   * @param allowedPaths 白名单:只有这些目录内的路径可访问
-   * @param deniedPaths  黑名单:优先于白名单,即使在白名单内也拒绝。
-   *                     用于存放「活凭证」的目录(如浏览器 profile) —— 里面的 cookie
-   *                     等价于登录态,被 read_file 读进上下文后会跟着 trace 落盘
+   * @param grants 授权列表。裸字符串按 rw 处理(兼容旧的 fsSandboxPaths 形态)
+   * @param deniedPaths 黑名单,优先于授权列表
    */
   constructor(
-    private allowedPaths: string[],
-    private deniedPaths: string[] = [],
-  ) {}
+    grants: ReadonlyArray<FsGrant | string>,
+    deniedPaths: readonly string[] = [],
+  ) {
+    this.grants = grants
+      .map(g =>
+        typeof g === 'string'
+          ? { root: path.resolve(g), mode: 'rw' as FsPermission }
+          : { root: path.resolve(g.path), mode: g.mode },
+      )
+      // 长路径优先。同时授权 D:\a(rw) 和 D:\a\sub(ro) 时,sub 下的文件
+      // 必须按更具体的那条判,否则外层 rw 会把内层 ro 淹掉
+      .sort((a, b) => b.root.length - a.root.length);
 
-  /**
-   * 检查文件路径是否在沙箱白名单内
-   * @param targetPath 要访问的路径
-   * @returns true=允许访问, false=拒绝
-   */
-  checkFsAccess(targetPath: string): boolean {
-    return this.evaluate(targetPath).allowed;
+    this.denied = deniedPaths.map(p => path.resolve(p));
   }
 
-  /**
-   * 断言路径可访问,否则抛出错误
-   */
-  assertFsAccess(targetPath: string): void {
-    const verdict = this.evaluate(targetPath);
+  checkFsAccess(targetPath: string, mode: FsMode): boolean {
+    return this.evaluate(targetPath, mode).allowed;
+  }
+
+  /** 断言可访问,否则抛出带可执行建议的错误(会回流给模型) */
+  assertFsAccess(targetPath: string, mode: FsMode): void {
+    const verdict = this.evaluate(targetPath, mode);
     if (!verdict.allowed) {
       throw new Error(verdict.reason);
     }
   }
 
   /**
-   * 判定单个路径,同时给出可回流给模型的拒绝原因
-   * 黑名单先判:它是白名单之上的例外,顺序反了就失效
+   * 授权快照
+   *
+   * 给两个地方用:CLI 启动横幅(让用户看见 agent 到底能碰哪些目录),
+   * 以及 Python 侧的边界注入(两边必须同源,否则会出现
+   * 「fs 工具读得到、Python 读不到」这类不报错的错位)。
    */
-  private evaluate(targetPath: string): { allowed: boolean; reason: string } {
-    const normalizedTarget = this.normalize(targetPath);
+  listGrants(): ReadonlyArray<Grant> {
+    return this.grants;
+  }
 
-    for (const denied of this.deniedPaths) {
-      if (this.contains(denied, normalizedTarget)) {
+  private evaluate(
+    targetPath: string,
+    mode: FsMode,
+  ): { allowed: boolean; reason: string } {
+    const target = this.normalize(targetPath);
+
+    for (const denied of this.denied) {
+      if (this.contains(denied, target)) {
         return {
           allowed: false,
           reason:
-            `访问被拒绝: 路径 "${targetPath}" 位于受保护目录 "${denied}" 内。\n` +
+            `访问被拒绝: "${targetPath}" 位于受保护目录 "${denied}" 内。\n` +
             `该目录存放凭证类数据,不允许通过文件工具读写。`,
         };
       }
     }
 
-    for (const allowed of this.allowedPaths) {
-      if (this.contains(allowed, normalizedTarget)) {
-        return { allowed: true, reason: '' };
+    // 已排序,首个命中即最具体的那条授权
+    for (const grant of this.grants) {
+      if (!this.contains(grant.root, target)) continue;
+
+      if (mode === 'write' && grant.mode === 'ro') {
+        return {
+          allowed: false,
+          reason:
+            `写入被拒绝: "${targetPath}" 所在目录 "${grant.root}" 是只读授权。\n` +
+            `可以读取,但不能写入或删除。请改写到工作区内。`,
+        };
       }
+      return { allowed: true, reason: '' };
     }
 
+    const rw = this.grants.filter(g => g.mode === 'rw').map(g => g.root);
+    const ro = this.grants.filter(g => g.mode === 'ro').map(g => g.root);
     return {
       allowed: false,
       reason:
-        `访问被拒绝: 路径 "${targetPath}" 不在沙箱白名单内。\n` +
-        `允许的路径: ${this.allowedPaths.join(', ')}`,
+        `访问被拒绝: "${targetPath}" 不在已授权的范围内(${mode === 'write' ? '写入' : '读取'})。\n` +
+        `可读写: ${rw.join(', ') || '(无)'}\n` +
+        (ro.length ? `只读  : ${ro.join(', ')}\n` : '') +
+        `需要访问其他位置时,请说明用途并请用户授权该目录。`,
     };
   }
 
-  /** 规范化路径(解析相对路径、符号链接) */
+  /** 规范化路径(解析相对路径与符号链接) */
   private normalize(targetPath: string): string {
     try {
       return fs.realpathSync(targetPath);
     } catch {
-      // 文件不存在时,realpathSync 会抛错,用 resolve 替代
+      // 文件不存在时 realpathSync 抛错(如写入新文件),退回 resolve。
+      // 此时父目录可能是符号链接 —— 但要借此逃逸得先在授权范围内建链接,
+      // 而建链接本身是写操作、会被这里拦住
       return path.resolve(targetPath);
     }
   }
 
   /** parent 是否包含 target(或两者相同) */
   private contains(parent: string, normalizedTarget: string): boolean {
-    const normalizedParent = path.resolve(parent);
-    const relative = path.relative(normalizedParent, normalizedTarget);
-    // relative 不以 '..' 开头 => target 在 parent 内部
+    const relative = path.relative(parent, normalizedTarget);
     return !relative.startsWith('..') && !path.isAbsolute(relative);
   }
 }

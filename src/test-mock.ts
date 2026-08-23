@@ -37,7 +37,7 @@ async function testRun() {
       return true;
     },
     allowDangerousTools: false,
-    fsSandboxPaths: [],
+    fsGrants: [],
   });
 
   // ④ 创建 Mock LLM Client

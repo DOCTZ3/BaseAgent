@@ -56,8 +56,16 @@ export class ExecutePythonTool implements Tool {
 
   needs = ['python'] as const;
 
-  // 代码执行能写文件、能发网络请求,副作用范围远超写单个文件
-  danger = true;
+  // 写边界(audit hook)已把不可逆操作限制在工作区内,故不再每次弹确认。
+  //
+  // 保持 danger:true 的代价是**确认疲劳**:浏览器任务一轮可能调七八次,
+  // 用户会条件反射按 y —— 那时确认已经是摆设,还给了虚假的安全感。
+  // 打扰额度应该留给真正需要人判断的操作。
+  //
+  // 剩余风险(见架构文档「评估后明确不做」):代码仍能读任意文件、
+  // 并可借浏览器把内容发出去。这两条确认弹窗本来也挡不住 ——
+  // 用户无法在一段代码里看出它会不会外发数据。
+  danger = false;
 
   async run(
     args: { code: string; timeout_ms?: number },

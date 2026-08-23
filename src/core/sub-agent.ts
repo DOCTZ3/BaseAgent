@@ -32,7 +32,7 @@ import {
   SubAgentResult,
   ConfirmRequest,
 } from '../tools/index.js';
-import { Logger } from '../platform/index.js';
+import { Logger, type FsGrant } from '../platform/index.js';
 import { LLMClient } from './llm-client.js';
 import { ContextManager, ContextConfig } from './context.js';
 import { Orchestrator } from './orchestrator.js';
@@ -43,7 +43,8 @@ export interface SubAgentConfig {
   signal: AbortSignal;
   onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
   allowDangerousTools: boolean;
-  fsSandboxPaths: string[];
+  // 与主 agent 同一份授权（含读写档位）—— 安全边界不因下放而放宽
+  fsGrants: FsGrant[];
 
   maxSteps: number;      // 单个子 agent 的步数预算
   maxCount: number;      // 单次会话内最多 spawn 多少个子 agent
@@ -126,7 +127,7 @@ export class LocalSubAgentRunner implements SubAgentRunner {
         signal: this.config.signal,
         onConfirmRequired: this.config.onConfirmRequired,
         allowDangerousTools: this.config.allowDangerousTools,
-        fsSandboxPaths: this.config.fsSandboxPaths,
+        fsGrants: this.config.fsGrants,
       });
 
       const orchestrator = new Orchestrator(this.llmClient, runner, registry, {

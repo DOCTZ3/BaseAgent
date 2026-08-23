@@ -2,8 +2,14 @@
 // Platform 层:SecurityGuard 单元测试
 // ============================================
 //
-// 重点覆盖黑名单：浏览器 profile 目录靠它挡住 read_file，
-// 而 profile 里的 cookie 等价于活凭证。判定顺序错了这层就失效。
+// 覆盖三档判定（「授权才有权限」）：
+//   deny 列表 > 授权路径（ro/rw）> 其余一律拒绝
+//
+// 两处重点：
+// - **未授权连读都拒**。这是刻意的：能读任意文件是 prompt 注入的主要入口，
+//   而外发那条路在本地形态下拦不住，只能在入口侧收紧
+// - **读写必须分开判**。归档目录要让模型读（压缩后回溯早期对话），
+//   但绝不能让它写 —— 否则模型可以覆盖自己的归档
 // ============================================
 
 import { describe, it, expect, beforeAll } from 'vitest';
@@ -14,90 +20,155 @@ import { SecurityGuard } from './security.js';
 
 let root: string;
 let profileDir: string;
+let archiveDir: string;
 
 beforeAll(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'baseagent-sec-'));
   profileDir = path.join(root, '.browser-profile');
+  archiveDir = path.join(root, 'traces');
   await fs.mkdir(profileDir, { recursive: true });
+  await fs.mkdir(archiveDir, { recursive: true });
   await fs.writeFile(path.join(root, 'notes.txt'), 'ok', 'utf-8');
   await fs.writeFile(path.join(profileDir, 'Cookies'), 'secret', 'utf-8');
+  await fs.writeFile(path.join(archiveDir, 'turn-001.json'), '{}', 'utf-8');
 });
 
 describe('SecurityGuard', () => {
-  describe('白名单', () => {
-    it('允许白名单目录内的路径', () => {
-      const guard = new SecurityGuard([root]);
-      expect(guard.checkFsAccess(path.join(root, 'notes.txt'))).toBe(true);
+  describe('rw 授权', () => {
+    it('读写都放行', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }]);
+      const f = path.join(root, 'notes.txt');
+      expect(guard.checkFsAccess(f, 'read')).toBe(true);
+      expect(guard.checkFsAccess(f, 'write')).toBe(true);
     });
 
-    it('允许白名单目录本身', () => {
-      const guard = new SecurityGuard([root]);
-      expect(guard.checkFsAccess(root)).toBe(true);
+    it('授权目录本身也算在内', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }]);
+      expect(guard.checkFsAccess(root, 'read')).toBe(true);
     });
 
-    it('拒绝白名单外的路径', () => {
+    it('裸字符串按 rw 处理（兼容旧的 fsSandboxPaths 形态）', () => {
       const guard = new SecurityGuard([root]);
-      expect(guard.checkFsAccess(path.join(os.tmpdir(), 'elsewhere.txt'))).toBe(false);
-    });
-
-    it('拒绝用 .. 逃逸的路径', () => {
-      const guard = new SecurityGuard([root]);
-      expect(guard.checkFsAccess(path.join(root, '..', 'escaped.txt'))).toBe(false);
-    });
-
-    it('空白名单拒绝一切', () => {
-      const guard = new SecurityGuard([]);
-      expect(guard.checkFsAccess(path.join(root, 'notes.txt'))).toBe(false);
+      expect(guard.checkFsAccess(path.join(root, 'notes.txt'), 'write')).toBe(true);
     });
   });
 
-  describe('黑名单', () => {
-    it('拒绝黑名单目录内的文件,即使它在白名单内', () => {
-      // 这是核心场景:profile 在沙箱根目录下,但必须读不到
-      const guard = new SecurityGuard([root], [profileDir]);
-      expect(guard.checkFsAccess(path.join(profileDir, 'Cookies'))).toBe(false);
+  describe('ro 授权', () => {
+    it('可读', () => {
+      const guard = new SecurityGuard([{ path: archiveDir, mode: 'ro' }]);
+      expect(guard.checkFsAccess(path.join(archiveDir, 'turn-001.json'), 'read'))
+        .toBe(true);
     });
 
-    it('拒绝黑名单目录本身', () => {
-      const guard = new SecurityGuard([root], [profileDir]);
-      expect(guard.checkFsAccess(profileDir)).toBe(false);
+    it('不可写 —— 模型不能覆盖自己的归档', () => {
+      const guard = new SecurityGuard([{ path: archiveDir, mode: 'ro' }]);
+      expect(guard.checkFsAccess(path.join(archiveDir, 'turn-001.json'), 'write'))
+        .toBe(false);
     });
 
-    it('拒绝黑名单目录的深层子路径', () => {
-      const guard = new SecurityGuard([root], [profileDir]);
+    it('拒绝写入时说明是「只读授权」，而非「不在范围内」', () => {
+      // 原因说错会让模型一直换路径重试，而问题其实是权限档位
+      const guard = new SecurityGuard([{ path: archiveDir, mode: 'ro' }]);
+      expect(() => guard.assertFsAccess(path.join(archiveDir, 'x.json'), 'write'))
+        .toThrow(/只读授权/);
+    });
+  });
+
+  describe('未授权：读和写都拒绝', () => {
+    it('未授权路径读被拒', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }]);
+      expect(guard.checkFsAccess(path.join(os.tmpdir(), 'elsewhere.txt'), 'read'))
+        .toBe(false);
+    });
+
+    it('.. 逃逸被拒', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }]);
+      expect(guard.checkFsAccess(path.join(root, '..', 'escaped.txt'), 'read'))
+        .toBe(false);
+    });
+
+    it('空授权列表拒绝一切', () => {
+      const guard = new SecurityGuard([]);
+      expect(guard.checkFsAccess(path.join(root, 'notes.txt'), 'read')).toBe(false);
+    });
+
+    it('错误信息列出可读写与只读两类范围', () => {
+      const guard = new SecurityGuard([
+        { path: root, mode: 'rw' },
+        { path: archiveDir, mode: 'ro' },
+      ]);
+      let msg = '';
+      try {
+        guard.assertFsAccess(path.join(os.tmpdir(), 'nope.txt'), 'read');
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toContain('可读写');
+      expect(msg).toContain('只读');
+      expect(msg).toContain('请用户授权');
+    });
+  });
+
+  describe('嵌套授权：更具体的那条优先', () => {
+    it('rw 目录内的 ro 子目录不被外层淹掉', () => {
+      // traces 在工作区内部，但必须只读
+      const guard = new SecurityGuard([
+        { path: root, mode: 'rw' },
+        { path: archiveDir, mode: 'ro' },
+      ]);
+      expect(guard.checkFsAccess(path.join(archiveDir, 'turn-001.json'), 'write'))
+        .toBe(false);
+      expect(guard.checkFsAccess(path.join(root, 'notes.txt'), 'write'))
+        .toBe(true);
+    });
+
+    it('声明顺序不影响结果（内部按路径长度排序）', () => {
+      const guard = new SecurityGuard([
+        { path: archiveDir, mode: 'ro' },
+        { path: root, mode: 'rw' },
+      ]);
+      expect(guard.checkFsAccess(path.join(archiveDir, 'x'), 'write')).toBe(false);
+    });
+  });
+
+  describe('deny 列表优先于一切', () => {
+    it('即使在 rw 授权内也拒绝', () => {
+      // profile 里的 cookie 等价于活凭证
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [profileDir]);
+      expect(guard.checkFsAccess(path.join(profileDir, 'Cookies'), 'read'))
+        .toBe(false);
+    });
+
+    it('目录本身与深层子路径都拒绝', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [profileDir]);
+      expect(guard.checkFsAccess(profileDir, 'read')).toBe(false);
       expect(
-        guard.checkFsAccess(path.join(profileDir, 'Default', 'Local Storage', 'x.log'))
+        guard.checkFsAccess(
+          path.join(profileDir, 'Default', 'Local Storage', 'x.log'), 'read')
       ).toBe(false);
     });
 
-    it('不影响黑名单之外的同级文件', () => {
-      const guard = new SecurityGuard([root], [profileDir]);
-      expect(guard.checkFsAccess(path.join(root, 'notes.txt'))).toBe(true);
+    it('不影响同级其他文件', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [profileDir]);
+      expect(guard.checkFsAccess(path.join(root, 'notes.txt'), 'read')).toBe(true);
     });
 
-    it('未配置黑名单时行为不变', () => {
-      const guard = new SecurityGuard([root]);
-      expect(guard.checkFsAccess(path.join(profileDir, 'Cookies'))).toBe(true);
+    it('拒绝原因说明是受保护目录', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [profileDir]);
+      expect(() => guard.assertFsAccess(path.join(profileDir, 'Cookies'), 'read'))
+        .toThrow(/受保护目录/);
     });
   });
 
-  describe('assertFsAccess 的错误信息', () => {
-    it('黑名单拒绝时说明是受保护目录,而不是「不在白名单内」', () => {
-      // 错误会回流给模型,原因说错会让它一直换路径重试
-      const guard = new SecurityGuard([root], [profileDir]);
-      expect(() => guard.assertFsAccess(path.join(profileDir, 'Cookies')))
-        .toThrow(/受保护目录/);
-    });
-
-    it('白名单拒绝时列出允许的路径', () => {
-      const guard = new SecurityGuard([root]);
-      expect(() => guard.assertFsAccess(path.join(os.tmpdir(), 'nope.txt')))
-        .toThrow(/不在沙箱白名单内/);
-    });
-
-    it('允许的路径不抛错', () => {
-      const guard = new SecurityGuard([root], [profileDir]);
-      expect(() => guard.assertFsAccess(path.join(root, 'notes.txt'))).not.toThrow();
+  describe('listGrants', () => {
+    it('返回授权快照，供启动横幅与 Python 侧同源使用', () => {
+      const guard = new SecurityGuard([
+        { path: root, mode: 'rw' },
+        { path: archiveDir, mode: 'ro' },
+      ]);
+      const grants = guard.listGrants();
+      expect(grants).toHaveLength(2);
+      expect(grants.map(g => g.mode).sort()).toEqual(['ro', 'rw']);
     });
   });
 });

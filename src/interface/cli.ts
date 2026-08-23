@@ -119,12 +119,15 @@ async function main() {
     process.exit(1);
   }
 
-  // 空白名单 = 所有 fs 工具都会被拒绝，模型会一路试路径撞墙并白烧 token。
+  // 未配置工作区 = 所有 fs 工具都会被拒绝，模型会一路试路径撞墙并白烧 token。
   // 这是踩过的坑，必须显式告警。
-  if (config.security.fsSandboxPaths.length === 0) {
+  //
+  // 判空要看内容而不是数组长度：workspace 未配置时 fsSandboxPaths 是 ['']，
+  // 长度为 1 但没有意义 —— 而空串在路径检查里会被解析成 cwd（即整个项目目录）。
+  if (!config.workspace) {
     console.warn(
-      `${YELLOW}警告: FS_SANDBOX_PATHS 未配置,文件类工具将全部被拒绝。${RESET}\n` +
-      `${DIM}      在 .env 里设置,例如: FS_SANDBOX_PATHS=${process.cwd()}${RESET}`
+      `${YELLOW}警告: WORKSPACE 未配置,文件类工具与代码执行将全部被拒绝。${RESET}\n` +
+      `${DIM}      在 .env 里设置,例如: WORKSPACE=${process.cwd()}${RESET}`
     );
   }
 
@@ -199,7 +202,7 @@ async function main() {
         signal: abortController.signal,
         onConfirmRequired,
         allowDangerousTools: config.security.allowDangerousTools,
-        fsSandboxPaths: config.security.fsSandboxPaths,
+        fsGrants: config.security.fsGrants,
         maxSteps: config.subAgent.maxSteps,
         maxCount: config.subAgent.maxCount,
         contextConfig: contextTuning,
@@ -210,10 +213,13 @@ async function main() {
   // 浏览器能力经此提供：沙箱预装 Playwright，模型自己写代码驱动。
   // profile 目录用绝对路径：要同时注入子进程和进 fs deny 列表，相对路径两边解析基准不同
   const browserProfileDir = path.resolve(config.python.browserProfileDir);
-  const pythonExecutor = config.python.enabled
+  // 没有工作区就不创建执行器：workDir 为空串会让 path.resolve 解析成 cwd，
+  // 写边界随之变成整个项目目录。缺配置时宁可代码执行不可用，不可越界
+  const pythonExecutor = config.python.enabled && config.workspace
     ? new PythonExecutor({
         pythonPath: config.python.pythonPath,
-        workDir: path.resolve(config.python.workDir),
+        // 与 fs 白名单同源：cwd 和写边界都用 workspace，不再单独配
+        workDir: config.workspace,
         timeout: config.python.timeout,
         maxStdoutBytes: config.python.maxStdoutBytes,
         maxStderrBytes: config.python.maxStderrBytes,
@@ -229,7 +235,7 @@ async function main() {
     signal: abortController.signal,
     onConfirmRequired,
     allowDangerousTools: config.security.allowDangerousTools,
-    fsSandboxPaths: config.security.fsSandboxPaths,
+    fsGrants: config.security.fsGrants,
     // profile 里的 cookie 等价于活凭证，不能让 read_file 读进上下文并跟着 trace 落盘
     fsDeniedPaths: config.python.enabled ? [browserProfileDir] : [],
     pythonExecutor,
@@ -300,13 +306,19 @@ async function main() {
     : modelConfig.maxTokens ? '跟随主模型' : '内置兜底';
   console.log(dim(`  压缩预算  ${fmtTokens(compBudget)} tokens (${compSource}),工具结果截断 ${config.context.compressionClip.toolResult} 字`));
   console.log(dim(`  留痕      ${config.trace.enabled ? recorder.traceDir : '已关闭'}`));
-  console.log(dim(`  沙箱      ${config.security.fsSandboxPaths.join(', ') || '(空)'}`));
+  // 授权范围必须可见：用户得知道 agent 到底能碰哪些目录、哪些只读。
+  // 归档目录是框架自动授权的，不显示的话用户根本不知道它在里面
+  console.log(dim(`  授权范围  ${
+    config.security.fsGrants.length > 0
+      ? config.security.fsGrants.map(g => `${g.path} [${g.mode}]`).join('\n            ')
+      : '(未配置 WORKSPACE，文件工具与代码执行均不可用)'
+  }`));
   console.log(dim(`  危险工具  ${config.security.allowDangerousTools ? '已启用(需确认)' : '已禁用'}`));
   console.log(dim(`  子 agent  ${config.subAgent.enabled
     ? `已启用,最多 ${config.subAgent.maxCount} 个,各 ${config.subAgent.maxSteps} 步`
     : '已禁用'}`));
   console.log(dim(`  代码执行  ${config.python.enabled
-    ? `已启用 ${config.python.pythonPath},cwd=${config.python.workDir},stdout 上限 ${Math.round(config.python.maxStdoutBytes / 1024)}KB`
+    ? `已启用 ${config.python.pythonPath},stdout 上限 ${Math.round(config.python.maxStdoutBytes / 1024)}KB,写边界=工作区`
     : '已禁用 (PYTHON_ENABLED=true 开启)'}`));
   console.log(dim(`  图片输入  ${config.vision.enabled
     ? `已启用 view_image (每图 ≤384 token)`

@@ -44,6 +44,7 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { buildWriteGuardPrelude } from './write-guard.js';
 
 // 只依赖四个方法,与 RetryHandler 同样的窄接口,避免耦合具体 Logger 实现
 interface ExecutorLogger {
@@ -74,6 +75,16 @@ export interface PythonExecutorConfig {
    * 打进上下文并跟着 trace 落盘。
    */
   inheritEnv?: string[];
+  /**
+   * 写边界:只允许往工作区(和 temp)写文件,其余写操作被拒
+   *
+   * 默认开启。关掉意味着模型的代码能删/改机器上任意文件 ——
+   * 写/删是不可逆的,一次手滑就是真实损失。
+   * 只管写不管读:读错文件没有直接损害,而读的白名单最容易误伤 import
+   * (实测一次 `import pandas` 触发 1183 次 open,全是库加载)。
+   * 详见 write-guard.ts 顶部注释,含「明确不做」的清单与剩余风险。
+   */
+  writeGuard?: boolean;
   logger: ExecutorLogger;
 }
 
@@ -139,7 +150,13 @@ export class PythonExecutor {
 
     await fs.mkdir(this.config.workDir, { recursive: true });
     const scriptPath = path.join(os.tmpdir(), `baseagent-${randomUUID()}.py`);
-    await fs.writeFile(scriptPath, code, 'utf-8');
+
+    // 写边界必须排在模型代码之前：audit hook 一旦注册就无法注销
+    // （PEP 578 故意不提供 remove），所以模型的代码删不掉它
+    const prelude = (this.config.writeGuard ?? true)
+      ? buildWriteGuardPrelude(this.config.workDir)
+      : '';
+    await fs.writeFile(scriptPath, prelude + code, 'utf-8');
 
     try {
       return await this.spawnScript(scriptPath, timeout, startedAt, options.env);

@@ -15,7 +15,7 @@ export class FsDriver {
    * 读取文件内容
    */
   async readFile(filePath: string): Promise<string> {
-    this.securityGuard.assertFsAccess(filePath);
+    this.securityGuard.assertFsAccess(filePath, 'read');
     return await fs.readFile(filePath, 'utf-8');
   }
 
@@ -26,7 +26,7 @@ export class FsDriver {
    * 替换字符，base64 编码出来的东西服务端根本认不出格式。
    */
   async readFileBytes(filePath: string): Promise<Buffer> {
-    this.securityGuard.assertFsAccess(filePath);
+    this.securityGuard.assertFsAccess(filePath, 'read');
     return await fs.readFile(filePath);
   }
 
@@ -34,7 +34,7 @@ export class FsDriver {
    * 列出目录内容
    */
   async listDirectory(dirPath: string): Promise<string[]> {
-    this.securityGuard.assertFsAccess(dirPath);
+    this.securityGuard.assertFsAccess(dirPath, 'read');
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
     return entries.map(entry => {
@@ -54,7 +54,7 @@ export class FsDriver {
     pattern: string,
     maxDepth: number
   ): Promise<string[]> {
-    this.securityGuard.assertFsAccess(baseDir);
+    this.securityGuard.assertFsAccess(baseDir, 'read');
 
     const results: string[] = [];
     const regex = this.patternToRegex(pattern);
@@ -68,7 +68,8 @@ export class FsDriver {
    * 写入文件(会自动创建父目录)
    */
   async writeFile(filePath: string, content: string): Promise<void> {
-    this.securityGuard.assertFsAccess(filePath);
+    // 走 write 检查：只读授权（如归档目录）到这里会被拒
+    this.securityGuard.assertFsAccess(filePath, 'write');
 
     // 确保父目录存在
     const dir = path.dirname(filePath);

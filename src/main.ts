@@ -70,10 +70,13 @@ async function main() {
   // Python 沙箱(CodeAct 底座)。浏览器能力经此提供,不做独立 BrowserDriver。
   // profile 用绝对路径:要同时注入子进程和进 fs deny 列表,相对路径两边解析基准不同
   const browserProfileDir = path.resolve(config.python.browserProfileDir);
-  const pythonExecutor = config.python.enabled
+  // 没有工作区就不创建执行器：workDir 为空串会让 path.resolve 解析成 cwd，
+  // 写边界随之变成整个项目目录。缺配置时宁可代码执行不可用，不可越界
+  const pythonExecutor = config.python.enabled && config.workspace
     ? new PythonExecutor({
         pythonPath:     config.python.pythonPath,
-        workDir:        path.resolve(config.python.workDir),
+        // 与 fs 白名单同源：cwd 和写边界都用 workspace，不再单独配
+        workDir:        config.workspace,
         timeout:        config.python.timeout,
         maxStdoutBytes: config.python.maxStdoutBytes,
         maxStderrBytes: config.python.maxStderrBytes,
@@ -91,7 +94,7 @@ async function main() {
       return true; // 测试阶段自动批准，后续接 CLI 交互
     },
     allowDangerousTools: config.security.allowDangerousTools,
-    fsSandboxPaths:      config.security.fsSandboxPaths,
+    fsGrants:            config.security.fsGrants,
     // profile 里的 cookie 等价于活凭证,不能让 read_file 读进上下文并跟着 trace 落盘
     fsDeniedPaths:       config.python.enabled ? [browserProfileDir] : [],
     pythonExecutor,
