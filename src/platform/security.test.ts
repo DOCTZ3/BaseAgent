@@ -14,6 +14,7 @@
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { SecurityGuard } from './security.js';
@@ -169,6 +170,52 @@ describe('SecurityGuard', () => {
       const grants = guard.listGrants();
       expect(grants).toHaveLength(2);
       expect(grants.map(g => g.mode).sort()).toEqual(['ro', 'rw']);
+    });
+  });
+
+  // ============================================
+  // 相对路径的解析基准
+  // ============================================
+  //
+  // 回归：基准原本是 process.cwd()（项目目录），而 Python 子进程的 cwd 是工作区。
+  // 于是模型在代码里写 read_file("a.txt")、文件确实在工作区里
+  // （os.path.exists 为 True），经工具桥回到 TS 却按项目目录解析 —— 实测被拒。
+  // 更糟的一侧是「检查路径 A、读取路径 B」：若项目目录下恰好有同名文件，
+  // 检查通过之后读到的是未授权的那一个。
+  describe('相对路径基准', () => {
+    it('按 baseDir（工作区）解析，不按 process.cwd()', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [], root);
+
+      // 裸文件名：只有按工作区解析才落在授权范围内
+      expect(guard.checkFsAccess('notes.txt', 'read')).toBe(true);
+      expect(guard.checkFsAccess('./notes.txt', 'read')).toBe(true);
+    });
+
+    it('不给 baseDir 时退回 process.cwd()（旧行为，兼容既有调用点）', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }]);
+      // 工作区不是 cwd，所以裸文件名解析到 cwd 下、落在授权外
+      expect(guard.checkFsAccess('notes.txt', 'read')).toBe(false);
+    });
+
+    it('相对路径逃逸出工作区仍被拒', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [], root);
+      expect(guard.checkFsAccess('../outside.txt', 'read')).toBe(false);
+      expect(guard.checkFsAccess('../../etc/passwd', 'read')).toBe(false);
+    });
+
+    it('相对路径同样受 deny 列表约束', () => {
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [profileDir], root);
+      expect(guard.checkFsAccess('.browser-profile/Cookies', 'read')).toBe(false);
+    });
+
+    it('assertFsAccess 返回检查时用的绝对路径，供调用方做实际 IO', () => {
+      // FsDriver 必须用这个返回值去读写：用入参会变成「检查 A、读取 B」
+      const guard = new SecurityGuard([{ path: root, mode: 'rw' }], [], root);
+      const resolved = guard.assertFsAccess('notes.txt', 'read');
+
+      expect(path.isAbsolute(resolved)).toBe(true);
+      // realpathSync 会解析符号链接（macOS 的 /var → /private/var），故比对 realpath
+      expect(resolved).toBe(fsSync.realpathSync(path.join(root, 'notes.txt')));
     });
   });
 });

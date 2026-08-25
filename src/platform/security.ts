@@ -40,15 +40,24 @@ interface Grant {
 export class SecurityGuard {
   private grants: Grant[];
   private denied: string[];
+  private baseDir: string;
 
   /**
    * @param grants 授权列表。裸字符串按 rw 处理(兼容旧的 fsSandboxPaths 形态)
    * @param deniedPaths 黑名单,优先于授权列表
+   * @param baseDir 相对路径的解析基准,应为**工作区**。缺省退回 process.cwd()
+   *
+   * 为什么基准必须是工作区、而不是进程 cwd:Python 子进程的 cwd 就是工作区,
+   * 于是模型在代码里写 `view_image(path="chart.png")` 时,文件确实在那儿
+   * (`os.path.exists` 为 True),但经工具桥回到 TS 后按进程 cwd(项目目录)解析,
+   * 就变成了另一个文件 —— 实测被拒。两边基准必须同源。
    */
   constructor(
     grants: ReadonlyArray<FsGrant | string>,
     deniedPaths: readonly string[] = [],
+    baseDir?: string,
   ) {
+    this.baseDir = path.resolve(baseDir || process.cwd());
     this.grants = grants
       .map(g =>
         typeof g === 'string'
@@ -66,12 +75,19 @@ export class SecurityGuard {
     return this.evaluate(targetPath, mode).allowed;
   }
 
-  /** 断言可访问,否则抛出带可执行建议的错误(会回流给模型) */
-  assertFsAccess(targetPath: string, mode: FsMode): void {
+  /**
+   * 断言可访问,否则抛出带可执行建议的错误(会回流给模型)
+   *
+   * **返回检查时用的那个绝对路径,调用方必须拿它去做实际 IO。**
+   * 否则「检查路径 A、读取路径 B」——相对路径两次解析基准不同、
+   * 或中途符号链接被替换,都会变成绕过检查的读写。
+   */
+  assertFsAccess(targetPath: string, mode: FsMode): string {
     const verdict = this.evaluate(targetPath, mode);
     if (!verdict.allowed) {
       throw new Error(verdict.reason);
     }
+    return verdict.resolved;
   }
 
   /**
@@ -88,13 +104,14 @@ export class SecurityGuard {
   private evaluate(
     targetPath: string,
     mode: FsMode,
-  ): { allowed: boolean; reason: string } {
+  ): { allowed: boolean; reason: string; resolved: string } {
     const target = this.normalize(targetPath);
 
     for (const denied of this.denied) {
       if (this.contains(denied, target)) {
         return {
           allowed: false,
+          resolved: target,
           reason:
             `访问被拒绝: "${targetPath}" 位于受保护目录 "${denied}" 内。\n` +
             `该目录存放凭证类数据,不允许通过文件工具读写。`,
@@ -109,18 +126,20 @@ export class SecurityGuard {
       if (mode === 'write' && grant.mode === 'ro') {
         return {
           allowed: false,
+          resolved: target,
           reason:
             `写入被拒绝: "${targetPath}" 所在目录 "${grant.root}" 是只读授权。\n` +
             `可以读取,但不能写入或删除。请改写到工作区内。`,
         };
       }
-      return { allowed: true, reason: '' };
+      return { allowed: true, reason: '', resolved: target };
     }
 
     const rw = this.grants.filter(g => g.mode === 'rw').map(g => g.root);
     const ro = this.grants.filter(g => g.mode === 'ro').map(g => g.root);
     return {
       allowed: false,
+      resolved: target,
       reason:
         `访问被拒绝: "${targetPath}" 不在已授权的范围内(${mode === 'write' ? '写入' : '读取'})。\n` +
         `可读写: ${rw.join(', ') || '(无)'}\n` +
@@ -129,15 +148,25 @@ export class SecurityGuard {
     };
   }
 
-  /** 规范化路径(解析相对路径与符号链接) */
+  /**
+   * 规范化路径(解析相对路径与符号链接)
+   *
+   * 相对路径按 baseDir(工作区)解析,**不用 process.cwd()** ——
+   * Python 子进程的 cwd 是工作区,两边基准不同就会出现
+   * 「代码里 os.path.exists 为 True,经桥调工具却被拒」这种错位(实测)。
+   */
   private normalize(targetPath: string): string {
+    const absolute = path.isAbsolute(targetPath)
+      ? targetPath
+      : path.resolve(this.baseDir, targetPath);
+
     try {
-      return fs.realpathSync(targetPath);
+      return fs.realpathSync(absolute);
     } catch {
       // 文件不存在时 realpathSync 抛错(如写入新文件),退回 resolve。
       // 此时父目录可能是符号链接 —— 但要借此逃逸得先在授权范围内建链接,
       // 而建链接本身是写操作、会被这里拦住
-      return path.resolve(targetPath);
+      return path.resolve(absolute);
     }
   }
 

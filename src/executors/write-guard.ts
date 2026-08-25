@@ -10,6 +10,28 @@
 //   全是库加载。漏放行一个目录就是 import 直接失败
 // - 因此收益/风险比在「写」这一侧压倒性地好
 //
+// ⚠️ **已知缺口:换个进程就绕过。**
+//
+// audit hook 的性质是「注册后删不掉,但只管当前进程」。所以模型不需要攻击这个
+// 钩子,只要**换个进程**:
+//   subprocess.run([sys.executable, "-c", "open(r'C:\\x.txt','w')"])   # 实测成功
+// 实测对照:同一路径直接写 → 被拒;经 subprocess 起新解释器写 → 返回码 0,
+// 文件真的落盘了。os.system / os.spawn* / ctypes 调 CreateProcess、
+// 以及机器上现成的 powershell / cmd / node / git 都是同一个出口。
+//
+// 因此本模块是**护栏,不是边界**:它挡住「没在攻击、只是按常规写法办事」的代码
+// (实测事故就是这种 —— 模型想做 OCR,不是想越界),挡不住刻意绕的。
+// 真边界必须在进程之外(容器 / 独立用户 / seccomp),属于待实现。
+//
+// 缓解措施(各管一段,都不管全部):
+// - **沙箱 venv**(PYTHON_PATH 指向项目内 venv):装包落在 venv,碰不到用户全局
+//   环境。结构性、无绕法 —— 治的是「污染」,不是「越界」
+// - **PIP_NO_INDEX**(见 sandbox-env.ts):代码里 pip 装不上。同样是路牌不是锁,
+//   但它借的是 env **向子进程继承**的性质,恰好覆盖 subprocess 这条路
+// - **run_command**(danger:true,原样命令给用户看):装包的正式通道。
+//   pip 在安装期就执行 setup.py、而构建隔离跑在放行的 TEMP 里 ——
+//   写边界对这条路完全无感,只有人读那行命令才拦得住 typosquatting
+//
 // 明确**不做**(评估后放弃,不是欠的债):
 // - **网络管控**:实测无效。Playwright 全流程里 socket.connect 只出现 2 次、
 //   都是 127.0.0.1(Python 连本地 driver);真正访问网站的是 node driver 与
@@ -17,7 +39,12 @@
 // - **subprocess / ctypes 调用栈分析**:实测 subprocess.Popen 的 executable 参数
 //   是 None、命令行是一整个带空格的字符串,无法可靠切分;而 ctypes.dlopen
 //   有正常用途(标准库查时区会 dlopen kernel32/tzres.dll)。
-//   要区分「谁触发的」需要栈分析,复杂且脆弱
+//   要区分「谁触发的」需要栈分析,复杂且脆弱。
+//   **注意这条只说明「拦 subprocess 很难」,不改变上面那个缺口的存在**
+// - **sitecustomize.py / .pth 注入**(让新解释器自动装同一份写边界):可行且便宜,
+//   但绕法仍在(`python -S` 不加载 site、`-I` 连 PYTHONPATH 一起忽略),
+//   而且只覆盖 Python 子进程。加了容易让人误以为进程内边界补上了 ——
+//   PIP_NO_INDEX + run_command 确认已经覆盖了实际发生过的场景,故暂不做
 // - **读路径白名单 / 分级策略 / 中途授权确认**:见上;后者还需要 CodeAct 工具桥
 //
 // 剩余风险(产品决策,不是技术限制):

@@ -13,10 +13,14 @@ export class FsDriver {
 
   /**
    * 读取文件内容
+   *
+   * 用 assertFsAccess 返回的**已解析路径**去读,不用入参 —— 否则就是
+   * 「检查路径 A、读取路径 B」:相对路径两次解析基准不同时会读到别的文件。
+   * 下面每个方法同理。
    */
   async readFile(filePath: string): Promise<string> {
-    this.securityGuard.assertFsAccess(filePath, 'read');
-    return await fs.readFile(filePath, 'utf-8');
+    const resolved = this.securityGuard.assertFsAccess(filePath, 'read');
+    return await fs.readFile(resolved, 'utf-8');
   }
 
   /**
@@ -26,16 +30,16 @@ export class FsDriver {
    * 替换字符，base64 编码出来的东西服务端根本认不出格式。
    */
   async readFileBytes(filePath: string): Promise<Buffer> {
-    this.securityGuard.assertFsAccess(filePath, 'read');
-    return await fs.readFile(filePath);
+    const resolved = this.securityGuard.assertFsAccess(filePath, 'read');
+    return await fs.readFile(resolved);
   }
 
   /**
    * 列出目录内容
    */
   async listDirectory(dirPath: string): Promise<string[]> {
-    this.securityGuard.assertFsAccess(dirPath, 'read');
-    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    const resolved = this.securityGuard.assertFsAccess(dirPath, 'read');
+    const entries = await fs.readdir(resolved, { withFileTypes: true });
 
     return entries.map(entry => {
       const name = entry.name;
@@ -54,12 +58,12 @@ export class FsDriver {
     pattern: string,
     maxDepth: number
   ): Promise<string[]> {
-    this.securityGuard.assertFsAccess(baseDir, 'read');
+    const resolved = this.securityGuard.assertFsAccess(baseDir, 'read');
 
     const results: string[] = [];
     const regex = this.patternToRegex(pattern);
 
-    await this.searchRecursive(baseDir, baseDir, regex, maxDepth, 0, results);
+    await this.searchRecursive(resolved, resolved, regex, maxDepth, 0, results);
 
     return results;
   }
@@ -69,13 +73,13 @@ export class FsDriver {
    */
   async writeFile(filePath: string, content: string): Promise<void> {
     // 走 write 检查：只读授权（如归档目录）到这里会被拒
-    this.securityGuard.assertFsAccess(filePath, 'write');
+    const resolved = this.securityGuard.assertFsAccess(filePath, 'write');
 
     // 确保父目录存在
-    const dir = path.dirname(filePath);
+    const dir = path.dirname(resolved);
     await fs.mkdir(dir, { recursive: true });
 
-    await fs.writeFile(filePath, content, 'utf-8');
+    await fs.writeFile(resolved, content, 'utf-8');
   }
 
   // ============================================

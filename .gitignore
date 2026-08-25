@@ -18,3 +18,7 @@ traces*/
 # profile 里的 cookie 等价于活凭证，绝不能进版本库
 sandbox/
 .browser-profile/
+
+# 沙箱 venv（模型装的包落在这里，碰不到全局环境）。
+# 放在工作区之外是刻意的：放进去模型的代码就能改 venv 自身
+.sandbox-venv/

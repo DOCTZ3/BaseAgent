@@ -17,6 +17,26 @@ import type { PythonExecutor } from '../../../executors/index.js';
 export class ExecutePythonTool implements Tool {
   name = 'execute_python';
 
+  /**
+   * @param bridgeSignatures 工具桥暴露的 Python 函数签名(由入口从 ToolBridge 取)
+   *
+   * signature 由桥从工具的 JSON Schema 生成、不手写 ——
+   * 手写的那份迟早和真实签名漂移,而漂移的表现是「模型照描述调用却报 TypeError」
+   */
+  constructor(private bridgeSignatures: string[] = []) {
+    if (bridgeSignatures.length > 0) {
+      this.description += [
+        '',
+        '',
+        '代码里可以直接调用这些框架函数(它们做的是纯 Python 做不到的事):',
+        ...bridgeSignatures.map(s => `  ${s}`),
+        '返回 dict,用 result["ok"] 判断成败。',
+        'screenshot / view_image 的图片不在返回值里 —— 框架会把它注入你的上下文,',
+        '你在本轮工具结果之后就能看见。单次执行最多收 8 张,请先筛选再截图。',
+      ].join('\n');
+    }
+  }
+
   // description 是模型用这个工具的唯一说明书,所以把"怎么用才不炸上下文"写在这里,
   // 而不是散在 system prompt 里
   description = [
@@ -118,6 +138,10 @@ export class ExecutePythonTool implements Tool {
         };
       }
 
+      // 代码经工具桥拿到的观察:必须上浮,由框架投递 ——
+      // 代码只能回传 stdout,而模型裸调 view_image 时不会 print 返回值
+      const observations = result.observations;
+
       return {
         ok: true,
         data: {
@@ -125,7 +149,14 @@ export class ExecutePythonTool implements Tool {
           // 成功但有 stderr 是常态(warning),不算失败,但要让模型看见
           ...(result.stderr.trim() ? { stderr: clip(result.stderr, 1000) } : {}),
           duration_ms: result.durationMs,
+          ...(observations.length
+            ? {
+                observations_attached: observations.length,
+                note: '代码里看图的观察已附加，你将在本轮工具结果之后看到它',
+              }
+            : {}),
         },
+        ...(observations.length ? { observations } : {}),
       };
     } catch (error) {
       return {

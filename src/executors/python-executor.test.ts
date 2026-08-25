@@ -75,6 +75,16 @@ describe.skipIf(!hasPython)('PythonExecutor', () => {
       expect(r.stdout.trim()).toBe('正文内容：标题');
     });
 
+    it('多行输出用 \\n 而非 \\r\\n', async () => {
+      // Windows 上 print 每行都产出 \r\n。stdout 会被 JSON.stringify 进 tool 消息，
+      // 不归一的话模型看到的是满屏 "第一行\r\n第二行\r\n" —— 纯噪声还占 token
+      const r = await makeExecutor().run('print("第一行")\nprint("第二行")');
+
+      expect(r.ok).toBe(true);
+      expect(r.stdout).toBe('第一行\n第二行\n');
+      expect(r.stdout).not.toContain('\r');
+    });
+
     it('语法/运行时错误以 ok:false + stderr 返回,不抛异常', async () => {
       const r = await makeExecutor().run('raise ValueError("boom")');
 
@@ -230,6 +240,104 @@ describe.skipIf(!hasPython)('PythonExecutor', () => {
         .filter(f => f.startsWith('baseagent-') && f.endsWith('.py'));
 
       expect(after.length).toBeLessThanOrEqual(before.length);
+    });
+  });
+
+  // ============================================
+  // 代码里装不了包
+  // ============================================
+  //
+  // 针对一次**实测事故**:模型想做 OCR,在代码里写
+  //   subprocess.run([sys.executable, "-m", "pip", "install", "-q", "rapidocr_onnxruntime"])
+  // 返回码 0、静默成功,顺带把用户全局环境里的 onnxruntime 升级了 ——
+  // 用户是事后翻 trace 才发现的。
+  //
+  // 这里断言的核心性质是 env **向子进程继承**:所以 subprocess 起的新解释器
+  // 也覆盖得到。这正好补上写边界补不了的那块 —— audit hook 反过来:
+  // 注册后删不掉,但只管当前进程,换个进程就绕过(见 write-guard.ts 的已知缺口)。
+  describe('禁止代码里装包(PIP_NO_INDEX)', () => {
+    it('默认注入 PIP_NO_INDEX', async () => {
+      const r = await makeExecutor().run(
+        'import os\nprint(os.environ.get("PIP_NO_INDEX", "MISSING"))',
+      );
+
+      expect(r.stdout.trim()).toBe('1');
+    });
+
+    it('**subprocess 起的新解释器也继承** —— 这是它能覆盖事故路径的原因', async () => {
+      const r = await makeExecutor().run(
+        [
+          'import os, sys, subprocess',
+          'out = subprocess.run(',
+          '    [sys.executable, "-c", "import os; print(os.environ.get(\\"PIP_NO_INDEX\\", \\"MISSING\\"))"],',
+          '    capture_output=True, text=True)',
+          'print(out.stdout.strip())',
+        ].join('\n'),
+      );
+
+      expect(r.ok).toBe(true);
+      expect(r.stdout.trim()).toBe('1');
+    });
+
+    it('blockPipInstall:false 时不注入 —— 留一个可对照的关', async () => {
+      const executor = new PythonExecutor({
+        pythonPath: 'python',
+        workDir,
+        timeout: 20_000,
+        maxStdoutBytes: 50 * 1024,
+        maxStderrBytes: 8 * 1024,
+        blockPipInstall: false,
+        logger: mockLogger,
+      });
+
+      const r = await executor.run(
+        'import os\nprint(os.environ.get("PIP_NO_INDEX", "MISSING"))',
+      );
+
+      expect(r.stdout.trim()).toBe('MISSING');
+    });
+
+    it('构造时的 env 能覆盖它 —— 框架自己的脚本(BrowserOps)需要这个自由度', async () => {
+      const r = await makeExecutor({ env: { PIP_NO_INDEX: '' } }).run(
+        'import os\nprint(repr(os.environ.get("PIP_NO_INDEX", "MISSING")))',
+      );
+
+      expect(r.stdout.trim()).toBe("''");
+    });
+  });
+
+  // 凭证隔离:VISION_API_KEY / DEEPSEEK_API_KEY 不进沙箱。
+  // 这是工具桥在 CodeAct 收敛后继续存在的理由之一 ——
+  // 代码拿不到 key,就必须经桥调视觉模型
+  describe('凭证隔离', () => {
+    it('DEEPSEEK_API_KEY 不进子进程', async () => {
+      const prev = process.env.DEEPSEEK_API_KEY;
+      process.env.DEEPSEEK_API_KEY = 'sk-should-not-leak';
+
+      try {
+        const r = await makeExecutor().run(
+          'import os\nprint(os.environ.get("DEEPSEEK_API_KEY", "MISSING"))',
+        );
+        expect(r.stdout.trim()).toBe('MISSING');
+      } finally {
+        if (prev === undefined) delete process.env.DEEPSEEK_API_KEY;
+        else process.env.DEEPSEEK_API_KEY = prev;
+      }
+    });
+
+    it('VISION_API_KEY 不进子进程 —— 否则代码能自己调视觉 API,绕过工具桥', async () => {
+      const prev = process.env.VISION_API_KEY;
+      process.env.VISION_API_KEY = 'sk-vision-should-not-leak';
+
+      try {
+        const r = await makeExecutor().run(
+          'import os\nprint(os.environ.get("VISION_API_KEY", "MISSING"))',
+        );
+        expect(r.stdout.trim()).toBe('MISSING');
+      } finally {
+        if (prev === undefined) delete process.env.VISION_API_KEY;
+        else process.env.VISION_API_KEY = prev;
+      }
     });
   });
 });

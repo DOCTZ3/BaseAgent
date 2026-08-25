@@ -1,61 +1,79 @@
 // ============================================
-// 代码工具:view_image(让模型"看见"一张本地图片)
+// 代码工具:view_image(把一张本地图片交给视觉模型,带回文字观察)
 // ============================================
 //
-// 模型的输出只有文本和 tool_calls,改不了请求体 —— 所以它无法自己把图片塞进上下文。
-// 这个工具就是那条带内信道:模型调它,框架读盘、编码、在下一轮注入成 user 消息。
-// 模型全程不需要知道 wire 格式,它只是"调了个工具,然后就看见了"。
+// **数据流是「图进视觉模型、文字回主模型」**,不是「把图搬进主模型的上下文」。
+// 主模型全程不接触像素,所以它是不是多模态与框架无关 —— 这是视觉即插件的含义。
+// 未配 VISION_MODEL 时这个工具不注册,函数在代码里直接不存在。
 //
 // 关键设计：
-// - 格式按**文件内容**判断(magic bytes),不看扩展名 —— DeepSeek 也是按内容判的,
+// - 格式按**文件内容**判断(magic bytes),不看扩展名 —— 服务端也是按内容判的,
 //   一个改名成 .png 的 bmp 会在服务端 400,在这里提前拦住并说清原因
 // - 尺寸从文件头解析,用于拦住超限图(单边 >8192px)并给出可执行建议
 // - 不引入图像库做缩放:超限就返回 ok:false 建议用 PIL 缩放后重试
 //   (沙箱已带 PIL),同「工具超限返回收窄建议」那套
 // - 路径过 SecurityGuard,与 read_file 同一套白名单/黑名单
+// - `question` 决定视觉模型找什么。不给只能拿到泛泛描述,
+//   很可能恰好漏掉主模型真正要的东西
 //
 // 配额(来自 DeepSeek vision 文档):
 //   单图 ≤32MiB / 单边 ≤8192px / 每图 token 上限 384
 // ============================================
 
 import { z } from 'zod';
-import { Tool, ToolContext, ToolResult, ImageAttachment } from '../../contract.js';
+import {
+  Tool,
+  ToolContext,
+  ToolResult,
+  ImageMime,
+  VisionAnalyzer,
+} from '../../contract.js';
 
 // 服务端硬限。超了必定 400，提前拦
 const MAX_BYTES = 32 * 1024 * 1024;
 const MAX_SIDE = 8192;
 
-type Mime = ImageAttachment['mimeType'];
+type Mime = ImageMime;
 
 export class ViewImageTool implements Tool {
   name = 'view_image';
 
+  // 中性表述:不承诺「你会看到图」,只承诺「你会得到对这张图的观察」——
+  // 观察由视觉模型产出,你拿到的是文字
   description = [
-    '查看一张本地图片 —— 调用后图片会出现在你的下一轮上下文里,你就能直接看到它。',
-    '用于:看网页截图确认渲染效果、读图表、识别图中文字、检查布局问题。',
+    '看一张本地图片 —— 返回对这张图的观察(文字)。',
+    '用于:确认网页截图的渲染效果、读图表、识别图中文字、检查布局问题。',
     '',
-    'detail 参数控制精细度:默认 low(先缩到 512×512,更省 token,够看布局和大字);',
+    '**务必写 question**:观察由视觉模型产出,它只回答你问的东西。',
+    '「验证码是什么」和「这页面为什么看起来是坏的」需要的描述完全不同,',
+    '不问就只能拿到泛泛描述,很可能恰好漏掉你要的信息。',
+    '',
+    'detail:默认 low(先缩到 512×512,够看布局和大字);',
     '要看清小字、表格、验证码时传 original。',
     '',
-    '图片会随对话保留,但它反映的是**截图当时**的状态。',
-    '页面或文件变化后请重新调用,不要依据旧图判断当前状态。',
+    '观察反映的是**调用当时**的状态。页面或文件变化后请重新调用。',
+    '需要追问同一张图,再调一次并换个 question。',
   ].join('\n');
 
   parameters = z.object({
     path: z.string().describe('图片路径。支持 JPEG / PNG / GIF / WebP'),
+    question: z
+      .string()
+      .optional()
+      .describe('你想从这张图里知道什么。写清楚，观察会聚焦在这上面'),
     detail: z
       .enum(['low', 'original'])
       .optional()
       .describe('low=缩到 512×512(默认,省 token);original=保留原图(看清细节)'),
   });
 
-  needs = ['fs'] as const;
+  needs = ['fs', 'vision'] as const;
 
   // 只读文件，不产生副作用
   danger = false;
 
   async run(
-    args: { path: string; detail?: 'low' | 'original' },
+    args: { path: string; question?: string; detail?: 'low' | 'original' },
     ctx: ToolContext,
   ): Promise<ToolResult> {
     const fsDriver = ctx.executors.fs as
@@ -64,6 +82,12 @@ export class ViewImageTool implements Tool {
 
     if (!fsDriver) {
       return { ok: false, error: '文件系统执行器未初始化' };
+    }
+
+    // 未配视觉模型时这个工具本不该被注册，走到这里说明注入漏了
+    const vision = ctx.executors.vision as VisionAnalyzer | undefined;
+    if (!vision) {
+      return { ok: false, error: '视觉插件未启用（需配置 VISION_MODEL）' };
     }
 
     try {
@@ -114,36 +138,47 @@ export class ViewImageTool implements Tool {
         };
       }
 
-      const attachment: ImageAttachment = {
-        kind: 'image',
+      const detail = args.detail ?? 'low';
+
+      // 图交给视觉模型，只把文字带回来 —— 主模型全程不接触像素
+      const result = await vision.analyze({
         data: bytes.toString('base64'),
         mimeType,
         label: args.path,
-        // 默认 low：省 token 且对"看布局/大字"足够，要细节由模型显式要 original
-        detail: args.detail ?? 'low',
-        ...(size ? { width: size.width, height: size.height } : {}),
-      };
+        question: args.question,
+        detail,
+      });
 
-      ctx.logger.info('加载图片', {
+      if (!result.ok || !result.observation) {
+        return { ok: false, error: result.error ?? '视觉观察失败' };
+      }
+
+      ctx.logger.info('看图完成', {
         path: args.path,
         mime: mimeType,
         bytes: bytes.length,
         ...(size ? { size: `${size.width}x${size.height}` } : {}),
-        detail: attachment.detail,
+        detail,
+        question: args.question ?? '(通用描述)',
       });
 
+      // 观察走 observations 而不是塞进 data：经工具桥调用时 data 会返回给
+      // Python 代码，而模型不会 print 它（实测连续三次裸调 view_image 都没 print）。
+      // 放 observations 才能由框架投递，与图片同一套语义
       return {
         ok: true,
-        // data 里只放元信息，图片本体走 attachments（tool 消息不能带图）
+        observations: [
+          args.question
+            ? `【${args.path}｜问：${args.question}】\n${result.observation}`
+            : `【${args.path}】\n${result.observation}`,
+        ],
         data: {
           path: args.path,
-          format: mimeType,
+          // 让主模型知道这是谁看的：观察是二手信息，出错时能判断该怀疑哪一层
+          observed_by: vision.modelName,
+          ...(args.question ? { question: args.question } : {}),
           ...(size ? { width: size.width, height: size.height } : {}),
-          bytes: bytes.length,
-          detail: attachment.detail,
-          note: '图片已附加，你将在下一条消息中看到它',
         },
-        attachments: [attachment],
       };
     } catch (error) {
       return {

@@ -45,6 +45,10 @@ import * as os from 'os';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { buildWriteGuardPrelude } from './write-guard.js';
+import { CappedBuffer } from './capped-buffer.js';
+import { killProcessTree } from './process-tree.js';
+import { DEFAULT_INHERIT_ENV, inheritEnv, PIP_BLOCKED_ENV } from './sandbox-env.js';
+import type { ToolBridge } from './tool-bridge.js';
 
 // 只依赖四个方法,与 RetryHandler 同样的窄接口,避免耦合具体 Logger 实现
 interface ExecutorLogger {
@@ -85,40 +89,36 @@ export interface PythonExecutorConfig {
    * 详见 write-guard.ts 顶部注释,含「明确不做」的清单与剩余风险。
    */
   writeGuard?: boolean;
+  /**
+   * 禁止在代码里装包(默认开)
+   *
+   * 装包的正式通道是 shell 工具:它 danger:true,执行前把**原样命令**
+   * 给用户看。关掉这项等于回到「模型静默装包、用户事后翻 trace 才发现」。
+   * 实现与绕法见 sandbox-env.ts 的 PIP_BLOCKED_ENV —— 它是路牌不是锁。
+   */
+  blockPipInstall?: boolean;
+  /**
+   * 工具桥:让代码里能调「代码本身做不到」的工具(截图、请求用户介入)
+   *
+   * 不给 = 那几个函数在代码里不存在,其余能力不受影响。
+   * 桥只暴露 3 个工具,筛选依据见 tool-bridge.ts 顶部。
+   */
+  toolBridge?: ToolBridge;
   logger: ExecutorLogger;
 }
-
-/**
- * 默认继承的环境变量
- *
- * 只放「不给就跑不起来」的:找解释器和动态库要 PATH,
- * Windows 下 python 还依赖 SystemRoot / TEMP 一类。
- * 白名单而非黑名单 —— 黑名单漏一个键就是一次凭证泄漏。
- */
-const DEFAULT_INHERIT_ENV = [
-  'PATH',
-  'Path',              // Windows 上键名大小写不定
-  'SystemRoot',
-  'windir',
-  'COMSPEC',
-  'PATHEXT',
-  'TEMP',
-  'TMP',
-  'HOME',
-  'USERPROFILE',       // Playwright 找 chromium 缓存要用
-  'LANG',
-  'LC_ALL',
-  'PYTHONHOME',
-  'PYTHONPATH',
-  'LD_LIBRARY_PATH',
-  'DISPLAY',           // headless=False 在 Linux 上要
-];
 
 export interface PythonRunOptions {
   /** 覆盖默认超时 */
   timeout?: number;
   /** 追加环境变量(与构造时的 env 合并,同名键覆盖) */
   env?: Record<string, string>;
+  /**
+   * 是否注入工具桥函数(默认 true)
+   *
+   * 框架自己写的脚本(BrowserOps)传 false:它们不需要这些函数,
+   * 而且截图脚本里再出现一个 screenshot() 会形成递归的可能。
+   */
+  bridge?: boolean;
 }
 
 export interface PythonRunResult {
@@ -133,6 +133,13 @@ export interface PythonRunResult {
   stdoutTruncated: boolean;
   /** 实际产生的 stdout 字节数(截断前),用于给模型量化提示 */
   stdoutBytes: number;
+  /**
+   * 代码经工具桥拿到的观察文字(视觉插件的产物)
+   *
+   * 由框架投递、不返回给代码:实测模型裸调 `view_image(...)`
+   * 不会 print 返回值,真交给代码就会静默丢掉花过钱的视觉调用结果。
+   */
+  observations: string[];
 }
 
 export class PythonExecutor {
@@ -151,15 +158,33 @@ export class PythonExecutor {
     await fs.mkdir(this.config.workDir, { recursive: true });
     const scriptPath = path.join(os.tmpdir(), `baseagent-${randomUUID()}.py`);
 
+    // 每次执行一个 id:工具桥按它给图片分桶。
+    // 必须分桶,因为截图会**嵌套**再起一个 Python 进程(BrowserOps),
+    // 共用一个桶时内层结束会把外层攒的图片一并取走
+    const runId = randomUUID();
+    const bridge = this.config.toolBridge;
+    const useBridge = (options.bridge ?? true) && !!bridge?.isRunning;
+
     // 写边界必须排在模型代码之前：audit hook 一旦注册就无法注销
     // （PEP 578 故意不提供 remove），所以模型的代码删不掉它
-    const prelude = (this.config.writeGuard ?? true)
+    const guardPrelude = (this.config.writeGuard ?? true)
       ? buildWriteGuardPrelude(this.config.workDir)
       : '';
-    await fs.writeFile(scriptPath, prelude + code, 'utf-8');
+    // 工具桥排在写边界之后:桥自己也要受写边界约束(它没有理由例外)
+    const bridgePrelude = useBridge ? bridge!.prelude : '';
+    await fs.writeFile(scriptPath, guardPrelude + bridgePrelude + code, 'utf-8');
 
     try {
-      return await this.spawnScript(scriptPath, timeout, startedAt, options.env);
+      const result = await this.spawnScript(scriptPath, timeout, startedAt, {
+        ...(useBridge ? { ...bridge!.env, BASEAGENT_RUN_ID: runId } : {}),
+        ...options.env,
+      });
+
+      // 观察必须取走:桶留着就是内存泄漏,而且下一次同 id 执行会串味
+      return {
+        ...result,
+        observations: useBridge ? bridge!.takeObservations(runId) : [],
+      };
     } finally {
       // 临时脚本不留痕:代码本身已经在 LLM trace 里了
       await fs.rm(scriptPath, { force: true }).catch(() => {});
@@ -169,35 +194,43 @@ export class PythonExecutor {
   /**
    * 按白名单挑出要继承的父进程环境变量
    *
-   * 不用 `...process.env` 是因为里面有 DEEPSEEK_API_KEY:模型写
-   * print(os.environ['DEEPSEEK_API_KEY']) 就能把 key 打进上下文、跟着 trace 落盘。
-   * 这不是隔离(进程仍是主环境全权限),只是不主动把凭证递到手里。
+   * 白名单本体在 sandbox-env.ts,与 shell 执行器**共用同一份** ——
+   * 各写一份的话,Python 这侧费劲不继承 DEEPSEEK_API_KEY、
+   * bash 一句 `echo $DEEPSEEK_API_KEY` 就把这层还回去了。
    */
   private baseEnv(): Record<string, string> {
-    const keys = this.config.inheritEnv ?? DEFAULT_INHERIT_ENV;
-    const env: Record<string, string> = {};
-
-    for (const key of keys) {
-      const value = process.env[key];
-      if (value !== undefined) env[key] = value;
-    }
-
-    return env;
+    return inheritEnv(this.config.inheritEnv ?? DEFAULT_INHERIT_ENV);
   }
 
+  /**
+   * 起子进程跑脚本
+   *
+   * 返回值不含 attachments / observations:两者都攒在 TS 侧的工具桥里、
+   * 与子进程无关,由 run() 在结束后取走。类型上排除掉,免得这里漏填也编译通过。
+   */
   private spawnScript(
     scriptPath: string,
     timeout: number,
     startedAt: number,
     extraEnv?: Record<string, string>,
-  ): Promise<PythonRunResult> {
-    return new Promise<PythonRunResult>(resolve => {
+  ): Promise<Omit<PythonRunResult, 'attachments' | 'observations'>> {
+    return new Promise<Omit<PythonRunResult, 'attachments' | 'observations'>>(resolve => {
       const child = spawn(this.config.pythonPath, ['-X', 'utf8', '-u', scriptPath], {
         cwd: this.config.workDir,
         env: {
           ...this.baseEnv(),
           // 让 print 的中文在 Windows 上不炸(cp936 编码错误)
           PYTHONIOENCODING: 'utf-8',
+          // 代码里装不了包:PIP_NO_INDEX 让 pip 不查索引,`pip install X` 返回码 1。
+          // 装包的正式通道是 shell 工具(danger:true,原样命令给用户看)——
+          // 一屏代码里第 23 行的 pip 没人看得见,单独一行用户才会真读清包名。
+          //
+          // 关键性质:env **向子进程继承**,所以 subprocess 起的新解释器也覆盖得到
+          // (实测有效)。这正好补上写边界补不了的那块 —— audit hook 反过来:
+          // 注册后删不掉,但只管当前进程。
+          // 它是路牌不是锁:传 env=清掉这个键的副本、或 pip install <URL> 都能绕。
+          // 详见 sandbox-env.ts 的 PIP_BLOCKED_ENV 注释
+          ...(this.config.blockPipInstall ?? true ? PIP_BLOCKED_ENV : {}),
           ...this.config.env,
           ...extraEnv,
         },
@@ -267,65 +300,9 @@ export class PythonExecutor {
    *
    * Playwright 会拉起 chromium 子进程,只杀 python 会留下孤儿浏览器 ——
    * 它还锁着 profile 目录,导致下一轮 launch_persistent_context 直接失败。
+   * 实现与 shell 执行器共用(process-tree.ts),平台分叉只写一份。
    */
   private killTree(pid: number | undefined) {
-    if (pid === undefined) return;
-
-    if (process.platform === 'win32') {
-      // Windows 没有进程组,借 taskkill /T 递归
-      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
-      return;
-    }
-
-    try {
-      // detached 让子进程自成进程组,负 pid = 杀整组
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        // 已经退出了
-      }
-    }
-  }
-}
-
-/**
- * 带上限的字节缓冲:超限后丢弃新数据,但记账总量
- *
- * 记账是为了给模型量化提示（"你打印了 1.8MB"比"输出过大"有用得多）。
- * 按字节而非字符截断,再在末尾切掉可能被劈开的多字节字符。
- */
-class CappedBuffer {
-  private chunks: Buffer[] = [];
-  private kept = 0;
-  totalBytes = 0;
-  overflowed = false;
-
-  constructor(private limit: number) {}
-
-  push(chunk: Buffer) {
-    this.totalBytes += chunk.length;
-
-    if (this.kept >= this.limit) {
-      this.overflowed = true;
-      return;
-    }
-
-    const room = this.limit - this.kept;
-    if (chunk.length <= room) {
-      this.chunks.push(chunk);
-      this.kept += chunk.length;
-    } else {
-      this.chunks.push(chunk.subarray(0, room));
-      this.kept = this.limit;
-      this.overflowed = true;
-    }
-  }
-
-  toString(): string {
-    // 截断可能把一个 UTF-8 字符劈成两半,末尾会出现替换字符;去掉它
-    const text = Buffer.concat(this.chunks).toString('utf-8');
-    return this.overflowed ? text.replace(/�+$/, '') : text;
+    killProcessTree(pid);
   }
 }

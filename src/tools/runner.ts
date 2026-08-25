@@ -9,10 +9,11 @@ import {
   ToolContext,
   ConfirmRequest,
   SubAgentRunner,
+  VisionAnalyzer,
 } from './contract.js';
 import { ToolRegistry } from './registry.js';
 import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard, type FsGrant } from '../platform/index.js';
-import { FsDriver, PythonExecutor, BrowserOps } from '../executors/index.js';
+import { FsDriver, PythonExecutor, ShellExecutor, BrowserOps } from '../executors/index.js';
 
 export interface RunnerConfig {
   sessionId: string;
@@ -25,15 +26,53 @@ export interface RunnerConfig {
   // 文件工具够不到的目录(优先于授权列表)。浏览器 profile 走这里:
   // 里面的 cookie 等价于活凭证,被 read_file 读进上下文会跟着 trace 落盘
   fsDeniedPaths?: string[];
+  // 相对路径的解析基准,应为**工作区**。不给则退回 process.cwd()
+  //
+  // 必须与 Python 子进程的 cwd 同源:模型在代码里写 read_file("a.txt") 时,
+  // 文件在工作区里(os.path.exists 为 True),但经工具桥回到 TS 后若按进程 cwd
+  // (项目目录)解析,就变成了另一个文件 —— 实测被拒
+  workspace?: string;
   // Python 沙箱执行器(CodeAct 底座)。未提供 = 代码执行未启用,
   // execute_python 会返回 ok:false 说明原因
   pythonExecutor?: PythonExecutor;
+  // Shell 执行器(外部程序,如 pip/git)。未提供 = run_command 返回 ok:false。
+  // 它没有机制边界,安全性来自 run_command 的 danger:true 人工确认
+  shellExecutor?: ShellExecutor;
   // 常驻浏览器操作。未提供 = screenshot 返回 ok:false 说明原因
   browserOps?: BrowserOps;
   // 子 agent 执行器(实现在 core 层,由入口注入)。
   // 未提供 = 子 agent 功能未启用,spawn 工具会返回 ok:false 说明原因
   subAgentRunner?: SubAgentRunner;
+  // 视觉插件(实现在 core 层,由入口注入)。
+  // 未提供 = 未配 VISION_MODEL,入口那边根本不会注册看图类工具
+  visionAnalyzer?: VisionAnalyzer;
 }
+
+/**
+ * 可被子 agent 继承的部分(资源 + 安全边界)
+ *
+ * 单独抽成一个对象,而不是让子 agent 逐字段转发 —— **逐字段转发实测会漏**:
+ * 本次开发里先漏了 `visionAnalyzer`,又漏了 `pythonExecutor`,
+ * 后者让子 agent 的 `execute_python` 每次都返回「未初始化」,
+ * 它以为是自己代码的问题,连跑 `print("hello")` 探活,白烧十几步才放弃。
+ *
+ * 抽成一个对象后入口只构造一次、主 runner 与子 agent 共用同一份,
+ * 「新增执行器忘了给子 agent」这个失败模式从结构上消失。
+ *
+ * **刻意不含 `subAgentRunner`**:子 agent 拿不到 spawn 能力,结构上无递归。
+ * 也不含 sessionId / logger —— 那两个每个 agent 各不相同。
+ */
+export type InheritableRunnerConfig = Pick<
+  RunnerConfig,
+  | 'allowDangerousTools'
+  | 'fsGrants'
+  | 'fsDeniedPaths'
+  | 'workspace'
+  | 'pythonExecutor'
+  | 'shellExecutor'
+  | 'browserOps'
+  | 'visionAnalyzer'
+>;
 
 export class ToolRunner {
   private fsDriver: FsDriver;
@@ -42,10 +81,11 @@ export class ToolRunner {
     private registry: ToolRegistry,
     private config: RunnerConfig,
   ) {
-    // 初始化文件系统执行器(授权列表 + 凭证目录黑名单)
+    // 初始化文件系统执行器(授权列表 + 凭证目录黑名单 + 相对路径基准)
     const securityGuard = new SecurityGuard(
       config.fsGrants,
       config.fsDeniedPaths ?? [],
+      config.workspace,
     );
     this.fsDriver = new FsDriver(securityGuard);
   }
@@ -120,6 +160,10 @@ export class ToolRunner {
       } else if (need === 'python') {
         // 由入口注入。未注入时保持 undefined，工具自己返回 ok:false 报「未启用」
         executors.python = this.config.pythonExecutor;
+      } else if (need === 'shell') {
+        // 外部程序通道。未注入时工具报「未初始化」——
+        // 它没有机制边界,靠 run_command 的 danger:true 人工确认兜住
+        executors.shell = this.config.shellExecutor;
       } else if (need === 'browser') {
         // 常驻浏览器操作。同样由入口注入，未注入时工具报「未启用」
         executors.browser = this.config.browserOps;
@@ -129,6 +173,10 @@ export class ToolRunner {
         // 子 agent 执行器由入口注入（实现在 core 层，tools 只认接口）。
         // 未注入时保持 undefined，工具自己返回 ok:false 报「未启用」
         executors.agent = this.config.subAgentRunner;
+      } else if (need === 'vision') {
+        // 视觉插件由入口注入（实现在 core 层，要用 LLMClient）。
+        // 未配 VISION_MODEL 时入口根本不注册看图类工具，所以这里通常不会是 undefined
+        executors.vision = this.config.visionAnalyzer;
       }
     }
 

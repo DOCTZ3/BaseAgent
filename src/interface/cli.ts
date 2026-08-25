@@ -30,14 +30,31 @@ import {
   TraceRecorder,
   type TraceSummary,
 } from '../platform/index.js';
-import { ToolRegistry, ToolRunner } from '../tools/index.js';
-import { PythonExecutor, BrowserManager, BrowserOps } from '../executors/index.js';
+import {
+  ToolRegistry,
+  ToolRunner,
+  type InheritableRunnerConfig,
+} from '../tools/index.js';
+import {
+  PythonExecutor,
+  ShellExecutor,
+  BrowserManager,
+  BrowserOps,
+  ToolBridge,
+  ensureSandboxVenv,
+  checkSandboxDeps,
+  SANDBOX_DEPS,
+  type BridgeToolResult,
+} from '../executors/index.js';
 import {
   ContextManager,
   DeepSeekAdapter,
   Orchestrator,
   LocalSubAgentRunner,
+  LocalVisionAnalyzer,
+  buildMainSystemPrompt,
   messageToText,
+  type EnvironmentOptions,
 } from '../core/index.js';
 import {
   EchoTool,
@@ -51,6 +68,7 @@ import {
   ViewImageTool,
   ScreenshotTool,
   RequestHelpTool,
+  RunCommandTool,
 } from '../tools/builtin/index.js';
 
 const HELP = `
@@ -142,19 +160,33 @@ async function main() {
   });
 
   // ---------- 工具 ----------
+  //
+  // CodeAct 收敛：动作空间变成代码后，「代码能做的」不再占工具位 ——
+  // 每个工具都要在**每次调用**的 prompt 里付 schema 成本，而且「工具和等价代码
+  // 两条路」会让模型的选择不可预测（实测：两条路都开时它一律选工具）。
+  //
+  // 去掉的四个都有一行等价代码：datetime.now() / open(...,'w') / glob / print。
+  // 保留 read_file 与 search_files：它们自带返回量上限，而裸 glob 命中三千个文件
+  // 一 print 就撑爆上下文 ——「数据大不大」是领域知识，封在工具里才有效。
+  //
+  // 只在代码通道可用时收敛：没有 execute_python 还删工具就是净损失能力
+  const converged = config.python.enabled && config.python.convergeTools;
+
   const registry = new ToolRegistry(logger);
-  registry.register(new EchoTool());
-  registry.register(new GetCurrentTimeTool());
-  registry.register(new ReadFileTool());
-  registry.register(new ListFilesTool());
-  registry.register(new SearchFilesTool());
-  registry.register(new WriteFileTool());
-  if (config.python.enabled) {
-    registry.register(new ExecutePythonTool());
+  if (!converged) {
+    registry.register(new EchoTool());
+    registry.register(new GetCurrentTimeTool());
+    registry.register(new ListFilesTool());
+    registry.register(new WriteFileTool());
   }
-  if (config.vision.enabled) {
+  registry.register(new ReadFileTool());
+  registry.register(new SearchFilesTool());
+  // 视觉是**插件**：配了 VISION_MODEL 才有这两个函数。
+  // 没配就不注册 —— 暴露一个必然返回 ok:false 的函数只会让模型白花一步
+  const visionConfig = config.models.vision;
+  if (visionConfig) {
     registry.register(new ViewImageTool());
-    // 截图需要视觉能力才有意义：图片进了上下文但模型看不见，等于白花 token
+    // screenshot 还需要常驻浏览器（截图由 BrowserOps 经 Python 跑）
     if (config.python.enabled) {
       registry.register(new ScreenshotTool());
     }
@@ -162,6 +194,20 @@ async function main() {
   // request_help 无条件注册：它不碰浏览器、不需要任何执行器，
   // 只是「暂停并把控制权交回用户」。将来非浏览器场景同样能用
   registry.register(new RequestHelpTool());
+  // run_command：外部程序的正式通道（装包主要靠它）。
+  // 没有工作区就不注册 —— cwd 会解析成 cwd（整个项目目录）
+  //
+  // 它是 danger 工具，ALLOW_DANGEROUS_TOOLS=false 时调用会被 runner 直接拒。
+  // 那种情况下注册它只会让模型白花一步，所以两个开关都要满足。
+  // Windows 上 shell:true 用的是 cmd.exe，要告诉模型 —— 它按 bash 习惯写
+  // `ls`/`$VAR` 会失败，而那种失败看起来像「工具坏了」，很难自己纠偏
+  const shellEnabled =
+    config.shell.enabled && !!config.workspace && config.security.allowDangerousTools;
+  if (shellEnabled) {
+    registry.register(
+      new RunCommandTool(process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'),
+    );
+  }
   if (config.subAgent.enabled) {
     registry.register(new SpawnSubAgentTool());
   }
@@ -187,6 +233,28 @@ async function main() {
     logger,
   });
 
+  // ---------- 视觉插件 ----------
+  // 单独一个 adapter：视觉模型很可能来自另一个 provider，key/baseURL 都可独立配。
+  // 复用 DeepSeekAdapter —— 图片转线格式（data URL 前缀、detail 透传）已经在里面，
+  // 变的只是「发给谁」。留痕也共用 recorder.sink，视觉调用在 trace 里可查
+  const visionAnalyzer = visionConfig
+    ? new LocalVisionAnalyzer({
+        client: new DeepSeekAdapter({
+          apiKey: visionConfig.apiKey,
+          baseURL: visionConfig.baseURL!,
+          model: visionConfig.model,
+          // 描述一张图不需要思维链，开着纯烧 token
+          enableThinking: visionConfig.enableThinking ?? false,
+          retry: config.retry,
+          onTrace: recorder.sink,
+          logger,
+        }),
+        modelName: visionConfig.model,
+        maxTokens: visionConfig.maxTokens,
+        logger,
+      })
+    : undefined;
+
   // 子 agent 的上下文配置与主 agent 同构（sessionId/logger 由 runner 各自填）
   const contextTuning = {
     windowSize: config.context.windowSize,
@@ -202,21 +270,56 @@ async function main() {
     sessionsDir: config.trace.dir,
   };
 
-  // 子 agent 执行器：实现在 core 层，经 ToolRunner 注入到 ctx.executors.agent。
-  // 共享 signal 与 confirm —— 下放任务不放宽安全边界
-  const subAgentRunner = config.subAgent.enabled
-    ? new LocalSubAgentRunner(llmClient, registry, {
-        parentSessionId: sessionId,
+  // 注：子 agent 执行器的构造挪到 pythonExecutor 之后了 ——
+  // 它要整份继承 inherited（含 pythonExecutor），必须等那些资源建好
+
+  // ---------- 沙箱 venv（框架托管，不存在则自动创建）----------
+  //
+  // 为什么框架管而不写进文档让用户跑一条命令：做错的三种方式都不报错在正确的地方 ——
+  // 忘了建 → 每次 execute_python 都 spawn ENOENT（模型以为是自己代码错了，实测踩到）；
+  // 忘了 --system-site-packages → 预装库全丢而代码里的 pip 已被禁，沙箱直接瘫；
+  // 平台写错 Scripts/ 或 bin/ → 同第一种。三件都可推导，没理由交给人。
+  //
+  // 失败不阻塞启动：回落到基础解释器并告警。没有隔离仍能干活，CLI 起不来就什么都干不了
+  const venv = config.python.enabled && config.python.useVenv
+    ? await ensureSandboxVenv({
+        venvDir: config.python.venvDir,
+        baseInterpreter: config.python.pythonPath,
+        // 只用于校验 venv 不在工作区内 —— 在里面的话模型能改 venv 自身
+        workspace: config.workspace || undefined,
         logger,
-        signal: abortController.signal,
-        onConfirmRequired,
-        allowDangerousTools: config.security.allowDangerousTools,
-        fsGrants: config.security.fsGrants,
-        maxSteps: config.subAgent.maxSteps,
-        maxCount: config.subAgent.maxCount,
-        contextConfig: contextTuning,
       })
     : undefined;
+
+  if (venv?.reason) {
+    console.warn(`${YELLOW}警告${RESET} 沙箱 venv 不可用: ${venv.reason}`);
+  }
+
+  // 真正执行代码的解释器。venv 可用就用它，否则回落到基础解释器
+  const sandboxPython = venv?.ok ? venv.pythonPath : config.python.pythonPath;
+
+  // ---------- 基线依赖检测 ----------
+  //
+  // 提示词里写着「沙箱已预装 playwright、pandas、pypdf…」—— 那句话在开发机上
+  // 碰巧是真的，在一台新机器上是**假的**。模型会照着一个不存在的前提写代码，
+  // 撞 ImportError；而代码里的 pip 已被禁，它自己修不了，只能反复试或者放弃。
+  //
+  // 只检测、**不自动装**：基线依赖装进的是系统环境（共享资源），自动往里装
+  // 等于替用户决定要不要动他别的项目在用的包；playwright 的 chromium 上百 MB，
+  // 启动时静默拉几分钟也是很差的体验。
+  // 模型中途要的临时依赖走另一条路（run_command，每次确认，落进 venv）
+  const deps = config.python.enabled
+    ? await checkSandboxDeps(sandboxPython, logger)
+    : undefined;
+
+  if (deps && !deps.ok) {
+    console.warn(
+      deps.error
+        ? `${YELLOW}警告${RESET} 沙箱依赖检测失败: ${deps.error}`
+        : `${YELLOW}警告${RESET} 沙箱缺少基线依赖: ${deps.missing.join(', ')}\n` +
+          `${DIM}        ${deps.hint}${RESET}`,
+    );
+  }
 
   // ---------- Python 沙箱(CodeAct) ----------
   // 浏览器能力经此提供：沙箱预装 Playwright，模型自己写代码驱动。
@@ -238,11 +341,61 @@ async function main() {
     await browserManager.start();   // 失败只告警，不阻塞 CLI
   }
 
+  // ---------- 工具桥(CodeAct) ----------
+  // 让模型代码里能调「代码本身做不到」的工具。只暴露 screenshot / view_image ——
+  // 图片进上下文只有 attachments 一条路，代码只能回传 stdout。
+  // 筛选依据见 tool-bridge.ts 顶部；read_file 一类刻意不暴露（Python 有 open()）
+  const BRIDGED = ['screenshot', 'view_image'];
+
+  // 用 describe() 而不是 getAllDescriptions()：后者会过滤掉隐藏的工具，
+  // 而下面正要隐藏它们 —— 那样桥就拿不到 schema、直接不启动了
+  const bridgeTools = registry.describe(
+    registry.all().filter(t => BRIDGED.includes(t.name)),
+  );
+
+  // invoke 转给 runner：这样经桥的调用和模型直接调工具走同一条路径，
+  // 权限检查、确认、日志都不会因为「从代码里调」而被绕过。
+  //
+  // 三者构成一个环：桥 → runner → pythonExecutor → 桥。运行时不成问题 ——
+  // invoke 是个箭头函数，只在模型代码真的调工具时才执行，那时 runner 早就建好了。
+  // 但类型推断会绕不出来，所以这里的三个声明都显式标注类型
+  const toolBridge: ToolBridge | undefined =
+    config.python.enabled && bridgeTools.length > 0
+      ? new ToolBridge({
+          tools: bridgeTools,
+          invoke: (name, args): Promise<BridgeToolResult> =>
+            runner.run({ name, args }),
+          logger,
+        })
+      : undefined;
+  if (toolBridge) {
+    // 桥起来了才隐藏：**顺序很重要**。桥启动失败时不能隐藏 ——
+    // 否则模型两条路都没有了（工具清单里没有、代码里的函数也连不上）
+    if (await toolBridge.start()) {
+      // 看图类工具只在代码里可调，不出现在工具清单里 —— 没有开关。
+      // 实测：两条路都开时模型一律直接发 tool_call（那是它更熟的形式），
+      // 代码那条路根本走不到，留着开关等于维护一个没人该用的模式。
+      // 工具仍留在注册表：桥的 invoke 要经 runner 按名字查找
+      registry.hide(BRIDGED);
+      console.log(
+        dim(`  ${BRIDGED.join(' / ')} 只在 execute_python 的代码里可调\n`),
+      );
+    }
+  }
+
+  // execute_python 特意放在这里注册（而不是和其他工具一起）：
+  // 它的 description 要带上工具桥暴露的函数签名，而签名由桥从工具 schema 生成，
+  // 所以必须等桥建好。registry 只要在 runner.run() 之前注册完就行
+  if (config.python.enabled) {
+    registry.register(new ExecutePythonTool(toolBridge?.signatures ?? []));
+  }
+
   // 没有工作区就不创建执行器：workDir 为空串会让 path.resolve 解析成 cwd，
   // 写边界随之变成整个项目目录。缺配置时宁可代码执行不可用，不可越界
-  const pythonExecutor = config.python.enabled && config.workspace
+  const pythonExecutor: PythonExecutor | undefined = config.python.enabled && config.workspace
     ? new PythonExecutor({
-        pythonPath: config.python.pythonPath,
+        // venv 里那个解释器（venv 不可用时回落到基础解释器，已在上面告警）
+        pythonPath: sandboxPython,
         // 与 fs 白名单同源：cwd 和写边界都用 workspace，不再单独配
         workDir: config.workspace,
         timeout: config.python.timeout,
@@ -254,25 +407,109 @@ async function main() {
           // 常驻浏览器的连接地址。空串表示没起来，模型代码会拿到连接失败并改道
           BROWSER_CDP_URL: browserManager?.cdpUrl ?? '',
         },
+        // 代码里装不了包：pip 不查索引，`pip install X` 返回码 1。
+        // 装包走 run_command —— 一屏 40 行代码里第 23 行的 pip 用户看不见，
+        // 单独一行才会真读清包名（typosquatting 的攻击面就是一两个字符）
+        blockPipInstall: config.python.blockPipInstall,
+        // 桥的地址与 token 由执行器逐次注入子进程（还要带上 run id 给图片分桶）
+        toolBridge,
         logger,
       })
     : undefined;
 
-  const runner = new ToolRunner(registry, {
-    sessionId,
-    logger,
-    signal: abortController.signal,
-    onConfirmRequired,
+  // ---------- Shell 执行器（外部程序的正式通道）----------
+  //
+  // PATH 前置 venv 的 Scripts/bin：**这一步不做，前面的 venv 隔离就白做了** ——
+  // shell 从 PATH 找 `pip` 会找到全局解释器那个，装回用户机器上，
+  // 正是这次要修的东西（实测：模型装的 rapidocr 顺带升级了全局 onnxruntime）。
+  //
+  // 从**实际使用的**解释器推导（sandboxPython，而不是配置里的基础解释器）：
+  // 两处各自算必然错位，而错位不报错 —— 只表现成「venv 里装了、代码里 import 不到」。
+  // 裸 `python`（没有路径分隔符）说明 venv 没用上，此时无从前置，也就不前置
+  const pythonDir = /[\\/]/.test(sandboxPython)
+    ? path.dirname(path.resolve(sandboxPython))
+    : undefined;
+
+  const shellExecutor: ShellExecutor | undefined = shellEnabled
+    ? new ShellExecutor({
+        // 与 Python 同源：都用工作区，模型写的相对路径两边一致
+        workDir: config.workspace,
+        timeout: config.shell.timeout,
+        maxStdoutBytes: config.shell.maxStdoutBytes,
+        maxStderrBytes: config.shell.maxStderrBytes,
+        pathPrepend: pythonDir ? [pythonDir] : [],
+        // 刻意**不设** PIP_NO_INDEX：这里是装包的正式通道，pip 要能联网。
+        // 代码那侧才设（见 sandbox-env.ts 的 PIP_BLOCKED_ENV）
+        logger,
+      })
+    : undefined;
+
+  // ---------- 资源与安全边界（主 agent 与子 agent 共用同一份）----------
+  //
+  // 抽成一个对象、而不是在两处各写一遍：逐字段转发实测会漏 ——
+  // 先漏了 visionAnalyzer，又漏了 pythonExecutor，后者让子 agent 的
+  // execute_python 每次返回「未初始化」，它以为是自己代码的问题，
+  // 连跑 print("hello") 探活，白烧十几步。
+  // 共用一份之后「新增执行器忘了给子 agent」这个失败模式从结构上消失
+  const inherited: InheritableRunnerConfig = {
     allowDangerousTools: config.security.allowDangerousTools,
     fsGrants: config.security.fsGrants,
     // profile 里的 cookie 等价于活凭证，不能让 read_file 读进上下文并跟着 trace 落盘
     fsDeniedPaths: config.python.enabled ? [browserProfileDir] : [],
+    // 相对路径按工作区解析，与 Python 子进程的 cwd 同源
+    workspace: config.workspace || undefined,
     pythonExecutor,
+    // 资源整份继承（子 agent 那边按**工具名**排除 run_command，见 sub-agent.ts）——
+    // 资源与「谁能用」是两回事，混在一起判过去漏过三次
+    shellExecutor,
     // 浏览器操作复用 PythonExecutor 跑框架自己写的脚本 ——
     // TS 侧不再引一份 playwright（几百 MB），而 Python 侧本来就装着
     browserOps: pythonExecutor && browserManager?.cdpUrl
       ? new BrowserOps(pythonExecutor, browserManager.cdpUrl)
       : undefined,
+    // 视觉插件：经 ctx.executors.vision 注入给 view_image / screenshot
+    visionAnalyzer,
+  };
+
+  // ---------- 运行环境（主 agent 与子 agent 的提示词同源）----------
+  // 抽成一份：子 agent 原本用一段独立短提示，对环境一无所知 ——
+  // 拿 requests 去抓需要登录的站点、还可能 close 掉常驻浏览器（那会毁掉主 agent 的会话）
+  const environment: EnvironmentOptions = {
+    converged,
+    pythonEnabled: config.python.enabled,
+    visionModel: visionConfig?.model,
+    // 代码里装包被挡住之后必须告诉模型出路在哪，否则它会去试 --index-url、
+    // 试直接 URL、试换包名 —— 实测事故就是连着四步都在装包
+    shellEnabled,
+    // 提示里的「已预装」必须是**实况**，与启动检测同源。
+    // 写死一串的话，在缺库的机器上那句话是假的 —— 模型照着不存在的前提写代码、
+    // 撞 ImportError，而代码里的 pip 已被禁，它自己修不了
+    missingPackages: deps?.missing ?? [],
+  };
+
+  // 子 agent 执行器：实现在 core 层，经 ToolRunner 注入到 ctx.executors.agent。
+  // 共享 signal 与 confirm —— 下放任务不放宽安全边界。
+  // 必须建在 pythonExecutor 之后：它要整份继承 inherited
+  const subAgentRunner = config.subAgent.enabled
+    ? new LocalSubAgentRunner(llmClient, registry, {
+        parentSessionId: sessionId,
+        logger,
+        signal: abortController.signal,
+        onConfirmRequired,
+        inherited,
+        environment,
+        maxSteps: config.subAgent.maxSteps,
+        maxCount: config.subAgent.maxCount,
+        contextConfig: contextTuning,
+      })
+    : undefined;
+
+  const runner: ToolRunner = new ToolRunner(registry, {
+    ...inherited,
+    sessionId,
+    logger,
+    signal: abortController.signal,
+    onConfirmRequired,
     subAgentRunner,
   });
 
@@ -291,48 +528,13 @@ async function main() {
 
   // 系统提示只在会话开始时加一次。后续每轮只传 user 消息，
   // 让 ContextManager 把它们接到同一个 Turn 序列上（压缩才能真正生效）。
+  // 环境约定与子 agent 出自**同一个函数** —— 提示词写在这里的话，
+  // 子 agent 那份必然漂移（它原本就对浏览器常驻、stdout 上限一无所知）
   context.addSystemMessage(
-    '你是 BaseAgent，一个可以调用工具完成任务的 AI 助手。' +
-    '需要读写文件、查询时间等操作时使用提供的工具，不要臆测工具结果。' +
-    '工具返回错误时，说明原因而不是反复重试同一路径。' +
-    (config.subAgent.enabled
-      ? '遇到需要读取大量内容才能得出结论的任务（遍历目录逐个读文件、批量搜索比对），' +
-        '用 spawn_subagent 下放给子 agent，避免原始内容占满当前上下文。' +
-        '一两次工具调用能完成的事直接自己做。'
-      : '') +
-    // CodeAct 的核心约定：筛选必须发生在沙箱里。这条不写清楚，模型会把
-    // 整页 HTML / 整个文件 print 出来，一次就烧掉几十万 token
-    (config.python.enabled
-      ? '解析 docx/pdf/excel、抓取网页、数据清洗转换等任务，用 execute_python 写代码完成，' +
-        '不要自己手工推断二进制格式。沙箱已预装 playwright、python-docx、openpyxl、' +
-        'pypdf、pandas、requests、beautifulsoup4。' +
-        '只有 print 出来的内容会回到你的上下文且有体积上限，' +
-        '务必在代码内先提取过滤再打印，绝不要 print 整页 HTML 或整个文件。' +
-        '页面结构未知时先用 page.locator("body").aria_snapshot() 拿语义树,' +
-        '或用 locator(...).count() 数条目,不要 print(page.content())。' +
-        '注意 page.accessibility 在新版 Playwright 已移除。' +
-        // 浏览器由框架常驻，模型只连接不启动。这条写错会让它每次开新浏览器，
-        // 跨轮次的页面状态就丢了
-        '浏览器已经由框架启动并常驻（有头窗口，登录态自动持久化）。' +
-        '用 browser = p.chromium.connect_over_cdp(os.environ["BROWSER_CDP_URL"]) 连上去，' +
-        'page = browser.contexts[0].pages[0] 拿到当前页面。' +
-        '不要用 launch 或 launch_persistent_context 自己启动浏览器，' +
-        '也绝对不要调 browser.close() 或 context.close() —— 那会杀掉常驻实例，' +
-        '下一轮就接不上了。需要新标签页时用 browser.contexts[0].new_page()。' +
-        '因为浏览器跨轮次存活，上一轮打开的页面这一轮可以直接接着操作。' +
-        '需要登录时直接 goto 登录页，窗口是可见的，让用户手动完成后用 ' +
-        'page.wait_for_url 等待，绝不要在代码里填写账号密码。'
-      : '') +
-    // 截图其实是便宜通道：单图 ≤384 token，而同一页面的 aria_snapshot 文本
-    // 往往要 1000~3000 token。所以不劝模型少截图
-    (config.vision.enabled
-      ? '你可以看图:用 view_image 查看本地图片(截图、图表、扫描件),' +
-        '调用后图片会出现在你的下一轮上下文里。' +
-        '页面渲染是否正常、元素有没有被遮挡、验证码内容这类问题,' +
-        '截图后 view_image 比读 DOM 更直接。' +
-        '图片会随对话保留,但它反映的是**当时**的页面状态;' +
-        '页面变化后请重新截图,不要依据旧图判断当前状态。'
-      : '')
+    buildMainSystemPrompt({
+      ...environment,
+      subAgentEnabled: config.subAgent.enabled,
+    }),
   );
 
   // ---------- 启动信息 ----------
@@ -359,11 +561,38 @@ async function main() {
     ? `已启用,最多 ${config.subAgent.maxCount} 个,各 ${config.subAgent.maxSteps} 步`
     : '已禁用'}`));
   console.log(dim(`  代码执行  ${config.python.enabled
-    ? `已启用 ${config.python.pythonPath},stdout 上限 ${Math.round(config.python.maxStdoutBytes / 1024)}KB,写边界=工作区`
+    ? `已启用 ${sandboxPython},stdout 上限 ${Math.round(config.python.maxStdoutBytes / 1024)}KB,写边界=工作区`
     : '已禁用 (PYTHON_ENABLED=true 开启)'}`));
-  console.log(dim(`  图片输入  ${config.vision.enabled
-    ? `已启用 view_image (每图 ≤384 token)`
-    : '已禁用 (VISION_ENABLED=true 开启,需视觉模型)'}`));
+  // venv 状态必须可见:用户得知道模型装的包会落在哪儿。
+  // 「新建了」和「已存在」要区分 —— 首次启动多等几秒,不说会以为卡住了
+  if (config.python.enabled) {
+    console.log(dim(`  沙箱 venv ${!config.python.useVenv
+      ? '已关闭 (SANDBOX_VENV=false;模型装的包会进全局环境)'
+      : venv?.ok
+        ? `${venv.created ? '已创建' : '已就绪'} ${config.python.venvDir} (装的包只落在这里)`
+        : '不可用,已回落到全局解释器 (见上方警告)'}`));
+    // 基线依赖的实况:提示词声称「已预装」,这行是那句话的事实核对
+    console.log(dim(`  基线依赖  ${deps?.ok
+      ? `齐备 (${SANDBOX_DEPS.length} 个,来自系统环境)`
+      : deps?.error
+        ? `检测失败 (${deps.error})`
+        : `缺 ${deps?.missing.join(', ')} —— 见上方安装命令`}`));
+  }
+  console.log(dim(`  视觉插件  ${visionConfig
+    ? `已启用 ${visionConfig.model} (图不进主上下文,只回文字观察)`
+    : '未配置 (设 VISION_MODEL 开启)'}`));
+  // 外部命令通道必须可见:它是唯一没有机制边界的能力,安全性全靠用户那次确认。
+  // 用户得知道它开着 —— 以及 PATH 前置的是哪个解释器目录(装包会落在那儿)
+  console.log(dim(`  外部命令  ${shellEnabled
+    ? `已启用 run_command (每次需确认${pythonDir ? `,PATH 前置 ${pythonDir}` : ''})`
+    : config.shell.enabled && !config.security.allowDangerousTools
+      ? '已配置但未生效 (还需 ALLOW_DANGEROUS_TOOLS=true)'
+      : '已禁用 (SHELL_ENABLED=true 开启)'}`));
+  if (config.python.enabled) {
+    console.log(dim(`  代码装包  ${config.python.blockPipInstall
+      ? `已禁止 (pip 不查索引;装包走 ${shellEnabled ? 'run_command' : '用户手动'})`
+      : '允许 (模型可在代码里静默装包)'}`));
+  }
   if (config.python.enabled) {
     console.log(dim(`  浏览器    profile=${browserProfileDir} (已加入 fs 拒绝列表)`));
   }
@@ -525,6 +754,8 @@ async function main() {
     rl.close();
     context.dispose();
     await browserManager?.stop();
+    // 桥是个在监听的 HTTP server，不关掉进程不会退出
+    await toolBridge?.stop();
     return;
   }
 
@@ -576,6 +807,7 @@ async function main() {
       // 必须关掉常驻浏览器：它是 detached 的，不会随本进程退出。
       // 留下来会一直锁着 profile 目录，导致下次启动失败
       await browserManager?.stop();
+      await toolBridge?.stop();
       process.exit(0);
     });
   };

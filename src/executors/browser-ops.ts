@@ -84,7 +84,9 @@ except Exception as e:
 print("__BASEAGENT__" + json.dumps(result, ensure_ascii=False))
 `;
 
-    const res = await this.python.run(code, { timeout: 60_000 });
+    // bridge:false —— 这是框架自己写的脚本,不需要工具桥函数。
+    // 更要紧的是:桥里的 screenshot() 就是靠这段脚本实现的,注进来会形成递归入口
+    const res = await this.python.run(code, { timeout: 60_000, bridge: false });
     const parsed = this.parse(res.stdout, res.stderr);
     if (!parsed.ok) return parsed as ScreenshotResult;
     return { ...parsed, filePath: out } as ScreenshotResult;

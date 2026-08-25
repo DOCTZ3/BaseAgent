@@ -63,11 +63,6 @@ export function messageToText(content: string | ContentPart[]): string {
     .join('\n');
 }
 
-/** 消息里是否含图片 */
-export function hasImage(content: string | ContentPart[]): boolean {
-  return typeof content !== 'string' && content.some(p => p.type === 'image');
-}
-
 export interface ToolCallMessage {
   id: string;
   name: string;

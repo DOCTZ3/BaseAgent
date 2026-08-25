@@ -20,7 +20,6 @@ import {
   SearchFilesTool,
   WriteFileTool,
   ExecutePythonTool,
-  ViewImageTool,
 } from './tools/builtin/index.js';
 import path from 'path';
 
@@ -60,9 +59,8 @@ async function main() {
   if (config.python.enabled) {
     registry.register(new ExecutePythonTool());
   }
-  if (config.vision.enabled) {
-    registry.register(new ViewImageTool());
-  }
+  // 视觉是插件,需要注入 VisionAnalyzer(见 cli.ts)。
+  // main.ts 是最小演示入口,不接视觉 —— 要用视觉请走 npm run cli
 
   // ④ 创建 Runner
   const abortController = new AbortController();
@@ -97,6 +95,8 @@ async function main() {
     fsGrants:            config.security.fsGrants,
     // profile 里的 cookie 等价于活凭证,不能让 read_file 读进上下文并跟着 trace 落盘
     fsDeniedPaths:       config.python.enabled ? [browserProfileDir] : [],
+    // 相对路径按工作区解析,与 Python 子进程的 cwd 同源
+    workspace:           config.workspace || undefined,
     pythonExecutor,
   });
 

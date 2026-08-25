@@ -15,6 +15,21 @@ import type { FsGrant } from './security.js';
  *
  * 兼容旧的 FS_SANDBOX_PATHS:那时它是逗号分隔的多路径列表,取第一项。
  */
+/**
+ * 解析 python 可执行文件路径
+ *
+ * 含路径分隔符(即指向某个 venv)时**必须转绝对路径**:子进程的 cwd 是
+ * **工作区**,相对路径会按工作区解析 —— `.sandbox-venv/Scripts/python.exe`
+ * 于是变成「工作区/.sandbox-venv/...」,spawn 直接 ENOENT(实测踩到)。
+ * 而用户在 .env 里写的相对路径,心里的基准是**项目根目录**。
+ *
+ * 裸名字(`python` / `python3`)保持原样:那要交给 PATH 查找,转绝对反而错。
+ */
+function resolvePythonPath(): string {
+  const raw = process.env.PYTHON_PATH || 'python';
+  return /[\\/]/.test(raw) ? path.resolve(raw) : raw;
+}
+
 function resolveWorkspace(): string {
   const explicit = process.env.WORKSPACE?.trim();
   if (explicit) return path.resolve(explicit);
@@ -42,6 +57,17 @@ export interface AgentConfig {
     main: ModelConfig;        // 主模型(必需)
     fast?: ModelConfig;       // 快速模型(可选)
     reasoning?: ModelConfig;  // 推理模型(可选)
+    /**
+     * 视觉模型(可选)—— 视觉能力的**插件**
+     *
+     * 配了它才有视觉能力。图片只进这个模型的请求,主模型全程只收文字,
+     * 因此**主模型是不是多模态变得无关** —— 这正是要把主模型换成
+     * 强文本模型(v4-pro)时需要的形状。
+     *
+     * 为什么不再用 VISION_ENABLED:那是个「我保证主模型能看图」的断言,
+     * 框架无法验证,填错的后果是运行时 400。改成「配了没有」这个可验证的事实。
+     */
+    vision?: ModelConfig;
   };
 
   // 执行控制
@@ -106,18 +132,43 @@ export interface AgentConfig {
     allowDangerousTools: boolean;  // 是否启用危险工具
   };
 
-  // 多模态:图片输入
-  vision: {
-    // 是否注册 view_image 工具。
-    // 必须与模型能力匹配:非视觉模型收到图片会返回 400
-    // ("This model does not support image")
-    enabled: boolean;
-  };
+  // 注:视觉能力不再有独立开关。见 models.vision ——
+  // 「配了视觉模型」是可验证的事实,而「主模型能看图」是框架验证不了的断言
 
   // CodeAct:Python 沙箱(浏览器能力经此提供,不做独立 BrowserDriver)
   python: {
     enabled: boolean;          // 是否注册 execute_python 工具
-    pythonPath: string;        // python 可执行文件(装了 venv 就指向 venv 里那个)
+    /**
+     * **基础**解释器(建 venv 用它,venv 不可用时也回落到它)
+     *
+     * 注意语义:这里**不是**最终执行代码的解释器 —— 启动时框架会准备
+     * 沙箱 venv 并改用 venv 里那个(见 useVenv / venvDir)。
+     * 之前让用户直接把这项指到 venv 内的解释器,结果是每台新机器都要手动
+     * 建目录、还要按平台写对 Scripts/ 或 bin/ —— 忘了就是**每次**
+     * execute_python 都 spawn ENOENT,而模型会以为是自己代码错了(实测踩到)。
+     */
+    pythonPath: string;
+    /**
+     * 是否使用框架托管的沙箱 venv(默认开)
+     *
+     * 开着时启动阶段自动创建(幂等,已存在则跳过),模型装的包落在 venv 里,
+     * 碰不到用户全局环境。关掉 = 直接用基础解释器,装包会污染全局。
+     *
+     * 为什么这件事值得框架管:确认管的是**授权**(该不该装),
+     * venv 管的是**爆炸半径**(装了影响谁)。确认结构上覆盖不到连带影响 ——
+     * 实测事故里用户批准的是 `pip install rapidocr_onnxruntime`,
+     * 实际发生的是 onnxruntime 被升级,而那是 pip 在点下同意**之后**
+     * 解析依赖树才算出来的,不在用户读的那行字里。且 pip 没有 undo。
+     */
+    useVenv: boolean;
+    /**
+     * 沙箱 venv 目录(相对路径按项目根解析)
+     *
+     * **必须在工作区之外**:放进去的话模型的代码能改 venv 自身,
+     * 隔离就自己交出去了。在工作区内时框架会拒绝使用并告警 ——
+     * 宁可明说「没有隔离」,不给一个假的。
+     */
+    venvDir: string;
     // 注:代码的 cwd 与写边界都用顶层 workspace,不再单独配 —— 见 workspace 注释
     timeout: number;           // 单次执行超时(ms)
     maxStdoutBytes: number;    // stdout 上限:防 print 整页 HTML 炸上下文
@@ -126,6 +177,46 @@ export interface AgentConfig {
     // 框架不解析内容、只提供路径,经 BROWSER_PROFILE_DIR 注入子进程。
     // 同时进 fs 工具的 deny 列表:里面的 cookie 等价于活凭证
     browserProfileDir: string;
+    /**
+     * CodeAct 可用时,是否把「代码能做的」工具从清单里去掉
+     *
+     * 默认开。去掉的是 `get_current_time`(`datetime.now()` 一行)、
+     * `write_file`(写边界已在 audit hook 管住,工具层重复)、
+     * `list_files`(与 search_files 重合)、`echo`。
+     *
+     * **只在 python.enabled 时生效**:没有代码通道还删工具就是净损失能力。
+     * 设 false 可退回「工具全开」做对照。
+     */
+    convergeTools: boolean;
+    /**
+     * 禁止在**代码里**装包(默认开)
+     *
+     * 装包的正式通道是 run_command:它每次请用户确认、原样显示命令。
+     * 关掉这项就回到「模型静默装包、用户事后翻 trace 才发现」——
+     * 实测事故就是这样:pip 返回码 0,顺带升级了全局环境的 onnxruntime。
+     *
+     * 实现是 PIP_NO_INDEX(见 sandbox-env.ts),**是路牌不是锁**:
+     * 传一份清掉该键的 env、或 pip install <URL> 都能绕。
+     */
+    blockPipInstall: boolean;
+  };
+
+  /**
+   * Shell:调用机器上外部程序的通道(pip / git / ffmpeg 一类)
+   *
+   * ⚠️ 它**没有机制边界**。Python 的写边界是进程内的 audit hook,
+   * shell 起的进程根本不经过它 —— 安全性全部来自 run_command 的
+   * danger:true 人工确认(原样命令给用户看)。
+   *
+   * 为什么仍然要它:让危险操作**变得可读**。一屏 40 行代码里第 23 行的
+   * pip install 没人看得见,单独一行用户才会真读清包名 ——
+   * 而 typosquatting 的整个攻击面就是一两个字符的差别。
+   */
+  shell: {
+    enabled: boolean;          // 是否注册 run_command 工具
+    timeout: number;           // 单次执行超时(ms),装大包要宽
+    maxStdoutBytes: number;    // stdout 上限:npm install 能刷几百行
+    maxStderrBytes: number;    // stderr 上限(pip 的 warning 都走 stderr)
   };
 
   // 重试配置（幂等操作:LLM 调用/结构化输出解析）
@@ -155,7 +246,12 @@ export interface AgentConfig {
 }
 
 // 默认配置
-const buildModels = (): { main: ModelConfig; fast?: ModelConfig; reasoning?: ModelConfig } => {
+const buildModels = (): {
+  main: ModelConfig;
+  fast?: ModelConfig;
+  reasoning?: ModelConfig;
+  vision?: ModelConfig;
+} => {
   const models = {
     main: {
       provider: 'deepseek' as 'deepseek' | 'openai',
@@ -166,7 +262,12 @@ const buildModels = (): { main: ModelConfig; fast?: ModelConfig; reasoning?: Mod
       maxTokens: process.env.MAIN_MAX_TOKENS ? parseInt(process.env.MAIN_MAX_TOKENS) : undefined,
       enableThinking: process.env.MAIN_ENABLE_THINKING !== 'false', // 默认开启
     },
-  } as { main: ModelConfig; fast?: ModelConfig; reasoning?: ModelConfig };
+  } as {
+    main: ModelConfig;
+    fast?: ModelConfig;
+    reasoning?: ModelConfig;
+    vision?: ModelConfig;
+  };
 
   // 可选的 fast 模型
   if (process.env.FAST_MODEL) {
@@ -193,6 +294,29 @@ const buildModels = (): { main: ModelConfig; fast?: ModelConfig; reasoning?: Mod
       temperature: parseFloat(process.env.REASONING_TEMPERATURE || '0.9'),
       maxTokens: process.env.REASONING_MAX_TOKENS ? parseInt(process.env.REASONING_MAX_TOKENS) : undefined,
       enableThinking: process.env.REASONING_ENABLE_THINKING !== 'false', // 默认开启
+    };
+  }
+
+  // 可选的视觉模型 —— 视觉能力的插件
+  //
+  // 允许独立的 key / baseURL:视觉插件很可能来自另一个 provider,
+  // 这正是「插件」的含义。未给则回落到主 provider 的配置。
+  //
+  // 注:VISION_API_KEY 不在 PythonExecutor 的 env 继承白名单里,
+  // 所以沙箱内的代码拿不到它、无法自己调视觉 API —— 必须经工具桥。
+  // 这也是 CodeAct 收敛后工具桥继续存在的理由之一(凭证隔离)
+  if (process.env.VISION_MODEL) {
+    const visionProvider = process.env.VISION_PROVIDER || 'deepseek';
+    models.vision = {
+      provider: (visionProvider === 'openai' ? 'openai' : 'deepseek') as 'deepseek' | 'openai',
+      apiKey: process.env.VISION_API_KEY || process.env.DEEPSEEK_API_KEY || '',
+      baseURL: process.env.VISION_BASE_URL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
+      model: process.env.VISION_MODEL,
+      // 低温:看图要的是「图里有什么」这类事实,不是创造性表述
+      temperature: parseFloat(process.env.VISION_TEMPERATURE || '0.2'),
+      maxTokens: process.env.VISION_MAX_TOKENS ? parseInt(process.env.VISION_MAX_TOKENS) : undefined,
+      // 默认关:描述一张图不需要思维链,开着纯烧 token
+      enableThinking: process.env.VISION_ENABLE_THINKING === 'true',
     };
   }
 
@@ -250,15 +374,20 @@ export const defaultConfig: AgentConfig = {
       : [],
     allowDangerousTools: process.env.ALLOW_DANGEROUS_TOOLS === 'true',
   },
-  vision: {
-    // 默认关闭:开了但模型不支持图片,调用会 400。
-    // 换上 deepseek-v4-flash-vision-exp 这类视觉模型后再显式开
-    enabled: process.env.VISION_ENABLED === 'true',
-  },
   python: {
     // 默认关闭:需要先装好 python 环境和依赖库,装好再显式开
     enabled: process.env.PYTHON_ENABLED === 'true',
-    pythonPath: process.env.PYTHON_PATH || 'python',
+    // **基础**解释器:建 venv 用它,venv 不可用时回落到它。
+    // 最终执行代码的解释器由启动阶段的 ensureSandboxVenv 决定。
+    // 相对路径按**项目根目录**解析成绝对路径:子进程的 cwd 是工作区,
+    // 留着相对路径会按工作区解析 → spawn ENOENT(实测踩到)
+    pythonPath: resolvePythonPath(),
+    // 默认开:装包落进项目内的 venv,碰不到用户全局环境。
+    // 目录不存在时启动阶段自动创建 —— 这件事可推导,没理由交给人做
+    useVenv: process.env.SANDBOX_VENV !== 'false',
+    // 放项目根下,**在工作区之外** —— 放进工作区的话模型能改 venv 自身。
+    // 框架会校验这一点,在工作区内时拒绝使用并告警
+    venvDir: path.resolve(process.env.SANDBOX_VENV_DIR || '.sandbox-venv'),
     // 比工具默认超时宽:浏览器启动 + 页面加载本身就要几秒
     timeout: process.env.PYTHON_TIMEOUT ? parseInt(process.env.PYTHON_TIMEOUT) : 120_000,
     // 50KB ≈ 1.2 万 token。够放几百条提取结果,又拦得住整页 HTML
@@ -270,6 +399,25 @@ export const defaultConfig: AgentConfig = {
       : 8 * 1024,
     // 不放 workDir 内:那里是模型的工作区,profile 混在里面容易被误删/误读
     browserProfileDir: process.env.BROWSER_PROFILE_DIR || '.browser-profile',
+    // 默认收敛。只在 python.enabled 时生效(见类型定义处说明)
+    convergeTools: process.env.CONVERGE_TOOLS !== 'false',
+    // 默认禁止代码里装包:装包走 run_command,每次请用户确认、原样显示命令
+    blockPipInstall: process.env.BLOCK_PIP_INSTALL !== 'false',
+  },
+  shell: {
+    // 默认关闭:它没有机制边界,开之前用户应当知道自己在开什么。
+    // 需要 ALLOW_DANGEROUS_TOOLS=true 才真正可用(run_command 是 danger 工具)
+    enabled: process.env.SHELL_ENABLED === 'true',
+    // 比 Python 宽:装大包(torch 一类)几分钟很常见
+    timeout: process.env.SHELL_TIMEOUT ? parseInt(process.env.SHELL_TIMEOUT) : 300_000,
+    // 比 Python 的 50KB 小:命令输出是日志,模型只需要看结论。
+    // 超限不判失败(npm install 刷几百行是常态,命令本身是成功的)
+    maxStdoutBytes: process.env.SHELL_MAX_STDOUT_BYTES
+      ? parseInt(process.env.SHELL_MAX_STDOUT_BYTES)
+      : 16 * 1024,
+    maxStderrBytes: process.env.SHELL_MAX_STDERR_BYTES
+      ? parseInt(process.env.SHELL_MAX_STDERR_BYTES)
+      : 8 * 1024,
   },
   retry: {
     maxRetries: process.env.RETRY_MAX_ATTEMPTS ? parseInt(process.env.RETRY_MAX_ATTEMPTS) : 3,
@@ -298,18 +446,23 @@ export const defaultConfig: AgentConfig = {
 };
 
 export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
-  const models: { main: ModelConfig; fast?: ModelConfig; reasoning?: ModelConfig } = {
+  // 可选模型**遍历键名合并**,不逐个 if ——
+  // 逐个写实测漏过:加了 models.vision 却忘了在这里合并,于是 VISION_MODEL
+  // 配了也等于没配(config.models.vision 恒为 undefined),
+  // 视觉工具不注册、提示里没有视觉段,模型只好自己去装 OCR 库。
+  // 遍历之后新增可选模型不需要改这里
+  const optionalKeys = ['fast', 'reasoning', 'vision'] as const;
+
+  const models: AgentConfig['models'] = {
     main: { ...defaultConfig.models.main, ...overrides.models?.main },
   };
 
-  // 合并可选的 fast 模型
-  if (defaultConfig.models.fast || overrides.models?.fast) {
-    models.fast = { ...defaultConfig.models.fast, ...overrides.models?.fast } as ModelConfig;
-  }
-
-  // 合并可选的 reasoning 模型
-  if (defaultConfig.models.reasoning || overrides.models?.reasoning) {
-    models.reasoning = { ...defaultConfig.models.reasoning, ...overrides.models?.reasoning } as ModelConfig;
+  for (const key of optionalKeys) {
+    const base = defaultConfig.models[key];
+    const override = overrides.models?.[key];
+    if (base || override) {
+      models[key] = { ...base, ...override } as ModelConfig;
+    }
   }
 
   return {
@@ -327,8 +480,10 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
       },
     },
     security: { ...defaultConfig.security, ...overrides.security },
-    vision: { ...defaultConfig.vision, ...overrides.vision },
     python: { ...defaultConfig.python, ...overrides.python },
+    // 新增顶层配置段必须在这里合并 —— 漏了不会报错,只会让整段 overrides 生效
+    // 但默认值丢失(或反之)。models.vision 就是这么漏过一次的
+    shell: { ...defaultConfig.shell, ...overrides.shell },
     retry: { ...defaultConfig.retry, ...overrides.retry },
     subAgent: { ...defaultConfig.subAgent, ...overrides.subAgent },
     trace: { ...defaultConfig.trace, ...overrides.trace },

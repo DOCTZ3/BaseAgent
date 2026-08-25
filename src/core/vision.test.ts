@@ -12,7 +12,7 @@ import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { messageToText, hasImage, type ContentPart } from './llm-client.js';
+import { messageToText, type ContentPart } from './llm-client.js';
 import { DeepSeekAdapter } from './deepseek-adapter.js';
 import { TokenCounter } from './token-counter.js';
 import { ConsoleLogger, LogLevel, TraceRecorder } from '../platform/index.js';
@@ -141,11 +141,6 @@ describe('图片在文本路径里折成占位标签', () => {
     expect(messageToText('普通消息')).toBe('普通消息');
   });
 
-  it('hasImage 正确判别', () => {
-    expect(hasImage([IMG])).toBe(true);
-    expect(hasImage([{ type: 'text', text: 'x' }])).toBe(false);
-    expect(hasImage('文本')).toBe(false);
-  });
 });
 
 describe('trace 落盘剥离 base64', () => {

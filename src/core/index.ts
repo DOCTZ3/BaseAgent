@@ -9,3 +9,5 @@ export * from './orchestrator.js';
 export * from './token-counter.js';
 export * from './context.js';
 export * from './sub-agent.js';
+export * from './vision-analyzer.js';
+export * from './system-prompt.js';

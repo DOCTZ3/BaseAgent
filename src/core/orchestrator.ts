@@ -2,8 +2,8 @@
 // Core 层:主循环 Orchestrator(集成 Context 管理)
 // ============================================
 
-import { LLMClient, Message, ContentPart } from './llm-client.js';
-import { ToolRunner, ToolRegistry, type ImageAttachment } from '../tools/index.js';
+import { LLMClient, Message } from './llm-client.js';
+import { ToolRunner, ToolRegistry } from '../tools/index.js';
 import { Logger, MaxStepsExceededError } from '../platform/index.js';
 import { ContextManager } from './context.js';
 
@@ -86,9 +86,6 @@ export class Orchestrator {
     const messages = context ? [] : [...initialMessages];  // Context 模式下不用本地数组
     let step = 0;
 
-    // 本步工具产出的图片，攒到全部 tool 响应写完后再注入（见下方注入处注释）
-    const pendingAttachments: ImageAttachment[] = [];
-
     this.config.logger.info('开始主循环', { maxSteps: this.config.maxSteps });
 
     while (step < this.config.maxSteps) {
@@ -156,14 +153,13 @@ export class Orchestrator {
             ? { ...result, _system_note: buildWrapUpNote(this.config.maxSteps) }
             : result;
 
-          // 附件不进 tool 消息：OpenAI 兼容接口的 role:'tool' content 只接受字符串，
-          // 图片块只允许出现在 user 消息里。剥出来单独注入（见下方）
-          const { attachments, ...rest } = payload as typeof payload & {
-            attachments?: ImageAttachment[];
-          };
-
-          // 添加工具结果
-          const resultContent = JSON.stringify(rest);
+          // 工具结果直接序列化进 tool 消息。
+          //
+          // 这里曾有一段「把图片从结果里剥出来、攒到全部 tool 响应写完后
+          // 注入成 user 消息」的逻辑 —— 视觉改成插件后没有工具再产出图片了
+          // (观察是文字,不受「tool content 只接受字符串」的限制),故删除。
+          // 要重新支持多模态主模型时,从 git 历史取回比留着死代码清楚
+          const resultContent = JSON.stringify(payload);
           if (context) {
             context.addToolResult(toolCall.id, resultContent);
           } else {
@@ -173,47 +169,6 @@ export class Orchestrator {
               content: resultContent,
             });
           }
-
-          // 图片以 user 消息承载。必须排在全部 tool 消息之后 ——
-          // assistant 声明 N 个 tool_call 后，API 要求紧跟 N 条 tool 响应，
-          // 中间插入 user 会让序列非法并直接 400
-          if (attachments?.length) {
-            pendingAttachments.push(...attachments);
-          }
-        }
-
-        // 所有 tool 响应写完后再注入图片，此时序列已完整
-        if (pendingAttachments.length > 0) {
-          const parts: ContentPart[] = [
-            {
-              type: 'text',
-              text: `以下是工具返回的图片（${pendingAttachments
-                .map(a => a.label)
-                .join('、')}）：`,
-            },
-            ...pendingAttachments.map(a => ({
-              type: 'image' as const,
-              data: a.data,
-              mimeType: a.mimeType,
-              detail: a.detail,
-              label: a.label,
-              width: a.width,
-              height: a.height,
-            })),
-          ];
-
-          this.config.logger.info('注入图片附件', {
-            count: pendingAttachments.length,
-            labels: pendingAttachments.map(a => a.label),
-          });
-
-          if (context) {
-            context.addObservation(parts);
-          } else {
-            messages.push({ role: 'user', content: parts });
-          }
-
-          pendingAttachments.length = 0;
         }
 
         // 继续循环,把工具结果喂回模型

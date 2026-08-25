@@ -31,20 +31,34 @@ import {
   SubAgentRequest,
   SubAgentResult,
   ConfirmRequest,
+  type InheritableRunnerConfig,
 } from '../tools/index.js';
-import { Logger, type FsGrant } from '../platform/index.js';
+import { Logger } from '../platform/index.js';
 import { LLMClient } from './llm-client.js';
 import { ContextManager, ContextConfig } from './context.js';
 import { Orchestrator } from './orchestrator.js';
+import {
+  buildSubAgentSystemPrompt,
+  type EnvironmentOptions,
+} from './system-prompt.js';
 
 export interface SubAgentConfig {
   parentSessionId: string;
   logger: Logger;
   signal: AbortSignal;
   onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
-  allowDangerousTools: boolean;
-  // 与主 agent 同一份授权（含读写档位）—— 安全边界不因下放而放宽
-  fsGrants: FsGrant[];
+  /**
+   * 从主 agent 继承的资源与安全边界(整份传,不逐字段列举)
+   *
+   * **逐字段转发实测会漏**:先漏了 `visionAnalyzer`,又漏了 `pythonExecutor` ——
+   * 后者让子 agent 的 `execute_python` 每次返回「未初始化」,它以为是自己代码
+   * 的问题,连跑 `print("hello")` 探活,白烧十几步。
+   * 整份传之后「新增执行器忘了给子 agent」这个失败模式从结构上消失。
+   *
+   * 安全边界随之一并继承(授权列表、deny 列表、危险工具开关)——
+   * 下放任务不放宽边界。`subAgentRunner` 不在其中,子 agent 拿不到 spawn 能力。
+   */
+  inherited: InheritableRunnerConfig;
 
   maxSteps: number;      // 单个子 agent 的步数预算
   maxCount: number;      // 单次会话内最多 spawn 多少个子 agent
@@ -52,15 +66,42 @@ export interface SubAgentConfig {
   // 子 agent 自己的上下文配置（除 sessionId 外与主 agent 同构）
   contextConfig: Omit<ContextConfig, 'sessionId' | 'logger'>;
 
-  systemPrompt?: string;  // 子 agent 的系统提示，未给则用内置默认
+  /**
+   * 运行环境(代码执行 / 视觉插件 / 是否已收敛动作空间)
+   *
+   * **必填**,而且由这里自己拼提示、不接受入口传一段现成的 systemPrompt ——
+   * 否则又会变成「入口忘了同步」的漏:子 agent 原本就是因为用一段独立短提示,
+   * 对环境一无所知,拿 requests 去抓需要登录的站点、还可能 close 掉常驻浏览器。
+   *
+   * 环境约定与主 agent 出自**同一个函数**,变了只改一处。
+   */
+  environment: EnvironmentOptions;
+
+  /**
+   * 覆盖系统提示(仅测试/特殊场景用)
+   *
+   * 给了它就完全替换,**环境约定也会一并丢掉** —— 所以生产路径不要用
+   */
+  systemPromptOverride?: string;
 }
 
-const DEFAULT_SYSTEM_PROMPT =
-  '你是一个专注的子任务执行器。你会收到一个自包含的任务，请用提供的工具完成它。\n' +
-  '你看不到主对话的历史，任务描述里的信息就是你拥有的全部背景。\n' +
-  '完成后给出一段**高信息密度**的回答：直接写结论与关键事实（具体数值、路径、名称），' +
-  '不要复述过程，不要客套。你的回答会作为唯一产物交回主 agent，' +
-  '中间读到的原始内容不会传出去，所以必须把结论写全。';
+/**
+ * 不下放给子 agent 的工具(按名字)
+ *
+ * 两个都得按名字排除:它们没有可依赖的结构特征 ——
+ * `request_help` 的 needs 是空数组,`run_command` 的 needs 是 ['shell'],
+ * 而「有 shell 就排除」会在将来加入无害的 shell 类工具时误伤。
+ *
+ * 共同理由:**需要人当场判断的事,只能发生在用户正在对话的那个 agent 上。**
+ * - `request_help`:子 agent 的输出只回给主 agent,用户看不到它说的话 ——
+ *   它请求帮助等于打扰了用户、却没有任何人告诉用户该做什么。
+ * - `run_command`:它唯一的安全机制就是用户读那行命令并判断。
+ *   子 agent 的推理过程用户看不到,确认框会凭空冒出来 ——
+ *   用户不知道这条 `pip install` 从哪来、为什么需要,只能盲点。
+ *   而装包是对**整台机器**的副作用,这个决定该由主 agent 拿着上下文来做。
+ */
+const NO_SUBAGENT_TOOLS = new Set(['request_help', 'run_command']);
+
 
 export class LocalSubAgentRunner implements SubAgentRunner {
   private spawnCount = 0;
@@ -122,12 +163,12 @@ export class LocalSubAgentRunner implements SubAgentRunner {
       // ③ runner：共享父级 signal 与 confirm —— 安全边界不因下放而放宽。
       //    注意不传 subAgentRunner，双重保证拿不到 spawn 能力
       const runner = new ToolRunner(registry, {
+        // 资源与安全边界整份继承 —— 逐字段转发漏过两次（见 inherited 字段注释）
+        ...this.config.inherited,
         sessionId,
         logger,
         signal: this.config.signal,
         onConfirmRequired: this.config.onConfirmRequired,
-        allowDangerousTools: this.config.allowDangerousTools,
-        fsGrants: this.config.fsGrants,
       });
 
       const orchestrator = new Orchestrator(this.llmClient, runner, registry, {
@@ -138,7 +179,11 @@ export class LocalSubAgentRunner implements SubAgentRunner {
         traceLabelPrefix: `subagent:${subAgentId}`,
       });
 
-      context.addSystemMessage(this.config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT);
+      // 环境约定与主 agent 同源（同一个函数产出），差别只在角色部分
+      context.addSystemMessage(
+        this.config.systemPromptOverride ??
+          buildSubAgentSystemPrompt(this.config.environment),
+      );
 
       const userContent = request.context
         ? `任务：${request.task}\n\n背景信息：\n${request.context}`
@@ -212,7 +257,19 @@ export class LocalSubAgentRunner implements SubAgentRunner {
     const skipped: string[] = [];
 
     for (const tool of this.parentRegistry.all()) {
+      // needs 含 'agent' = 递归入口,结构上排除(不靠深度计数)
       if (tool.needs.includes('agent')) {
+        skipped.push(tool.name);
+        continue;
+      }
+      // 请求用户帮助也排除:子 agent 的输出只回给主 agent,**用户看不到它说的话**。
+      // 让它调 request_help 的话,用户压根不知道要去操作浏览器,
+      // 而子 agent 已经带着未完成的答案返回了 —— 打扰了用户却什么也没推进。
+      // 遇到需要人介入时它应当把情况写进回答,交回主 agent 去请用户处理。
+      //
+      // 用工具名而非 needs 判定:request_help 的 needs 是空数组(它不碰任何执行器),
+      // 没有可依赖的结构特征。这是唯一按名字排除的工具,所以显式列出
+      if (NO_SUBAGENT_TOOLS.has(tool.name)) {
         skipped.push(tool.name);
         continue;
       }
@@ -220,7 +277,7 @@ export class LocalSubAgentRunner implements SubAgentRunner {
     }
 
     if (skipped.length > 0) {
-      this.config.logger.debug('子 agent 工具集已排除递归入口', { skipped });
+      this.config.logger.debug('子 agent 工具集已排除', { skipped });
     }
 
     return registry;
