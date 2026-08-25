@@ -23,6 +23,7 @@
 import 'dotenv/config';
 import readline from 'readline';
 import path from 'path';
+import { formatConfirm } from './confirm-format.js';
 import {
   ConsoleLogger,
   LogLevel,
@@ -217,10 +218,8 @@ async function main() {
   // 危险工具的真实终端确认（复用主 rl，避免两个 readline 抢 stdin）
   let confirmFn: (prompt: string) => Promise<boolean>;
 
-  const onConfirmRequired = async (req: { toolName: string; args: Record<string, unknown> }) => {
-    const detail = JSON.stringify(req.args);
-    return confirmFn(`${YELLOW}需要确认${RESET} ${req.toolName} ${dim(detail)}`);
-  };
+  const onConfirmRequired = async (req: { toolName: string; args: Record<string, unknown> }) =>
+    confirmFn(formatConfirm(req));
 
   // ---------- LLM ----------
   const llmClient = new DeepSeekAdapter({
