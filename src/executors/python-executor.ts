@@ -84,11 +84,21 @@ export interface PythonExecutorConfig {
    *
    * 默认开启。关掉意味着模型的代码能删/改机器上任意文件 ——
    * 写/删是不可逆的,一次手滑就是真实损失。
-   * 只管写不管读:读错文件没有直接损害,而读的白名单最容易误伤 import
-   * (实测一次 `import pandas` 触发 1183 次 open,全是库加载)。
    * 详见 write-guard.ts 顶部注释,含「明确不做」的清单与剩余风险。
+   *
+   * 注意这一项同时管住读黑名单的注入(两者在同一个 audit hook 里):
+   * 关掉它,readDenyPaths 也就不生效了。
    */
   writeGuard?: boolean;
+  /**
+   * 读黑名单:凭证类路径,代码读不到(绝对路径)
+   *
+   * 与写边界策略相反 —— 写按白名单,读按黑名单。读的白名单做不了:
+   * 实测一次 `import pandas` 触发 1183 次 open,全是库加载。
+   * 清单由 read-deny.ts 生成,**必须与 SecurityGuard 用同一份**,
+   * 否则会出现「fs 工具读不到、代码读得到」这种不报错的错位。
+   */
+  readDenyPaths?: readonly string[];
   /**
    * 禁止在代码里装包(默认开)
    *
@@ -168,7 +178,7 @@ export class PythonExecutor {
     // 写边界必须排在模型代码之前：audit hook 一旦注册就无法注销
     // （PEP 578 故意不提供 remove），所以模型的代码删不掉它
     const guardPrelude = (this.config.writeGuard ?? true)
-      ? buildWriteGuardPrelude(this.config.workDir)
+      ? buildWriteGuardPrelude(this.config.workDir, this.config.readDenyPaths ?? [])
       : '';
     // 工具桥排在写边界之后:桥自己也要受写边界约束(它没有理由例外)
     const bridgePrelude = useBridge ? bridge!.prelude : '';

@@ -1,14 +1,16 @@
 // ============================================
-// Executors 层:代码执行的写边界(Python audit hook)
+// Executors 层:代码执行的写边界 + 读黑名单(Python audit hook)
 // ============================================
 //
-// 只管写,不管读。
+// 写按**白名单**(工作区 + temp),读按**黑名单**(凭证类路径,见 read-deny.ts)。
 //
-// 为什么只管写：
-// - 写/删是**不可逆**的,一次手滑就是真实损失;读错文件没有直接损害
-// - 读的白名单最容易误伤 —— 实测一次 `import pandas` 就触发 1183 次 open,
+// 为什么两侧用相反的策略:
+// - 写/删是**不可逆**的,一次手滑就是真实损失,所以按白名单收紧
+// - 读的白名单做不了 —— 实测一次 `import pandas` 触发 1183 次 open,
 //   全是库加载。漏放行一个目录就是 import 直接失败
-// - 因此收益/风险比在「写」这一侧压倒性地好
+// - 但读**不能完全不管**:读错普通文件没有直接损害,读到凭证不一样,
+//   值会进上下文、发给模型服务商、落进 traces,事后删不回来。
+//   黑名单只列沙箱没有正当理由读的东西,误伤面接近零
 //
 // ⚠️ **已知缺口:换个进程就绕过。**
 //
@@ -45,12 +47,19 @@
 //   但绕法仍在(`python -S` 不加载 site、`-I` 连 PYTHONPATH 一起忽略),
 //   而且只覆盖 Python 子进程。加了容易让人误以为进程内边界补上了 ——
 //   PIP_NO_INDEX + run_command 确认已经覆盖了实际发生过的场景,故暂不做
-// - **读路径白名单 / 分级策略 / 中途授权确认**:见上;后者还需要 CodeAct 工具桥
+// - **读路径白名单 / 分级策略 / 中途授权确认**:白名单见上(误伤 import);
+//   中途授权确认还需要 CodeAct 工具桥,且结构上不可能 —— 代码块是原子的
+// - **读侧的 realpath**:读黑名单只做 abspath 前缀匹配,不解析符号链接。
+//   于是「工作区内建软链接指到 ~/.ssh,再读那个链接」能绕过。
+//   不补是权衡:realpath 要按路径分量做 syscall,而读事件一次 import 上千次;
+//   更关键的是 subprocess 那条绕法**更省事**,补了符号链接也不会让谁绕不过去。
+//   fs 工具那一侧(SecurityGuard)是做 realpath 的,严格于此
 //
 // 剩余风险(产品决策,不是技术限制):
-//   模型仍能读任意文件(含 .ssh / .env),并可借浏览器把内容发出去。
+//   读黑名单之外的文件模型仍读得到,并可借浏览器把内容发出去。
 //   自用场景 + 用户信任该 agent 的前提下接受 —— 同类工具(Codex/Claude Code)
-//   也是全权限跑在用户机器上。
+//   也是全权限跑在用户机器上。黑名单收的只是**纯负债**的那部分(凭证),
+//   因为那类内容一旦进上下文就已经发给模型服务商了,事后删 trace 追不回。
 //
 // 配置面：用户只需指定**工作区**一项,其余(Python 安装目录、temp)运行时推导。
 // ============================================
@@ -63,17 +72,24 @@ import * as path from 'path';
  * 关键性质:audit hook 注册后**无法注销**(PEP 578 故意不提供 remove),
  * 所以模型的代码删不掉它。因此 prelude 必须排在模型代码之前执行。
  *
- * 钩子里做的判断要极轻:一次 import 就触发上千次事件,
- * 每次都做完整路径规范化会明显拖慢。故只在**写类事件**上做工作,
- * 读类事件直接返回。
+ * 钩子里做的判断要极轻:一次 import 就触发上千次事件。
+ * 写类事件很少,可以做 realpath;读类事件是绝大多数,只做
+ * 一次 `str.startswith(tuple)`(C 层单次调用),不做 realpath ——
+ * 代价是符号链接绕得过,见顶部「明确不做」。
  *
  * @param workspace 工作区绝对路径(用户唯一需要配置的项)
+ * @param readDenyPaths 读黑名单(绝对路径)。见 read-deny.ts;
+ *   与 SecurityGuard 用同一份清单,两边不同源会造成不报错的错位
  */
-export function buildWriteGuardPrelude(workspace: string): string {
+export function buildWriteGuardPrelude(
+  workspace: string,
+  readDenyPaths: readonly string[] = [],
+): string {
   // 用 JSON.stringify 转义路径：Windows 反斜杠直接插进 Python 源码会变转义符
   const ws = JSON.stringify(path.resolve(workspace));
+  const deny = JSON.stringify(readDenyPaths.map(p => path.resolve(p)));
 
-  return `# --- BaseAgent 写边界(自动注入,不可移除) ---
+  return `# --- BaseAgent 写边界 + 读黑名单(自动注入,不可移除) ---
 def _baseagent_install_guard():
     """
     所有状态与判定函数都放在**闭包**里,不留任何模块级名字。
@@ -90,6 +106,19 @@ def _baseagent_install_guard():
     # temp 也放行：库运行时要在这里落临时文件（实测 pandas/playwright 都会）
     allow = (ws, os.path.realpath(tempfile.gettempdir()))
     sep = os.sep
+    normcase = os.path.normcase
+
+    # 读黑名单。normcase 是必须的：Windows 上路径大小写不敏感,
+    # 不归一化则 C:\\Users\\x\\.ssh 与 c:\\users\\x\\.ssh 判成两个路径。
+    #
+    # 拆成 exact + prefixes 两个结构是为了**读事件的性能**:
+    # 一次 import 触发上千次读,判定必须是 O(1) 的 C 层调用 ——
+    # set 查一次 + startswith 吃元组(单次 C 调用),不写 Python 循环
+    _dn = tuple(normcase(r) for r in ${deny})
+    deny_exact = frozenset(_dn)
+    deny_prefixes = tuple(r + sep for r in _dn)
+    # 黑名单为空时读事件一个字节的工作都不做:省掉每次 open 的一次函数调用
+    deny_roots_present = bool(_dn)
 
     # 只拦这些。open 单独处理（要看 mode），其余是纯写操作
     write_events = frozenset((
@@ -120,8 +149,40 @@ def _baseagent_install_guard():
             "确实需要访问其他目录时,请在回答里说明并请用户授权。" % (op, p, ws)
         )
 
+    def denied_read(p):
+        """
+        读黑名单判定。只做 abspath,不做 realpath —— 读事件一次 import 上千次,
+        realpath 会按路径分量做 syscall。代价是符号链接绕得过(见顶部「明确不做」)。
+
+        bytes 路径必须先 fsdecode:open(b"...id_rsa") 是合法调用,
+        而 bytes 和 str 前缀比较永远为假 —— 不转换就是一条静默绕过。
+        """
+        if isinstance(p, int):
+            return False
+        try:
+            if isinstance(p, bytes):
+                p = os.fsdecode(p)
+            elif not isinstance(p, str):
+                p = os.fspath(p)      # PathLike(如 pathlib.Path)
+            np = normcase(abspath(p))
+        except Exception:
+            # 判不出来就放行:这里错杀的代价是任意读操作报错,
+            # 而黑名单本来只是护栏(subprocess 就能绕),不值得为它牺牲可用性
+            return False
+        return np in deny_exact or np.startswith(deny_prefixes)
+
+    def refuse_read(p):
+        raise PermissionError(
+            "读取被拒绝: %s\\n"
+            "该路径属于凭证类数据(私钥/云凭证/token/浏览器 cookie),"
+            "沙箱代码不允许读取。\\n"
+            "这类内容一旦读出就会进入对话上下文并发送给模型服务商,"
+            "事后无法撤回 —— 所以这条限制不能由代码自己绕过。\\n"
+            "如果任务确实需要某个凭证,请让用户以环境变量方式提供。" % (p,)
+        )
+
     def hook(event, args):
-        # 快速失败：绝大多数事件是读，直接返回。一次 import 会触发上千次
+        # 一次 import 触发上千次 open,所以最热的这条路径要尽早分流
         if event == "open":
             # (path, mode, flags) —— mode 为 None 时表示底层 os.open,看 flags
             if len(args) < 2:
@@ -135,12 +196,26 @@ def _baseagent_install_guard():
             else:
                 writing = any(c in str(mode) for c in ("w", "a", "x", "+"))
             if not writing:
+                # 读:只查黑名单。白名单在这一侧做不了 ——
+                # 实测一次 import pandas 触发 1183 次 open,全是库加载
+                if deny_roots_present and denied_read(p):
+                    refuse_read(p)
                 return
             # fd（int）不是路径，无法判定归属，放行 —— 拿到 fd 前必然已过一次检查
             if isinstance(p, int):
                 return
+            # 写到黑名单里也拒,且用读的措辞:凭证目录通常本来就在工作区外,
+            # 会被 inside() 拦掉,但工作区内的 .env 之类只有这条能拦
+            if deny_roots_present and denied_read(p):
+                refuse_read(p)
             if not inside(p):
                 deny(event, p)
+            return
+
+        # 列目录:拦的是「有哪些凭证文件」这类信息。事件本身很少,不影响热路径
+        if event in ("os.listdir", "os.scandir"):
+            if args and deny_roots_present and denied_read(args[0]):
+                refuse_read(args[0])
             return
 
         if event in write_events:

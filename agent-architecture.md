@@ -464,16 +464,21 @@ interface TopicSummary {
     (`headless=False` 登录引导在 WSL2 里没有桌面可显示),
     而它要防的「有决心的人类攻击者」不在本机自用的威胁模型内。
     容器仍是服务端形态的正确选择,但那是另一个产品
-  - **只管写,不管读** —— 两个理由,后者是决定性的:
-    ①写/删不可逆,一次手滑就是真实损失;读错文件没有直接损害。
-    而读的白名单最容易误伤(实测一次 `import pandas` 触发 1183 次 `open`,
-    漏放行一个目录就是 import 直接失败)。
-    ②**读边界在给了浏览器能力的前提下不可实现**。实测:Python 层拦住了
-    工作区外的 `open`,但 `page.goto("file:///.../id_rsa")` +
-    `inner_text("body")` 三行就把内容原样取回 —— chromium 是独立进程,
-    audit hook 只约束 Python;而浏览器的启动参数由模型自己写
-    (`import playwright` 直接起),框架没有插手的位置。
-    这不是实现没做好,是「代码执行」与「浏览器」两个已定能力的固有冲突
+  - **写按白名单,读按黑名单** —— 两侧策略相反,因为约束不同:
+    写/删不可逆,一次手滑就是真实损失,所以收紧到工作区 + temp。
+    读的白名单做不了(实测一次 `import pandas` 触发 1183 次 `open`,
+    漏放行一个目录就是 import 直接失败),但读**不能完全不管** ——
+    读错普通文件没有直接损害,读到凭证不一样:值会进上下文、
+    发给模型服务商、落进 traces,事后删 trace 追不回已经发出去的那一次。
+    于是只列**纯负债**的路径(私钥/云凭证/token/浏览器 cookie/本框架 `.env`),
+    误伤面接近零。清单见 `read-deny.ts`,与 SecurityGuard **同源** ——
+    两边各算一份就会出现「工具读不到、代码读得到」这种不报错的错位
+    (这正是修补前的形态:`fsDeniedPaths` 只挡住 fs 工具,代码里一句 `open()` 照读)
+  - **读黑名单挡不住的两条路,都是已知的**:①`subprocess` 换个进程
+    (与写边界同一个缺口,见下);②`page.goto("file:///.../id_rsa")` +
+    `inner_text("body")` 三行原样取回 —— chromium 是独立进程,audit hook
+    只约束 Python。所以它和写边界一样是**护栏**:治的是「模型顺手读一下配置
+    好判断环境」这种现实会发生的形态,而那一下就足够把明文凭证写进对话记录
   - **写边界之所以成立,靠的是一个不对称**:chromium 不能往任意路径写文件
     (没有 `file://` 写语义,下载目录受控),所以写这一侧没有对应的绕过路径。
     于是能守住的恰好是不可逆的那一半
@@ -556,15 +561,22 @@ interface TopicSummary {
     有正常用途(标准库查时区会 dlopen `kernel32`/`tzres.dll`)。
     要区分「谁触发的」需要栈分析,复杂且脆弱。
     **注意这条只说明「拦 subprocess 很难」,不改变上面那个缺口的存在**
-  - **读路径白名单 / 分级策略 / 中途授权确认** —— 见上;后者还需 CodeAct 工具桥,
-    且会加重确认疲劳
+  - **读路径白名单 / 分级策略 / 中途授权确认** —— 白名单见上(误伤 import);
+    中途授权确认还需 CodeAct 工具桥,且结构上不可能(代码块是原子的)
+  - **读黑名单的 `realpath`** —— 读侧只做 `abspath` 前缀匹配,不解析符号链接,
+    于是「工作区内建软链接指到 `~/.ssh` 再读那个链接」绕得过。
+    不补是权衡:`realpath` 要按路径分量做 syscall,而读事件一次 import 上千次;
+    更关键的是 `subprocess` 那条绕法**更省事**,补了也不会让谁绕不过去。
+    fs 工具那一侧(SecurityGuard)是做 `realpath` 的,严格于此
   - **代码里的中途确认** —— 结构上不可能:代码块是原子的,一段代码跑完才返回,
     中间没有「跟用户说句话然后等他」的位置(这也是 `request_help` 不上工具桥的原因)。
     所以装包只能在**钝的**两端选:要么禁、要么放行,没有「装之前问一下」这个中间态 ——
     `run_command` 是把那次询问挪到了代码**之外**
-  - **剩余风险**(产品决策,非技术限制):模型仍能读任意文件(含 `.ssh`/`.env`),
-    并可借浏览器把内容发出去。自用 + 用户信任该 agent 的前提下接受 ——
-    同类工具(Codex / Claude Code)同样是全权限跑在用户机器上
+  - **剩余风险**(产品决策,非技术限制):黑名单之外的文件模型仍读得到,
+    且黑名单内的文件经 `subprocess` 或浏览器仍取得到,内容可被发出去。
+    自用 + 用户信任该 agent 的前提下接受 —— 同类工具(Codex / Claude Code)
+    同样是全权限跑在用户机器上。黑名单收的只是**纯负债**的那部分(凭证),
+    因为那类内容一旦进上下文就已经发给模型服务商了
 - **登录态靠 chromium 的 user-data-dir 持久化,不靠框架解析**:
   - 用 `launch_persistent_context(dir)` 而非 `storage_state`:后者只搬 cookie +
     localStorage(用 IndexedDB 存 token 的站点会漏)且要显式存盘;前者是整个 profile、
@@ -725,9 +737,11 @@ interface TopicSummary {
 - FsDriver (文件系统,集成 SecurityGuard 白名单 + 凭证目录黑名单)
 - PythonExecutor (子进程执行代码:超时 / stdout 上限 / env 白名单继承 / 进程树回收 /
   `PIP_NO_INDEX` 禁止代码里装包)
-- WriteGuard (audit hook 写边界:只允许写工作区 + temp,读不限;
+- WriteGuard (audit hook:写按白名单(工作区 + temp),读按黑名单(凭证类路径);
   判定在闭包内,模型无法覆盖。**已知缺口:换个进程即绕过** ——
   详见「代码执行的边界」与「已知缺口」两条决策)
+- read-deny (读黑名单清单:私钥/云凭证/token/浏览器 cookie/本框架 `.env`。
+  一份清单两处用 —— SecurityGuard 与 audit hook,不同源会造成不报错的错位)
 - ShellExecutor (外部程序通道:PATH 前置 venv / 超时杀进程树 / 输出上限。
   **没有任何机制边界**,安全性来自 `run_command` 的人工确认)
 - venv (沙箱 venv 的自动准备:启动时不存在则创建,幂等;校验不在工作区内;
@@ -806,7 +820,7 @@ interface TopicSummary {
 | 语言 | TypeScript (ES modules) |
 | LLM | DeepSeek V4 (1M context) |
 | 浏览器自动化 | Playwright(装在 Python 环境内,非 TS 侧依赖) |
-| 代码执行 | Python 子进程 + audit hook 写边界(读不限,详见设计决策) |
+| 代码执行 | Python 子进程 + audit hook(写按白名单,读按凭证黑名单,详见设计决策) |
 | 持久化 | SQLite |
 | 参数校验 | Zod |
 | 测试 | Vitest 单元测试(`src/**/*.test.ts`)+ 手写集成测试 |

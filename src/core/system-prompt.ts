@@ -74,7 +74,12 @@ export function buildEnvironmentPrompt(opts: EnvironmentOptions): string {
       : '需要读写文件、查询时间等操作时使用提供的工具。',
   );
 
-  return parts.concat(codeActPart(opts), packagesPart(opts), visionPart(opts)).join('');
+  // secretsPart 无条件加入,且**不受 pythonEnabled 影响**:
+  // 拦截发生在两处(audit hook 与 SecurityGuard),没有代码执行时
+  // 模型照样能调 read_file 撞上拒绝 —— 那时它更需要知道原因
+  return parts
+    .concat(codeActPart(opts), packagesPart(opts), visionPart(opts), secretsPart())
+    .join('');
 }
 
 /**
@@ -170,6 +175,37 @@ function codeActPart(opts: EnvironmentOptions): string {
     '用完 page.close() 可以。' +
     '因为浏览器跨轮次存活，上一轮打开的页面这一轮可以直接接着操作。' +
     '绝不要在代码里填写账号密码 —— 那会把明文凭证写进对话记录。'
+  );
+}
+
+/**
+ * 敏感文件禁止读取
+ *
+ * **单独一段、且不依赖 pythonEnabled**,两个理由:
+ * ① 拦截发生在两处 —— audit hook(代码)和 SecurityGuard(read_file 工具)。
+ *    塞在 CodeAct 那段里会漏掉工具那条路:没有代码执行时模型照样能调 read_file,
+ *    而它对「为什么被拒」一无所知
+ * ② 这条比「别 close 浏览器」更硬,不该做长段落的最后一句 ——
+ *    位置本身就是权重
+ *
+ * 措辞上「拦什么」「为什么不能绕」「出路是哪」必须同时给。少了第二条,
+ * 模型会把 PermissionError 当成路径写错去换写法;少了第三条,
+ * 它会卡在这件事上反复试 —— 实测装包被禁时它连着四步都在试各种绕法。
+ *
+ * 刻意**不列**具体路径清单:清单按平台推导、十几条,写进提示既占篇幅又必然漂移
+ * (这个项目已在「同一份事实写两处」上栽过多次)。说清类别就够模型判断。
+ */
+function secretsPart(): string {
+  return (
+    '**敏感文件禁止读取**：私钥（~/.ssh、~/.gnupg）、云与集群凭证（~/.aws、~/.kube、gcloud）、' +
+    'token 类文件（.netrc、.git-credentials、.npmrc、.pypirc）、浏览器 profile 目录（里面的 ' +
+    'cookie 等价于活凭证），以及本框架自己的 .env。' +
+    '这些路径由框架强制拦截：代码里读会抛 PermissionError，read_file 会返回被拒绝。' +
+    '**这不是路径写错，也不是权限没配好，换写法、换工具、换进程都一样** —— ' +
+    '这类内容一旦读出就会进入对话记录、随请求发送出去并落进日志，事后无法撤回。' +
+    '所以不要尝试绕过，也不要把读取失败当成需要排查的故障。' +
+    '任务确实需要某个凭证时，说明用途、请用户以环境变量方式提供；' +
+    '需要登录某个站点时用常驻浏览器的登录态，不要去翻凭证文件。'
   );
 }
 

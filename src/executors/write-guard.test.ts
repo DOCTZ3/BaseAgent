@@ -30,8 +30,11 @@ const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 let workspace: string;
 let outsideDir: string;
 let outsideFile: string;
+/** 冒充凭证目录:进读黑名单,内含一个「私钥」 */
+let secretDir: string;
+let secretFile: string;
 
-function makeExecutor(writeGuard = true) {
+function makeExecutor(writeGuard = true, readDenyPaths: readonly string[] = []) {
   return new PythonExecutor({
     pythonPath: 'python',
     workDir: workspace,
@@ -39,9 +42,13 @@ function makeExecutor(writeGuard = true) {
     maxStdoutBytes: 50 * 1024,
     maxStderrBytes: 16 * 1024,
     writeGuard,
+    readDenyPaths,
     logger,
   });
 }
+
+/** 带读黑名单的执行器(黑名单 = secretDir) */
+const guarded = () => makeExecutor(true, [secretDir]);
 
 describe.skipIf(!hasPython)('写边界', () => {
   beforeAll(async () => {
@@ -50,11 +57,17 @@ describe.skipIf(!hasPython)('写边界', () => {
     outsideDir = await fs.mkdtemp(path.join(os.homedir(), '.ba-outside-'));
     outsideFile = path.join(outsideDir, 'victim.txt');
     await fs.writeFile(outsideFile, 'original', 'utf-8');
+
+    // 冒充 ~/.ssh：内容要能在断言里认出来，才能验证「没读到」而不只是「没报错」
+    secretDir = await fs.mkdtemp(path.join(os.homedir(), '.ba-secret-'));
+    secretFile = path.join(secretDir, 'id_rsa');
+    await fs.writeFile(secretFile, 'PRIVATE-KEY-CONTENT', 'utf-8');
   });
 
   afterAll(async () => {
     await fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
     await fs.rm(outsideDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(secretDir, { recursive: true, force: true }).catch(() => {});
   });
 
   const py = (s: string) => s.replace(/\\/g, '\\\\');
@@ -143,12 +156,132 @@ describe.skipIf(!hasPython)('写边界', () => {
       expect(await fs.readFile(outsideFile, 'utf-8')).toBe('original');
     });
 
-    it('工作区外读取仍然放行（只管写）', async () => {
+    it('工作区外读取放行（读按黑名单，不在名单里就放行）', async () => {
       const r = await makeExecutor().run(
         `print(open(r"${py(outsideFile)}").read())`
       );
       expect(r.ok).toBe(true);
       expect(r.stdout.trim()).toBe('original');
+    });
+  });
+
+  // ============================================
+  // 读黑名单
+  // ============================================
+  //
+  // 断言重点是**内容没出来**,不只是「报了错」:
+  // 这一层要防的后果是凭证进入上下文并发给模型服务商,
+  // 所以「拒了但值还在 stdout 里」等于没防住。
+  describe('读黑名单', () => {
+    it('读名单内文件被拒,且内容不出现在输出里', async () => {
+      const r = await guarded().run(
+        `print(open(r"${py(secretFile)}").read())`
+      );
+      expect(r.ok).toBe(false);
+      expect(r.stderr).toContain('读取被拒绝');
+      expect(r.stdout).not.toContain('PRIVATE-KEY-CONTENT');
+      expect(r.stderr).not.toContain('PRIVATE-KEY-CONTENT');
+    });
+
+    it('底层 os.open 读同样被拦', async () => {
+      const r = await guarded().run(
+        `import os\nfd = os.open(r"${py(secretFile)}", os.O_RDONLY)`
+      );
+      expect(r.ok).toBe(false);
+      expect(r.stderr).toContain('读取被拒绝');
+    });
+
+    it('bytes 路径也被拦 —— 不转换就是一条静默绕过', async () => {
+      // bytes 与 str 做前缀比较永远为假,漏了 fsdecode 这里就会返回内容
+      const r = await guarded().run(
+        `print(open(rb"${py(secretFile)}").read())`
+      );
+      expect(r.ok).toBe(false);
+      expect(r.stdout).not.toContain('PRIVATE-KEY-CONTENT');
+    });
+
+    it('pathlib.Path 也被拦(PathLike 分支)', async () => {
+      const r = await guarded().run(
+        `from pathlib import Path\nprint(Path(r"${py(secretFile)}").read_text())`
+      );
+      expect(r.ok).toBe(false);
+      expect(r.stdout).not.toContain('PRIVATE-KEY-CONTENT');
+    });
+
+    it('列目录被拦 —— 「有哪些凭证文件」本身就是信息', async () => {
+      const r = await guarded().run(
+        `import os\nprint(os.listdir(r"${py(secretDir)}"))`
+      );
+      expect(r.ok).toBe(false);
+      expect(r.stdout).not.toContain('id_rsa');
+    });
+
+    it('往名单内写也被拦(工作区内的 .env 只有这条能拦)', async () => {
+      const r = await guarded().run(
+        `open(r"${py(secretFile)}", "w").write("x")`
+      );
+      expect(r.ok).toBe(false);
+      expect(await fs.readFile(secretFile, 'utf-8')).toBe('PRIVATE-KEY-CONTENT');
+    });
+
+    it('覆盖同名函数无效(闭包,和写边界同一个理由)', async () => {
+      const r = await guarded().run(
+        `def denied_read(p): return False\n` +
+        `def refuse_read(p): pass\n` +
+        `print(open(r"${py(secretFile)}").read())`
+      );
+      expect(r.ok).toBe(false);
+      expect(r.stdout).not.toContain('PRIVATE-KEY-CONTENT');
+    });
+
+    it('名单外的读不受影响 —— 黑名单不能误伤正常任务', async () => {
+      const r = await guarded().run(
+        `print(open(r"${py(outsideFile)}").read())`
+      );
+      expect(r.ok).toBe(true);
+      expect(r.stdout.trim()).toBe('original');
+    });
+
+    it('import 不被误伤(黑名单开着也一样)', async () => {
+      // 读的白名单做不了就是因为这个:一次 import pandas 触发 1183 次 open
+      const r = await guarded().run(
+        `import json, pandas, requests, bs4\nprint("ok")`
+      );
+      expect(r.ok).toBe(true);
+      expect(r.stdout.trim()).toBe('ok');
+    }, 30_000);
+
+    it('错误信息说清为什么不能绕,而不是只说被拒', async () => {
+      // 模型看到「被拒」的第一反应是换写法重试。必须告诉它这条不是技术障碍
+      const r = await guarded().run(
+        `open(r"${py(secretFile)}").read()`
+      );
+      expect(r.stderr).toContain('凭证');
+      expect(r.stderr).toContain('环境变量');
+    });
+
+    it('不给黑名单时读什么都放行 —— 默认不改变原行为', async () => {
+      const r = await makeExecutor().run(
+        `print(open(r"${py(secretFile)}").read())`
+      );
+      expect(r.ok).toBe(true);
+      expect(r.stdout.trim()).toBe('PRIVATE-KEY-CONTENT');
+    });
+
+    it('⚠️ 已知缺口:subprocess 换个进程就读得到', async () => {
+      // 和写边界同一个洞(audit hook 只管当前进程)。把它测出来,
+      // 是为了让「这是护栏不是边界」这句话有对照,而不是停在注释里
+      const r = await guarded().run(
+        [
+          'import sys, subprocess',
+          'out = subprocess.run(',
+          `    [sys.executable, "-c", "print(open(r'${py(secretFile)}').read())"],`,
+          '    capture_output=True, text=True)',
+          'print(out.stdout.strip())',
+        ].join('\n')
+      );
+      expect(r.ok).toBe(true);
+      expect(r.stdout).toContain('PRIVATE-KEY-CONTENT');
     });
   });
 

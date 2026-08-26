@@ -227,6 +227,63 @@ describe('基线库的可用性', () => {
   });
 });
 
+// ============================================
+// 敏感文件禁止读取
+// ============================================
+//
+// 拦截发生在两处:audit hook(代码)与 SecurityGuard(read_file 工具)。
+// 提示里只说其中一处,或者把它挂在 pythonEnabled 上,都会留下
+// 「模型撞上拒绝但不知道为什么」的形态 —— 那时它会换写法重试,
+// 实测装包被禁时它连着四步都在试各种绕法。
+describe('敏感文件禁止读取', () => {
+  const env = buildEnvironmentPrompt(FULL);
+
+  it('明确说禁止读取,并点名类别', () => {
+    expect(env).toContain('敏感文件禁止读取');
+    expect(env).toContain('.ssh');
+    expect(env).toContain('.aws');
+    expect(env).toContain('.env');
+    expect(env).toContain('cookie');
+  });
+
+  it('说清两条路都被拦 —— 代码和工具', () => {
+    // 只说代码那条,模型用 read_file 撞上拒绝时同样不知所以
+    expect(env).toContain('PermissionError');
+    expect(env).toContain('read_file');
+  });
+
+  it('说清「换写法没用」—— 否则模型会把拒绝当故障去排查', () => {
+    expect(env).toContain('不是路径写错');
+    expect(env).toContain('不要尝试绕过');
+  });
+
+  it('给出路:凭证走环境变量、登录走常驻浏览器', () => {
+    // 只禁不给出路等于制造一个新卡点(与装包那条同一个教训)
+    expect(env).toContain('环境变量');
+    expect(env).toContain('登录态');
+  });
+
+  it('**关掉代码执行时依然存在** —— read_file 那条路不依赖沙箱', () => {
+    const off = buildEnvironmentPrompt({ ...FULL, pythonEnabled: false });
+
+    expect(off).toContain('敏感文件禁止读取');
+    expect(off).toContain('read_file');
+  });
+
+  it('不列具体路径清单 —— 清单按平台推导,写进提示必然漂移', () => {
+    // 十几条路径写进提示既占篇幅,又与 read-deny.ts 形成第二份事实
+    expect(env).not.toContain('AppData');
+    expect(env).not.toContain('Library/Keychains');
+  });
+
+  it('主 agent 与子 agent 都有 —— 子 agent 同样跑在这个沙箱里', () => {
+    expect(buildMainSystemPrompt({ ...FULL, subAgentEnabled: true })).toContain(
+      '敏感文件禁止读取',
+    );
+    expect(buildSubAgentSystemPrompt(FULL)).toContain('敏感文件禁止读取');
+  });
+});
+
 describe('角色差异', () => {
   it('子 agent 被明确告知没有请求用户帮助的能力', () => {
     // 它的输出只回给主 agent，用户看不到它说的话 —— 不说清它会写

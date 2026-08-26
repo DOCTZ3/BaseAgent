@@ -25,6 +25,8 @@ export {
   inheritEnv,
   PIP_BLOCKED_ENV,
 } from './sandbox-env.js';
+export { defaultReadDenyPaths } from './read-deny.js';
+export type { ReadDenyOptions } from './read-deny.js';
 export { BrowserManager } from './browser-manager.js';
 export type { BrowserManagerConfig } from './browser-manager.js';
 export { BrowserOps } from './browser-ops.js';

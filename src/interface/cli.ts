@@ -45,6 +45,7 @@ import {
   ensureSandboxVenv,
   checkSandboxDeps,
   SANDBOX_DEPS,
+  defaultReadDenyPaths,
   type BridgeToolResult,
 } from '../executors/index.js';
 import {
@@ -325,6 +326,21 @@ async function main() {
   // profile 目录用绝对路径：要同时注入子进程和进 fs deny 列表，相对路径两边解析基准不同
   const browserProfileDir = path.resolve(config.python.browserProfileDir);
 
+  // ---------- 读黑名单(凭证类路径)----------
+  //
+  // 算一次、两处用(fs 工具的 SecurityGuard + Python 的 audit hook)。
+  // **必须同源**:两边各算一份就会出现「工具读不到、代码读得到」这种不报错的错位,
+  // 而这正是之前 fsDeniedPaths 只挡住 fs 工具、Python 里一句 open() 照读的形态。
+  //
+  // 它是护栏不是边界(subprocess 换个进程就绕,见 write-guard.ts)。
+  // 治的是「模型顺手读一下配置好判断环境」—— 而那一下就把明文凭证
+  // 写进了对话记录、发给了模型服务商、落进了 traces,事后删不回来
+  const readDenyPaths = defaultReadDenyPaths({
+    projectDir: process.cwd(),
+    // profile 里的 cookie 等价于活凭证,比密码更直接(不用过二次验证)
+    extra: config.python.enabled ? [browserProfileDir] : [],
+  });
+
   // ---------- 常驻浏览器(CDP) ----------
   // 由框架启动而非模型代码启动，浏览器才能跨轮次存活 ——
   // 「上一轮打开的页面下一轮接着点」就靠这个。
@@ -410,6 +426,9 @@ async function main() {
         // 装包走 run_command —— 一屏 40 行代码里第 23 行的 pip 用户看不见，
         // 单独一行才会真读清包名（typosquatting 的攻击面就是一两个字符）
         blockPipInstall: config.python.blockPipInstall,
+        // 与 fs 工具同一份清单：之前只有 fs 侧挡住 profile，
+        // 代码里一句 open() 照读 —— 一条锁一条全开，锁的那条就没有意义
+        readDenyPaths,
         // 桥的地址与 token 由执行器逐次注入子进程（还要带上 run id 给图片分桶）
         toolBridge,
         logger,
@@ -453,8 +472,9 @@ async function main() {
   const inherited: InheritableRunnerConfig = {
     allowDangerousTools: config.security.allowDangerousTools,
     fsGrants: config.security.fsGrants,
-    // profile 里的 cookie 等价于活凭证，不能让 read_file 读进上下文并跟着 trace 落盘
-    fsDeniedPaths: config.python.enabled ? [browserProfileDir] : [],
+    // 凭证类路径:私钥/云凭证/token/浏览器 cookie。与 Python 侧同一份清单,
+    // 否则会出现「fs 工具读不到、代码读得到」这种不报错的错位
+    fsDeniedPaths: readDenyPaths,
     // 相对路径按工作区解析，与 Python 子进程的 cwd 同源
     workspace: config.workspace || undefined,
     pythonExecutor,
@@ -593,8 +613,12 @@ async function main() {
       : '允许 (模型可在代码里静默装包)'}`));
   }
   if (config.python.enabled) {
-    console.log(dim(`  浏览器    profile=${browserProfileDir} (已加入 fs 拒绝列表)`));
+    console.log(dim(`  浏览器    profile=${browserProfileDir} (已加入读黑名单)`));
   }
+  // 让用户看见到底拦了多少、拦了什么。只报条数不报清单:
+  // 清单十几条会把横幅撑爆,而用户真正要确认的是「这层开着」
+  console.log(dim(`  读黑名单  ${readDenyPaths.length} 条凭证路径 ` +
+    `(私钥/云凭证/token/cookie/.env;fs 工具与代码同一份)`));
   console.log();
 
   const rl = readline.createInterface({
