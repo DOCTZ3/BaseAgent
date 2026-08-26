@@ -29,6 +29,7 @@ import {
   LogLevel,
   loadConfig,
   TraceRecorder,
+  Storage,
   type TraceSummary,
 } from '../platform/index.js';
 import {
@@ -54,6 +55,8 @@ import {
   Orchestrator,
   LocalSubAgentRunner,
   LocalVisionAnalyzer,
+  MemoryManager,
+  DIMENSION_LABELS,
   buildMainSystemPrompt,
   messageToText,
   type EnvironmentOptions,
@@ -79,6 +82,7 @@ const HELP = `
   /trace     显示最近一次 LLM 调用的摘要与文件路径
   /calls     列出本次会话所有 LLM 调用
   /context   打印当前发送给模型的消息结构
+  /memory    查看长期记忆（用户特征）；/memory clear 全部清空
   /help      显示本帮助
   /exit      退出（Ctrl+C 亦可）
 
@@ -545,15 +549,43 @@ async function main() {
     context,
   });
 
+  // ---------- 长期记忆 ----------
+  // 与压缩是两件事:压缩让**这次会话**能继续,记忆让**下次会话**知道你是谁。
+  // DB 放在项目根、**不放工作区** —— 放进去模型的代码就能改自己的记忆
+  // (与 .sandbox-venv 同一个理由)。
+  // 起不来只告警不阻塞:记忆是增强,不该让 CLI 因为它跑不了
+  let memoryStorage: Storage | undefined;
+  let memory: MemoryManager | undefined;
+  if (config.memory.enabled) {
+    try {
+      memoryStorage = new Storage(config.memory.dbPath, logger);
+      memory = new MemoryManager({
+        store: memoryStorage,
+        llmClient,
+        logger,
+        turnsPerExtraction: config.memory.turnsPerExtraction,
+        maxTokens: config.memory.maxTokens,
+        retry: config.retry,
+      });
+    } catch (e) {
+      console.log(
+        `${YELLOW}警告${RESET} 长期记忆不可用: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
   // 系统提示只在会话开始时加一次。后续每轮只传 user 消息，
   // 让 ContextManager 把它们接到同一个 Turn 序列上（压缩才能真正生效）。
   // 环境约定与子 agent 出自**同一个函数** —— 提示词写在这里的话，
   // 子 agent 那份必然漂移（它原本就对浏览器常驻、stdout 上限一无所知）
+  //
+  // 记忆拼在环境约定**之后**:它是「关于这位用户」的观察,
+  // 而不是环境事实。两者混在一段里,模型分不清哪些是硬约束
   context.addSystemMessage(
     buildMainSystemPrompt({
       ...environment,
       subAgentEnabled: config.subAgent.enabled,
-    }),
+    }) + (memory?.prompt() ? '\n\n' + memory.prompt() : ''),
   );
 
   // ---------- 启动信息 ----------
@@ -619,6 +651,13 @@ async function main() {
   // 清单十几条会把横幅撑爆,而用户真正要确认的是「这层开着」
   console.log(dim(`  读黑名单  ${readDenyPaths.length} 条凭证路径 ` +
     `(私钥/云凭证/token/cookie/.env;fs 工具与代码同一份)`));
+  // 记忆必须可见:它每轮都注入,用户得知道模型"记着"什么。
+  // 条数为 0 时也报 —— "开着但还没记住东西"和"关着"是两回事
+  console.log(dim(`  长期记忆  ${
+    memory
+      ? `${memory.list().length} 条用户特征 (/memory 查看,/memory clear 清空)`
+      : '已关闭 (MEMORY_ENABLED=true 开启)'
+  }`));
   console.log();
 
   const rl = readline.createInterface({
@@ -686,6 +725,13 @@ async function main() {
         console.log(dim(`  trace: ${newCalls[0].file} … (共 ${newCalls.length} 个文件)`));
       }
       console.log();
+
+      // 长期记忆抽取:放在回答**已经打印之后**,而且不 await ——
+      // 抽取要调一次 LLM(几秒),挡在这里会让用户干等一个与本轮无关的调用。
+      // onTurnEnd 内部不抛异常(记忆是增强不是必需品),所以这里不需要 catch
+      if (memory) {
+        void memory.onTurnEnd(context.peekTurns());
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`\n${RED}执行失败${RESET} ${msg}`);
@@ -707,6 +753,44 @@ async function main() {
 
     if (name === 'help') {
       console.log(HELP + '\n');
+      return true;
+    }
+
+    // 记忆必须**能看见和能推翻**。依据是 context.ts 里那条实测:
+    // 模型拿到概括性输入后会判定「已经足够明确」然后照着复述,不去核实 ——
+    // 一条错的特征长得和对的一样权威,而它每轮都在注入。
+    // 只给「看」和「整体清空」两个操作:逐条编辑是把负担和「给自己定性」推给用户
+    if (name === 'memory' || name === 'memory clear') {
+      if (!memory) {
+        console.log(dim('  长期记忆已关闭 (MEMORY_ENABLED=false)\n'));
+        return true;
+      }
+
+      if (name === 'memory clear') {
+        memory.clear();
+        console.log(dim('  长期记忆已清空。注意本次会话的系统提示已经发出,') +
+          dim('下次启动才完全生效\n'));
+        return true;
+      }
+
+      const entries = memory.list();
+      if (entries.length === 0) {
+        console.log(dim('  还没有记录任何用户特征\n'));
+        return true;
+      }
+
+      console.log(dim(`─── 长期记忆(${entries.length} 条)───`));
+      for (const dim_ of Object.keys(DIMENSION_LABELS) as Array<keyof typeof DIMENSION_LABELS>) {
+        const inDim = entries.filter(e => e.dimension === dim_);
+        if (inDim.length === 0) continue;
+        console.log(`  ${bold(DIMENSION_LABELS[dim_])}`);
+        for (const e of inDim) {
+          // hits 要显示:它是淘汰依据,用户看到「确认 1 次」就知道这条还不稳
+          console.log(`    ${e.text} ${dim(`(确认 ${e.hits} 次)`)}`);
+        }
+      }
+      console.log(dim(`  存储: ${config.memory.dbPath}`));
+      console.log(dim('  /memory clear 可全部清空\n'));
       return true;
     }
 
@@ -827,6 +911,8 @@ async function main() {
         console.log(dim(`留痕目录: ${path.resolve(recorder.traceDir)}`));
       }
       context.dispose();
+      // 记忆库要关:SQLite 句柄不关会留下 -wal/-shm 文件
+      memoryStorage?.close();
       // 必须关掉常驻浏览器：它是 detached 的，不会随本进程退出。
       // 留下来会一直锁着 profile 目录，导致下次启动失败
       await browserManager?.stop();

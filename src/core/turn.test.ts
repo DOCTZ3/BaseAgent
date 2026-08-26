@@ -211,6 +211,65 @@ describe('Turn 平铺存储', () => {
     });
   });
 
+  // ============================================
+  // peekTurns 必须含进行中那一轮
+  // ============================================
+  //
+  // finalizeTurn() 只在 addUserMessage() 里调 —— 一个轮次要等**下一条用户消息**
+  // 才进 this.turns。而长期记忆抽取发生在轮末,那一刻刚结束的轮次还挂在
+  // currentTurn 上。只返回 this.turns 的话:抽取器永远看不到最新一轮
+  // (最新鲜的证据),且第一轮结束时拿到空数组、直接 early return。
+  // 这个 bug 单元测试测不出来 —— memory-manager 的测试直接喂构造好的 Turn[],
+  // 绕过了这一层。所以断言放在这里。
+  describe('peekTurns 含进行中那一轮', () => {
+    it('第一轮答完就能被看到(不必等下一条用户消息)', async () => {
+      const ctx = makeContext();
+      await ctx.addUserMessage('第一个问题');
+      ctx.addAssistantMessage('思考中', [{ id: 'c1', name: 'f', args: {} }]);
+      ctx.addToolResult('c1', 'ok');
+      ctx.addFinalResponse('答案');
+
+      const turns = ctx.peekTurns();
+      expect(turns).toHaveLength(1);
+      expect(turnUserMessage(turns[0])?.content).toBe('第一个问题');
+    });
+
+    it('只有用户提问、模型还没答时不算一轮 —— 判据与 finalizeTurn 同源', async () => {
+      const ctx = makeContext();
+      await ctx.addUserMessage('刚问出去');
+
+      expect(ctx.peekTurns()).toHaveLength(0);
+    });
+
+    it('下一轮开始后不重复计数', async () => {
+      const ctx = makeContext();
+      await ctx.addUserMessage('第一轮');
+      ctx.addAssistantMessage('答');
+      ctx.addFinalResponse('答案一');
+      expect(ctx.peekTurns()).toHaveLength(1);
+
+      // 新一轮:上一轮进 turns,这一轮还没有 assistant
+      await ctx.addUserMessage('第二轮');
+      expect(ctx.peekTurns()).toHaveLength(1);
+
+      ctx.addAssistantMessage('答');
+      ctx.addFinalResponse('答案二');
+      expect(ctx.peekTurns()).toHaveLength(2);
+    });
+
+    it('返回的是快照,调用方改不动内部状态', async () => {
+      const ctx = makeContext();
+      await ctx.addUserMessage('问题');
+      ctx.addAssistantMessage('答');
+      ctx.addFinalResponse('答案');
+
+      const first = ctx.peekTurns();
+      (first as Turn[]).push({ turn_id: 99, messages: [], timestamp: 0 });
+
+      expect(ctx.peekTurns()).toHaveLength(1);
+    });
+  });
+
   describe('flattenTurns 保真', () => {
     it('压缩后重建的消息与原始逐条一致', async () => {
       const ctx = makeContext();

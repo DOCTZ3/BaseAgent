@@ -439,6 +439,31 @@ export class ContextManager {
   }
 
   /**
+   * 轮次的只读快照(含进行中那一轮,只要它已经有 assistant 响应)
+   *
+   * 给长期记忆抽取用(见 memory-manager.ts)。
+   *
+   * **必须带上 currentTurn。** `finalizeTurn()` 只在 `addUserMessage()` 里调 ——
+   * 一个轮次要等**下一条用户消息到来**才会进 `this.turns`。而记忆抽取发生在
+   * 轮末,那一刻刚结束的轮次还挂在 `currentTurn` 上。只返回 `this.turns` 的话
+   * 抽取器永远看不到最新一轮(而那是最新鲜的证据),且第一轮结束时拿到的是空数组、
+   * 直接 early return。
+   *
+   * 「有没有 assistant 响应」这个完整性判据与 `finalizeTurn()` 保持一致 ——
+   * 只有用户提问、模型还没答的轮次不构成「用户特征」的证据。
+   *
+   * 压缩后旧轮次会被归档移出 `this.turns`,所以这里拿到的是「还在上下文里的」
+   * 那些。对记忆抽取足够:它只看最近 N 轮。
+   */
+  peekTurns(): readonly Turn[] {
+    const inProgress =
+      this.currentTurn && this.currentTurn.messages.some(m => m.role === 'assistant')
+        ? [this.currentTurn]
+        : [];
+    return [...this.turns, ...inProgress];
+  }
+
+  /**
    * 准备 Prompt（唯一的压缩执行点）
    *
    * 压缩时机统一在这里：标志位由 recordTokenUsage() 按 API 实际返回的

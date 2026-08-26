@@ -234,6 +234,29 @@ export interface AgentConfig {
     maxCount: number;    // 单次会话内最多 spawn 多少个(防连续下放烧钱)
   };
 
+  /**
+   * 长期记忆(用户特征)
+   *
+   * 与上下文压缩是两件事:压缩让**这次会话**能继续,记忆让**下次会话**
+   * 知道你是谁。详见 memory.ts 顶部。
+   *
+   * dbPath 必须在**工作区之外** —— 放进工作区,模型的代码就能改自己的记忆
+   * (与 .sandbox-venv 同一个理由)。
+   */
+  memory: {
+    enabled: boolean;               // 关掉则不抽取、不注入,零开销
+    dbPath: string;                 // SQLite 文件位置(工作区之外)
+    /**
+     * 每几轮抽一次,同时也是**给抽取器看的轮数**(同一个数)
+     *
+     * 原先还叠了一层 token 增量,实测那是错的:它取的是模型**输出**增量,
+     * 而横幅上看到的是上下文水位 —— 同一次会话输出累计 3656、水位涨到 11966,
+     * 差三倍多,于是「聊了 11k 还没触发」。按轮次计数虽粗但**可预测**。
+     */
+    turnsPerExtraction: number;
+    maxTokens: number;              // 抽取调用的输出上限(思维链计入此预算)
+  };
+
   // 可观测:LLM 调用留痕(本地调试用)
   trace: {
     enabled: boolean;    // 是否把每次调用的线格式请求/响应写盘
@@ -435,6 +458,21 @@ export const defaultConfig: AgentConfig = {
     // 配额:防止主 agent 连续下放导致成本失控
     maxCount: process.env.SUBAGENT_MAX_COUNT ? parseInt(process.env.SUBAGENT_MAX_COUNT) : 5,
   },
+  memory: {
+    // 默认开启:它只在攒够增量时才调一次 LLM,平时零开销
+    enabled: process.env.MEMORY_ENABLED !== 'false',
+    // 放项目根目录、**不放工作区** —— 放进去模型的代码就能改自己的记忆
+    // (与 .sandbox-venv 同一个理由)。resolve 是必须的:
+    // Python 子进程的 cwd 是工作区,相对路径两边解析基准不同
+    dbPath: path.resolve(process.env.MEMORY_DB_PATH || '.agent-memory.db'),
+    // 3:贴合实际会话长度(实测一次会话就 3 轮)。它同时是「看几轮」——
+    // 拆成两个数会让同一段对话被重复分析,同一条特征反复 hits+1、虚高稳定度
+    turnsPerExtraction: process.env.MEMORY_TURNS_PER_EXTRACTION
+      ? parseInt(process.env.MEMORY_TURNS_PER_EXTRACTION) : 3,
+    // 思维链计入输出预算,给小了正文会空(与压缩那边同一个坑)
+    maxTokens: process.env.MEMORY_MAX_TOKENS
+      ? parseInt(process.env.MEMORY_MAX_TOKENS) : 2000,
+  },
   trace: {
     // 默认开启:本地调试的主要手段,开销只有一次同步写盘
     enabled: process.env.TRACE_ENABLED !== 'false',
@@ -486,6 +524,7 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     shell: { ...defaultConfig.shell, ...overrides.shell },
     retry: { ...defaultConfig.retry, ...overrides.retry },
     subAgent: { ...defaultConfig.subAgent, ...overrides.subAgent },
+    memory: { ...defaultConfig.memory, ...overrides.memory },
     trace: { ...defaultConfig.trace, ...overrides.trace },
   };
 }

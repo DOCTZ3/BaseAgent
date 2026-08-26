@@ -22,3 +22,9 @@ sandbox/
 # 沙箱 venv（模型装的包落在这里，碰不到全局环境）。
 # 放在工作区之外是刻意的：放进去模型的代码就能改 venv 自身
 .sandbox-venv/
+
+# 长期记忆（用户特征，SQLite）。放项目根而非工作区：
+# 放进工作区模型的代码就能改自己的记忆（与 .sandbox-venv 同一个理由）
+.agent-memory.db
+.agent-memory.db-wal
+.agent-memory.db-shm
