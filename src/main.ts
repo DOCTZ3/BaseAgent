@@ -1,177 +1,60 @@
 // ============================================
-// BaseAgent 主入口:组装所有模块
+// BaseAgent 最小入口(非交互)
+// ============================================
+//
+// 装配全部在 core/session.ts。这里只演示「建会话 → 跑一轮 → 收尾」。
+//
+// 原先这个文件自己建了一份 PythonExecutor / ToolRunner / ContextManager /
+// Orchestrator —— 那是**第二份装配**,和 cli.ts 那份必然漂移。
+// 这个项目已经在「同一份事实写两处」上栽过四次(visionAnalyzer、
+// pythonExecutor、models.vision、fsDeniedPaths),所以这里改成消费 session。
+//
+// 用法:npm run dev / npm start
 // ============================================
 
 import 'dotenv/config';   // ← 第一行加载 .env，后面所有 process.env 才能读到
-
-import {
-  ConsoleLogger,
-  LogLevel,
-  loadConfig,
-} from './platform/index.js';
-import { ToolRegistry, ToolRunner } from './tools/index.js';
-import { PythonExecutor, defaultReadDenyPaths } from './executors/index.js';
-import { ContextManager, DeepSeekAdapter, Orchestrator } from './core/index.js';
-import {
-  EchoTool,
-  GetCurrentTimeTool,
-  ReadFileTool,
-  ListFilesTool,
-  SearchFilesTool,
-  WriteFileTool,
-  ExecutePythonTool,
-} from './tools/builtin/index.js';
-import path from 'path';
+import { createAgentSession } from './core/index.js';
 
 async function main() {
-  // ① 加载配置(全部从环境变量读,有默认值兜底)
-  const config = loadConfig();
-
-  // ② 初始化 Logger
-  const logLevel = ({
-    debug: LogLevel.DEBUG,
-    info:  LogLevel.INFO,
-    warn:  LogLevel.WARN,
-    error: LogLevel.ERROR,
-  } as const)[config.logLevel] ?? LogLevel.INFO;
-
-  const logger = new ConsoleLogger(logLevel);
-
-  // 使用主模型配置
-  const modelConfig = config.models.main;
-  logger.info('BaseAgent 启动', {
-    model: modelConfig.model,
-    enableThinking: modelConfig.enableThinking
+  const session = await createAgentSession({
+    idPrefix: 'main',
+    // **一律拒绝**,不是自动批准。
+    // 这是非交互入口,没有人可问 —— 而 run_command 没有任何机制边界,
+    // 它全部的安全性就是「用户读那一行原样命令并判断」。
+    // 原先这里写的是 `return true`(那时还没有 run_command),
+    // 沿用到今天就等于给一个无人看守的入口开了任意命令执行
+    onConfirm: async req => {
+      session.logger.warn('非交互入口拒绝危险工具', { tool: req.toolName });
+      return false;
+    },
   });
 
-  if (!modelConfig.apiKey) {
-    logger.warn('未设置 DEEPSEEK_API_KEY，调用真实 API 会失败');
+  for (const n of session.notices) {
+    session.logger.warn(n.message, n.hint ? { hint: n.hint } : undefined);
   }
 
-  // ③ 注册工具
-  const registry = new ToolRegistry(logger);
-  registry.register(new EchoTool());
-  registry.register(new GetCurrentTimeTool());
-  registry.register(new ReadFileTool());
-  registry.register(new ListFilesTool());
-  registry.register(new SearchFilesTool());
-  registry.register(new WriteFileTool());
-  if (config.python.enabled) {
-    registry.register(new ExecutePythonTool());
+  session.logger.info('BaseAgent 启动', {
+    model: session.info.model,
+    sessionId: session.sessionId,
+  });
+
+  try {
+    const result = await session.run(
+      '请告诉我现在的时间(用代码实现),然后回显 "Hello BaseAgent"',
+    );
+
+    session.logger.info('任务结果', {
+      answer: result.answer,
+      stopReason: result.stopReason,
+      steps: result.steps,
+    });
+  } finally {
+    // 必须调:常驻 chromium 是 detached 的,不关会一直锁着 profile 目录
+    await session.dispose();
   }
-  // 视觉是插件,需要注入 VisionAnalyzer(见 cli.ts)。
-  // main.ts 是最小演示入口,不接视觉 —— 要用视觉请走 npm run cli
-
-  // ④ 创建 Runner
-  const abortController = new AbortController();
-
-  // Python 沙箱(CodeAct 底座)。浏览器能力经此提供,不做独立 BrowserDriver。
-  // profile 用绝对路径:要同时注入子进程和进 fs deny 列表,相对路径两边解析基准不同
-  const browserProfileDir = path.resolve(config.python.browserProfileDir);
-
-  // 读黑名单:算一次,fs 工具与 Python audit hook 共用同一份。
-  // 两边各算一份就会出现「工具读不到、代码读得到」这种不报错的错位
-  const readDenyPaths = defaultReadDenyPaths({
-    projectDir: process.cwd(),
-    extra: config.python.enabled ? [browserProfileDir] : [],
-  });
-
-  // 没有工作区就不创建执行器：workDir 为空串会让 path.resolve 解析成 cwd，
-  // 写边界随之变成整个项目目录。缺配置时宁可代码执行不可用，不可越界
-  const pythonExecutor = config.python.enabled && config.workspace
-    ? new PythonExecutor({
-        pythonPath:     config.python.pythonPath,
-        // 与 fs 白名单同源：cwd 和写边界都用 workspace，不再单独配
-        workDir:        config.workspace,
-        timeout:        config.python.timeout,
-        maxStdoutBytes: config.python.maxStdoutBytes,
-        maxStderrBytes: config.python.maxStderrBytes,
-        env: { BROWSER_PROFILE_DIR: browserProfileDir },
-        readDenyPaths,
-        logger,
-      })
-    : undefined;
-
-  const runner = new ToolRunner(registry, {
-    sessionId: 'session-001',
-    logger,
-    signal: abortController.signal,
-    onConfirmRequired: async (req) => {
-      logger.warn(`需要确认: ${req.reason}`, { tool: req.toolName });
-      return true; // 测试阶段自动批准，后续接 CLI 交互
-    },
-    allowDangerousTools: config.security.allowDangerousTools,
-    fsGrants:            config.security.fsGrants,
-    // 凭证类路径:私钥/云凭证/token/浏览器 cookie。与 Python 侧同一份清单
-    fsDeniedPaths:       readDenyPaths,
-    // 相对路径按工作区解析,与 Python 子进程的 cwd 同源
-    workspace:           config.workspace || undefined,
-    pythonExecutor,
-  });
-
-  // ⑤ 创建 LLM Client
-  const llmClient = new DeepSeekAdapter({
-    apiKey:  modelConfig.apiKey,
-    baseURL: modelConfig.baseURL!,
-    model:   modelConfig.model,
-    enableThinking: modelConfig.enableThinking ?? true, // 默认开启
-    retry:   config.retry,   // 统一重试策略（SDK 自带重试已关闭）
-    logger,
-  });
-
-  // ⑥ 创建 Context 管理器（Turn 管理 + 主题聚类压缩）
-  const context = new ContextManager(
-    {
-      sessionId: 'session-001',
-      windowSize:            config.context.windowSize,
-      compressionThreshold:  config.context.compressionThreshold,
-      recentTurnsToKeep:     config.context.recentTurnsToKeep,
-      maxTopicsInContext:    config.context.maxTopicsInContext,
-      // 高水位兜底:窗口快满但轮次门槛卡住时,突破门槛强制压缩
-      highWaterRatio:        config.context.highWaterRatio,
-      // 压缩用的是同一个主模型,输出预算默认跟随它
-      compressionMaxTokens: config.context.compressionMaxTokens,
-      modelMaxTokens:       modelConfig.maxTokens,
-      compressionClip:      config.context.compressionClip,
-      retry: config.retry,
-      // 归档与 LLM 留痕共用会话目录:<dir>/<sessionId>/archive|calls
-      sessionsDir:          config.trace.dir,
-      logger,
-    },
-    llmClient
-  );
-  await context.initialize();
-
-  // ⑦ 创建 Orchestrator
-  const orchestrator = new Orchestrator(llmClient, runner, registry, {
-    maxSteps: config.execution.maxSteps,
-    logger,
-    context,
-  });
-
-  // ⑧ 测试任务
-  const result = await orchestrator.run([
-    {
-      role: 'system',
-      content: '你是一个 AI 助手，可以使用工具来完成任务。',
-    },
-    {
-      role: 'user',
-      content: '请告诉我现在的时间，然后用 echo 工具回显 "Hello BaseAgent"',
-    },
-  ]);
-
-  logger.info('任务结果', {
-    answer: result.answer,
-    stopReason: result.stopReason,
-    steps: result.steps,
-  });
-
-  context.dispose();
 }
 
 main().catch(error => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
-

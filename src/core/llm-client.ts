@@ -81,6 +81,14 @@ export interface LLMRequest {
   // 调用来源标签,只用于 trace 归类(如 'main-loop' / 'compression:topic-analysis')
   // 不影响请求内容,不发给模型
   traceLabel?: string;
+  /**
+   * 分片回调。给了就走流式,不给走原来的一次性返回。
+   *
+   * 刻意做成**逐调用**而不是 adapter 级配置:压缩、摘要、记忆抽取这些单发调用
+   * 不需要流式(它们的产物是给机器解析的 JSON,吐给用户没有意义),
+   * 只有主循环需要。adapter 级开关会让那三类调用也白走流式路径。
+   */
+  onDelta?: DeltaSink;
 }
 
 // LLM 响应(内部格式)
@@ -125,6 +133,42 @@ export interface LLMTraceEvent {
 }
 
 export type TraceSink = (event: LLMTraceEvent) => void;
+
+// ============================================
+// 流式增量
+// ============================================
+//
+// 只有**正文和推理**是增量的,工具调用不是:参数是 JSON,吐一半没有意义
+// (拿到半截 JSON 既不能展示也不能解析),所以 tool_calls 仍在
+// LLMResponse 里一次性给出。
+//
+// 分片**不经过 trace**:trace 记的是线格式的完整请求/响应对
+// (见上面 LLMTraceEvent 的注释),分片重组之后才交给 onTrace ——
+// 否则 trace 里会出现几百条碎片,而定位问题要的是成对的完整数据。
+export interface LLMDelta {
+  /** 正文增量。与 reasoning 互斥:一次分片只会有一种 */
+  content?: string;
+  /** 推理增量(思维链) */
+  reasoning?: string;
+  /**
+   * 丢弃此前收到的所有分片,从头开始
+   *
+   * 重试时发出:上一次尝试可能已经吐了半截回答,不清掉的话
+   * 用户会看到「同一段话说了两遍」而且中间是断的。
+   */
+  reset?: true;
+}
+
+/**
+ * 分片回调
+ *
+ * 由**调用方**提供,adapter 只负责调它。这样「往哪送」
+ * (终端 stdout / SSE / IPC)不进核心层 —— 与 onTrace 同一套注入模式。
+ *
+ * 注意重试:网络错误重试时可能已经吐过一部分内容。adapter 会先发一次
+ * `reset` 让调用方丢弃已收到的分片,否则用户会看到重复的半截回答。
+ */
+export type DeltaSink = (delta: LLMDelta) => void;
 
 // LLM 客户端接口
 export interface LLMClient {

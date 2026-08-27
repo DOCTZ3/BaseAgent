@@ -26,14 +26,16 @@
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  interface/  交互层(壳,可替换)                            │
-│    · cli          已实现:REPL/单发两种模式 + 可观测回显     │
+│    · cli          已实现:REPL/单发 + 调试回显(turn/token)  │
+│    · app/         已实现:Electron 客户端(流式、原生窗口)   │
 │    · voice        预留:ASR 语音转文字 / TTS 播报            │
-│    · gui          预留:Electron/Tauri 桌面窗口             │
 │    职责:只做 输入→文本 / 结构化结果→展示,零业务逻辑        │
+│    关键:两个壳共用 core/session.ts 一份装配,壳不重算事实   │
 └───────────────────────────┬──────────────────────────────┘
                             │ AgentInput / AgentEvent
 ┌───────────────────────────┴──────────────────────────────┐
 │  core/  Agent 内核(大脑)                                  │
+│    · session       一次会话的全部接线(壳共用,零输出)      │
 │    · orchestrator  主循环:调 LLM → 拿决策 → 派发 → 观察    │
 │    · planner       复杂任务的多步拆解(可选增强)           │
 │    · llm-client    封装 LLM API 调用                       │
@@ -77,6 +79,7 @@
 │  platform/  横切基础设施                                   │
 │    · logger        分级日志输出                           │
 │    · config        .env 配置加载                          │
+│    · config-store  客户端配置持久化(JSON,.env 作回落)      │
 │    · storage       SQLite 持久化(记忆/session 索引)       │
 │    · security      SecurityGuard:白名单 + 凭证目录黑名单    │
 │    · errors        统一错误类型(Validation/Security/...)  │
@@ -196,8 +199,73 @@ interface AgentRunResult {
   steps: number;              // 主循环实际步数(收尾调用不计入)
 }
 
-run(initialMessages: Message[]): Promise<AgentRunResult>
+// onEvent 逐轮传,不在装配期固定 —— 传了才走流式(见下)
+run(initialMessages: Message[], onEvent?: AgentEventSink): Promise<AgentRunResult>
 ```
+
+### AgentEvent (过程事件 / 流式)
+
+```typescript
+type AgentEvent =
+  | { type: 'content';    text: string }      // 正文增量
+  | { type: 'reasoning';  text: string }      // 思维链增量(壳通常折叠)
+  | { type: 'reset' }                         // 重试:丢弃本步此前所有增量
+  | { type: 'step';       step: number; maxSteps: number }
+  | { type: 'tool_start'; id: string; name: string; args: Record<string, unknown> }
+  | { type: 'tool_end';   id: string; name: string; ok: boolean; summary: string }
+  | { type: 'done';       stopReason: AgentRunResult['stopReason']; steps: number };
+
+type AgentEventSink = (event: AgentEvent) => void;
+```
+
+**关键设计**:
+
+- **不只做 token 流**:用户等的十几秒里信息量最大的不是逐字吐字,而是
+  「它在干什么」。Orchestrator 本来就知道第几步、调了哪个工具,一并推出去
+- **流式是独立分支,非流式那条路径一个字节没动**:两者的**重试单元不同** ——
+  非流式只包「发请求」(`JSON.parse` 在 retry 之外,坏参数立即抛);
+  流式必须包整段消费(可能中途断)。合并会把 `JSON.parse` 挪进 RetryHandler
+  的匹配范围,是不报错的行为改变。代价只是 trace/catch 各写一份
+- **没人听就不付流式成本**:`onEvent` 逐轮传参而非装配期固定 ——
+  Orchestrator 是会话级的,而「这轮要不要流式」是每轮的事。没传则不传 `onDelta`,
+  adapter 走非流式(流式要多一层分片累积,`usage` 还得靠 `stream_options` 额外索要)
+- **只有主循环流式**:压缩、摘要、记忆抽取的产物是给机器解析的 JSON;
+  子 agent **不转发** —— 它的推理混进主流,用户分不清哪句是谁说的
+  (与 `request_help` 不下放同一个理由)
+- **`done` 收在一个 `finish()` 里**:四个 return 点各写一次 emit 迟早漏一个,
+  而漏了不报错 —— 壳只是永远等不到结束信号(光标一直转)
+- **工具调用轮次没有流式**:`tool_calls` 的 `arguments` 逐字拼,半截 JSON 不能
+  parse 更不能执行,所以 `tool_start` 只能在流结束后发。这是协议决定的
+- **`reset` 的擦除由壳实现**:终端要按宽度算 ANSI 回退行数,客户端只是清一个
+  DOM 节点 —— 两边不共用代码,共用只会让两套逻辑互相将就
+
+### AgentSession (壳与内核的边界)
+
+```typescript
+interface AgentSession {
+  readonly info: SessionInfo;              // 装配算出的事实,壳不重算
+  readonly notices: readonly SessionNotice[];   // 装配期告警,壳决定怎么呈现
+  run(input: string, onEvent?: AgentEventSink): Promise<AgentRunResult>;
+  dispose(): Promise<void>;                // **必须调**
+}
+```
+
+**关键设计**:三条边界让「壳可替换」这条总纲真正成立(抽出前 cli.ts 有 937 行、
+21 段装配,照那样再写一个客户端只能整段复制 —— 本项目已在「同一份事实写两处」
+上栽过四次:`visionAnalyzer` / `pythonExecutor` / `models.vision` / `fsDeniedPaths`)。
+
+- **装配期零输出**:告警以 `notices` 返回。`console.log` 写在 core 就等于把
+  展示逻辑焊死在业务层
+- **`onConfirm` 必须由壳提供,且没有默认实现**:`run_command` 全部的安全性就是
+  用户读那一行原样命令,给个默认放行等于让这道边界在某些壳里静默消失
+  (`main.ts` 曾经 `async () => true`,那是无人看守的任意命令执行)
+- **`SessionInfo` 让壳不重算任何事实**:venv 到底用上没有、实际哪个解释器、
+  缺哪些依赖。`pythonDir` 就踩过 —— 两处各算一份,而错位不报错、
+  只表现成「venv 里装了、代码里 import 不到」
+- **`dispose()` 是必须的**:常驻 chromium 是 detached 的,不关会一直锁着
+  profile 目录导致下次启动失败(实测)
+
+### Orchestrator (ReAct 主循环)
 
 **关键设计**:返回对象而非裸字符串 —— 退出路径有三条,字符串只能表达一种
 (`no_response` 以前返回一句写死的话、与真实回答同通道,CLI 会把内部状态当回答打出)。
@@ -502,6 +570,17 @@ interface TopicSummary {
     (`headless=False` 登录引导在 WSL2 里没有桌面可显示),
     而它要防的「有决心的人类攻击者」不在本机自用的威胁模型内。
     容器仍是服务端形态的正确选择,但那是另一个产品
+  - **工作区约束的是什么**(必须写准,否则「授权才有权限」这句话与实际行为不符):
+    实测同一个工作区外的普通文件 —— `read_file` **拒绝**,而 `execute_python`
+    里一句 `open()` **读得到**;写那一侧两条通道都拒绝。所以这一项的准确含义是
+    「**不可逆操作的边界 + 工具层的授权范围**」,不是「代码能看到的世界的边界」。
+    | 通道 | 工作区外的读 | 工作区外的写 | 凭证类路径 |
+    |---|---|---|---|
+    | fs 工具(`read_file` 等) | 拒绝 | 拒绝 | 拒绝 |
+    | 沙箱代码(`execute_python`) | **允许** | 拒绝 | 拒绝 |
+    这个不对称是下面那条决策的直接后果,不是漏洞;但它与直觉相反
+    (「未授权也不可读才逻辑通顺」),所以在 `.env.example` 与 `config.ts`
+    的 `workspace` 注释里都写明了 —— 配置项的语义不能只有读过这份文档的人知道
   - **写按白名单,读按黑名单** —— 两侧策略相反,因为约束不同:
     写/删不可逆,一次手滑就是真实损失,所以收紧到工作区 + temp。
     读的白名单做不了(实测一次 `import pandas` 触发 1183 次 `open`,
@@ -590,6 +669,56 @@ interface TopicSummary {
     装包是对整台机器的副作用,该由主 agent 拿着上下文决定
   - **禁装包并不削减模型的能力**:它本来就能跑任意代码(`execute_python` 入参
     就是任意代码)。禁掉减少的只有「污染」(已被 venv 解决)与供应链暴露
+- **客户端用 Electron,不用「本地 server + 浏览器」**:壳的技术不重要,
+  但「独立程序」和「浏览器里的网页」是两种东西,而后者要付的成本更高。
+  - **HTML 页面不能直接 import Node 代码**,而 agent 要 spawn Python、连 CDP、
+    开 SQLite —— 只有 Node 进程能做。所以壳与内核之间**必然有一层通信**,
+    分歧只在它长什么样:Electron 是进程内 IPC(`contextBridge`),
+    浏览器方案是 HTTP/SSE。界面代码两边完全一样
+  - **端口是净负债**:localhost 端口对 Python 沙箱是可达的
+    (`requests.post` 打得到确认接口),于是要额外造 token 鉴权 ——
+    而 Electron 的 IPC 根本没有这个面。这是同类护栏里唯一可以直接消掉的
+  - **原生目录对话框是实打实的优势**:`workspace` 必须是**绝对路径**,而网页里
+    拿不到(`webkitdirectory` 只给相对路径、`showDirectoryPicker` 只给 handle)。
+    只能让用户手敲,而敲错的后果是所有文件类工具静默全拒
+  - **代价诚实记账**:多一份 Chromium(装完约 270MB),且与框架常驻的那个
+    chromium 是两个进程、两份 profile。「只有一个浏览器」的唯一做法是把界面
+    开成常驻实例的一个标签页,而那**恰好是唯一不安全的**方案 ——
+    模型对那个浏览器有 CDP 控制权,能自己点掉自己的 `run_command` 确认框。
+    所以「两个浏览器」不是成本,是必要条件
+  - **渲染进程按不可信环境对待**:`contextIsolation: true` / `nodeIntegration: false`。
+    它渲染的是模型输出、抓来的网页片段、工具返回 —— 开 nodeIntegration 等于把
+    `fs` 和 `process.env`(含 `DEEPSEEK_API_KEY`)交给这些内容。
+    明文 key 也不进渲染进程,界面只收掩码
+  - **启动必须摘掉 `ELECTRON_RUN_AS_NODE`**:该变量存在时 electron 退化成普通
+    Node 运行时,`app` / `ipcMain` / `BrowserWindow` 全为 undefined,
+    实测报错是 `Cannot read properties of undefined (reading 'handle')` ——
+    完全指不到真正的原因。IDE 与各类工具会设它且会继承,所以在启动路径上删,
+    不靠文档提醒
+- **客户端配置存 JSON,不写回 `.env`**:
+  - **改了不生效**:`config.ts` 的 `defaultConfig` 是**模块级常量** ——
+    所有 `process.env.XXX` 在该模块首次 import 时求值一次,之后永不再读。
+    写回 `.env` 文件确实改了,但进程内什么都没变,用户点了保存看不到任何变化。
+    `config.test.ts` 必须 `vi.resetModules()` 才能验证不同环境变量,记的是同一件事
+  - **`.env` 在项目根目录,而它自己在读黑名单里**:配置面板会让 key 的生命周期
+    变长、被打开的次数变多,继续放那儿只是把同一个问题做大。改存用户配置目录
+    (`%APPDATA%/BaseAgent/config.json`),在项目外、工作区外 ——
+    与 `.agent-memory.db` / `.sandbox-venv` 同一个理由
+  - **`.env` 保留为回落**:JSON 里没有的项才读环境变量,现有 CLI 一个字不用改
+  - **由壳读出来当 `configOverrides` 传进去**,不让 session 自己读文件:
+    后者会让所有测试都读到运行机器上的 `config.json`,于是同一份测试在一台机器上
+    过、另一台挂,而挂的原因不在代码里
+  - **写入是增量合并**:界面上 apiKey 留空表示「不修改」,整份覆盖会把已存的 key
+    抹掉 —— 而用户看到的是「未设置 DEEPSEEK_API_KEY」,不会想到是自己点保存造成的。
+    先写临时文件再 rename:中途崩掉会留下半个 JSON,那时 key 就丢了
+  - **不假装热更新**:改完重建会话。`workspace` 一项派生出 fs 白名单、Python cwd、
+    写边界三样东西,venv 要重新校验,常驻浏览器要重开 ——
+    热更新只会得到「界面显示新值、实际跑的是旧边界」的会话
+  - **只放用户真正需要决定的项**:压缩阈值、clip 上限、重试退避仍只走 `.env` ——
+    它们要理解内部机制才填得对,进界面等于把「能填错的东西」变多
+  - **实际生效值与勾选值可能不同,必须说出来**:`shellEnabled` 是
+    `shell.enabled && workspace && allowDangerousTools` 三者的合成,而界面上是
+    三个独立开关。不提示的话用户只会觉得开关坏了
 - **评估后明确不做(不是欠的债)**:
   - **网络管控** —— 实测无效。Playwright 全流程里 `socket.connect` 只出现 2 次、
     都是 `127.0.0.1`(Python 连本地 driver);真正访问网站的是 node driver 与
@@ -770,6 +899,8 @@ interface TopicSummary {
 - Logger / Config / Storage / SecurityGuard / Errors
 - RetryHandler (幂等操作的统一重试)
 - TraceRecorder (LLM 调用留痕,本地可观测)
+- config-store (客户端配置持久化:用户配置目录下的 JSON,`.env` 作回落。
+  增量合并、原子写、不假装热更新。详见「客户端配置存 JSON」那条决策)
 
 **Executors 层**:
 - FsDriver (文件系统,集成 SecurityGuard 白名单 + 凭证目录黑名单)
@@ -816,7 +947,12 @@ interface TopicSummary {
   暴露一个必然失败的函数只会让模型白花一步。详见「视觉是插件」那条决策
 
 **Core 层**:
-- LLMClient (接口) + DeepSeekAdapter (实现,含 trace 钩子)
+- AgentSession (一次会话的全部接线:21 段装配集中一处,两个壳共用。
+  装配期零输出、`onConfirm` 必须由壳提供、`dispose()` 必须调。
+  详见「AgentSession」那节)
+- LLMClient (接口) + DeepSeekAdapter (实现,含 trace 钩子与**流式分支** ——
+  SSE 由 SDK 解析成 `AsyncIterable`,累积成与非流式同构的响应;
+  非流式路径未改动。详见「AgentEvent」那节)
 - TokenCounter (Token 统计和阈值判断)
 - ContextManager (Turn 管理 + 主题聚类压缩 + 结构化输出)
 - Orchestrator (ReAct 主循环)
@@ -832,8 +968,14 @@ interface TopicSummary {
 - MemoryManager (抽取驱动:何时抽、给它看哪一段、结果怎么落盘。
   详见「长期记忆与压缩是两件事」那条决策)
 
-**Interface 层**:
-- CLI (REPL / 单发两种模式,斜杠命令 + 每轮可观测回显)
+**Interface 层**(两个壳共用 `core/session.ts` 一份装配):
+- CLI (REPL / 单发两种模式,斜杠命令 + 每轮可观测回显 —— **调试壳**,
+  turn/token/压缩次数/trace 路径都在这里看)
+- Electron 客户端 (`electron/` + `src/interface/app/`):原生无边框窗口、
+  流式正文与可折叠思考过程、工具调用标签、原生目录选择、配置面板、
+  危险工具确认(命令原样呈现)。**不显示** turn/token 这类调试信息。
+  agent 直接跑在主进程,无端口无 HTTP;渲染进程按不可信环境对待。
+  详见「客户端用 Electron」那条决策
 
 ### ⏳ 待实现
 
@@ -845,7 +987,8 @@ interface TopicSummary {
 
 **Interface 层**:
 - Voice (语音接口 - 预留)
-- GUI (图形界面 - 预留)
+- 客户端打包成 exe:主进程现在用 tsx 直接吃 `.ts` 源码(开发期正确 ——
+  避免 dist 与 src 不同步这种不报错的错位),打包时要改成加载编译产物
 
 **高级特性**:
 - 容器隔离 —— **仅在做服务端形态时才需要**。本地形态下已用 audit hook 写边界

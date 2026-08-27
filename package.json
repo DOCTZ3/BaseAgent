@@ -9,6 +9,7 @@
     "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
     "cli": "tsx src/interface/cli.ts",
+    "app": "node electron/launch.cjs",
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:mock": "tsx src/test-mock.ts",
@@ -26,6 +27,7 @@
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.0.0",
     "@vitest/ui": "^4.1.11",
+    "electron": "^34.2.0",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0",
     "vitest": "^4.1.11"

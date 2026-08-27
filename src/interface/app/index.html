@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<!--
+  客户端界面(原型阶段:用 mock.js 的假事件流驱动)
+
+  刻意**不显示** turn / token / 压缩次数 / trace 路径 —— 那些是调试壳(CLI)的
+  东西。这里只呈现三样用户真正要看的:思考过程、工具调用、回答正文。
+
+  用普通 <script> 而非 type="module":后者在 file:// 下受 CORS 限制打不开,
+  而「双击就能看」是原型阶段最重要的性质。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BaseAgent</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">BaseAgent</div>
+  <div class="bar-right">
+    <span class="ws" id="ws-label" title="当前工作区"></span>
+    <button class="icon-btn" id="btn-config" title="配置">⚙</button>
+  </div>
+</header>
+
+<main id="stream" class="stream"></main>
+
+<footer class="composer">
+  <textarea id="input" rows="1" placeholder="描述你要做的事…  (Enter 发送,Shift+Enter 换行)"></textarea>
+  <button id="btn-send" class="send">发送</button>
+  <button id="btn-stop" class="stop" hidden>停止</button>
+</footer>
+
+<!-- 配置抽屉 -->
+<div class="drawer-mask" id="drawer-mask" hidden></div>
+<aside class="drawer" id="drawer" hidden>
+  <div class="drawer-head">
+    <h2>配置</h2>
+    <button class="icon-btn" id="btn-close-config">✕</button>
+  </div>
+
+  <div class="drawer-body">
+    <section>
+      <h3>模型</h3>
+      <label>API Key
+        <!-- 只显示掩码,不回填明文。留空 = 不修改 -->
+        <input type="password" id="cfg-key" placeholder="sk-••••••••1234(留空则不修改)">
+      </label>
+      <label>Base URL
+        <input type="text" id="cfg-baseurl" placeholder="https://api.deepseek.com">
+      </label>
+      <label>主模型
+        <input type="text" id="cfg-model" placeholder="deepseek-v4-flash">
+      </label>
+      <label>视觉模型 <span class="hint">留空则不启用视觉能力</span>
+        <input type="text" id="cfg-vision" placeholder="(未配置)">
+      </label>
+    </section>
+
+    <section>
+      <h3>工作区 <span class="hint">agent 唯一的读写范围</span></h3>
+      <div class="path-row">
+        <input type="text" id="cfg-workspace" readonly placeholder="(未选择)">
+        <button class="btn" id="btn-pick">选择…</button>
+      </div>
+      <p class="warn" id="ws-warn" hidden>未选择工作区时,所有文件类工具与代码执行都会被拒绝。</p>
+    </section>
+
+    <section>
+      <h3>能力</h3>
+      <label class="row"><input type="checkbox" id="cfg-python"> 代码执行(Python 沙箱)</label>
+      <label class="row"><input type="checkbox" id="cfg-danger"> 允许危险工具</label>
+      <label class="row"><input type="checkbox" id="cfg-shell"> 执行外部命令 <span class="hint" id="shell-hint"></span></label>
+      <label class="row"><input type="checkbox" id="cfg-subagent"> 子 agent</label>
+      <label class="row"><input type="checkbox" id="cfg-memory"> 长期记忆</label>
+    </section>
+  </div>
+
+  <div class="drawer-foot">
+    <span class="hint" id="restart-hint" hidden>这些改动需要重建会话才生效</span>
+    <button class="btn primary" id="btn-save">保存</button>
+  </div>
+</aside>
+
+<!-- 危险工具确认。命令**原样**呈现是这个对话框全部的意义 -->
+<div class="modal-mask" id="confirm-mask" hidden>
+  <div class="modal">
+    <h3 id="confirm-title">需要确认</h3>
+    <pre id="confirm-body" class="verbatim"></pre>
+    <p class="hint">请读清楚要执行的内容。这一步没有其他机制拦得住它。</p>
+    <div class="modal-foot">
+      <button class="btn" id="btn-deny">拒绝</button>
+      <button class="btn danger" id="btn-allow">允许执行</button>
+    </div>
+  </div>
+</div>
+
+<!--
+  顺序有意义:app.js 定义渲染层,bridge.js 在 Electron 里接真实 IPC,
+  mock.js 只在没有 AgentBridge 时接手(双击本文件看界面的场景)。
+-->
+<script src="app.js"></script>
+<script src="bridge.js"></script>
+<script src="mock.js"></script>
+</body>
+</html>

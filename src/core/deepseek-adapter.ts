@@ -3,8 +3,24 @@
 // ============================================
 
 import OpenAI from 'openai';
-import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage, TraceSink, ContentPart } from './llm-client.js';
+import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage, TraceSink, DeltaSink, ContentPart } from './llm-client.js';
 import { Logger, LLMError, RetryHandler, RetryConfig } from '../platform/index.js';
+
+/**
+ * 流式分片累积的中间态
+ *
+ * 工具调用的 arguments 在流式里是**逐字拼**的(delta.tool_calls[i].function.arguments
+ * 每次给一小段),所以必须按 index 累积成完整字符串再 JSON.parse ——
+ * 半截 JSON 解析必然抛错。
+ */
+interface StreamAccumulator {
+  content: string;
+  reasoning: string;
+  /** 按 index 累积:同一个 index 的分片属于同一个 tool_call */
+  toolCalls: Map<number, { id: string; name: string; args: string }>;
+  finishReason: string | null;
+  usage?: OpenAI.Completions.CompletionUsage;
+}
 
 export interface DeepSeekConfig {
   apiKey: string;
@@ -68,6 +84,20 @@ export class DeepSeekAdapter implements LLMClient {
     const label = request.traceLabel ?? 'unlabeled';
     const startedAt = Date.now();
     let attempts = 0;
+
+    // 流式是**独立分支**,下面那条老路径(含它自己的 try/catch)一个字节没动。
+    //
+    // 为什么不合并成一个:两条路的**重试单位不一样**。非流式只需要包住
+    // 「发起调用」那一下 —— 解析在 retryHandler 外面,模型返回畸形参数时
+    // `JSON.parse` 必然直接抛错。流式必须包住「整个消费过程」,因为它可能
+    // 吐到一半才断。合并的话 `JSON.parse` 会落进 RetryHandler 的匹配范围,
+    // 那是**行为改变**,而且不报错。
+    // 代价是 trace 与 catch 那段在流式分支里重复一次 —— 这笔交易值得做
+    if (request.onDelta) {
+      return await this.completeStreaming(
+        wireRequest, request.onDelta, callIndex, label, startedAt,
+      );
+    }
 
     try {
       // API 调用是幂等的,交给 RetryHandler 处理网络错误/限流/5xx
@@ -151,6 +181,214 @@ export class DeepSeekAdapter implements LLMClient {
         true
       );
     }
+  }
+
+  /**
+   * 流式路径(与非流式完全独立)
+   *
+   * 自带 try/catch 与 trace,不复用上面那条 —— 两条路的**重试单位不一样**,
+   * 合并会让 JSON.parse 落进 RetryHandler 的匹配范围(行为改变且不报错)。
+   *
+   * 重试的语义在这里也不同:非流式重试是「重新发一次请求」;流式重试意味着
+   * 上一次可能**已经吐给用户半截回答**,所以每次重试前先发 reset 让调用方丢弃。
+   */
+  private async completeStreaming(
+    wireRequest: Record<string, unknown>,
+    onDelta: DeltaSink,
+    callIndex: number,
+    label: string,
+    startedAt: number,
+  ): Promise<LLMResponse> {
+    let attempts = 0;
+
+    try {
+      const { response, wireResponse } = await this.retryHandler.execute(
+        () => {
+          attempts++;
+          // 不发 reset 的话用户会看到「同一段话说了两遍」而且中间是断的
+          if (attempts > 1) onDelta({ reset: true });
+          return this.consumeStream(wireRequest, onDelta);
+        },
+        'DeepSeek API 流式调用',
+      );
+
+      this.config.logger.debug('LLM 流式响应', {
+        hasContent: !!response.content,
+        hasReasoning: !!response.reasoning,
+        toolCallCount: response.toolCalls.length,
+        finishReason: response.finishReason,
+        usage: response.usage,
+      });
+
+      this.config.onTrace?.({
+        callIndex,
+        label,
+        model: this.config.model,
+        startedAt,
+        durationMs: Date.now() - startedAt,
+        attempts,
+        wireRequest,
+        wireResponse,
+        parsed: response,
+      });
+
+      return response;
+    } catch (error) {
+      this.config.logger.error('LLM 流式调用失败', { error });
+
+      this.config.onTrace?.({
+        callIndex,
+        label,
+        model: this.config.model,
+        startedAt,
+        durationMs: Date.now() - startedAt,
+        attempts,
+        wireRequest,
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          name: error instanceof Error ? error.name : undefined,
+        },
+      });
+
+      // 与非流式同一个理由:不透传原始消息(含 ECONNRESET 这类特征),
+      // 否则外层 RetryHandler 会匹配到并再次重试,调用次数相乘
+      throw new LLMError(
+        `LLM API 调用失败${error instanceof Error ? ` (${error.name})` : ''}`,
+        true,
+      );
+    }
+  }
+
+  /**
+   * 消费一次流,累积成与非流式**同形**的结果
+   *
+   * 三处必须小心,每一处做错都是静默的:
+   *
+   * ① **工具调用的 arguments 是逐字拼的**。流式里 `delta.tool_calls[i].function
+   *    .arguments` 每次只给一小段,必须按 index 累积成完整字符串再 JSON.parse ——
+   *    半截 JSON 必然抛错。id 和 name 通常只在该 index 的第一个分片里出现。
+   *
+   * ② **usage 要显式索要**。流式默认不返回用量,不加 `stream_options.include_usage`
+   *    会让 token 统计和缓存命中率静默变成 0,而 /stats 整个显示都依赖那些数。
+   *    它只在最后一个分片里给(那个分片的 choices 是空数组)。
+   *
+   * ③ **finishReason 从分片里读,不能默认 stop**。否则带 tool_calls 的轮次
+   *    会被误判成「模型给出了最终回答」,主循环直接收尾 —— 工具不会被执行。
+   *
+   * 分片本身**不进 trace**:trace 记的是完整的线格式请求/响应对,
+   * 几百条碎片对定位问题没有用。所以这里重组出一个与非流式同构的响应体。
+   */
+  private async consumeStream(
+    wireRequest: Record<string, unknown>,
+    onDelta: DeltaSink,
+  ): Promise<{ response: LLMResponse; wireResponse: unknown }> {
+    const stream = await this.client.chat.completions.create({
+      ...wireRequest,
+      stream: true,
+      // 见 ②:不加这个,流式下拿不到 usage
+      stream_options: { include_usage: true },
+    } as any) as unknown as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
+
+    const acc: StreamAccumulator = {
+      content: '',
+      reasoning: '',
+      toolCalls: new Map(),
+      finishReason: null,
+    };
+
+    for await (const chunk of stream) {
+      // usage 分片的 choices 是空数组,所以先取 usage 再看 choices
+      if (chunk.usage) acc.usage = chunk.usage;
+
+      const choice = chunk.choices?.[0];
+      if (!choice) continue;
+
+      if (choice.finish_reason) acc.finishReason = choice.finish_reason;
+
+      const delta = choice.delta as any;
+      if (!delta) continue;
+
+      // 推理和正文分开推:客户端要把思维链折叠显示,混在一起就没法区分
+      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+        acc.reasoning += delta.reasoning_content;
+        onDelta({ reasoning: delta.reasoning_content });
+      }
+
+      if (typeof delta.content === 'string' && delta.content) {
+        acc.content += delta.content;
+        onDelta({ content: delta.content });
+      }
+
+      // 见 ①:按 index 累积,不推给调用方(半截 JSON 没有展示价值)
+      for (const tc of delta.tool_calls ?? []) {
+        const idx = tc.index ?? 0;
+        const cur = acc.toolCalls.get(idx) ?? { id: '', name: '', args: '' };
+        if (tc.id) cur.id = tc.id;
+        if (tc.function?.name) cur.name = tc.function.name;
+        if (tc.function?.arguments) cur.args += tc.function.arguments;
+        acc.toolCalls.set(idx, cur);
+      }
+    }
+
+    // 按 index 排序:Map 的插入序通常就是 index 序,但不保证 ——
+    // 而顺序错了会让「先读文件再写文件」这类调用反过来
+    const ordered = [...acc.toolCalls.entries()].sort((a, b) => a[0] - b[0]);
+
+    const toolCalls: ToolCallMessage[] = ordered.map(([idx, tc]) => {
+      let args: Record<string, unknown>;
+      try {
+        args = tc.args ? JSON.parse(tc.args) : {};
+      } catch {
+        // 拼出来的 JSON 不合法 —— 这是流式特有的失败形态(丢了分片)。
+        // 抛 LLMError 而不是静默给空参数:空参数会让工具用默认值跑起来,
+        // 那比失败更糟(模型以为自己调成功了)
+        throw new LLMError(
+          `流式工具调用参数不是合法 JSON (index ${idx}, ${tc.name}): ${tc.args.slice(0, 200)}`,
+          true,
+        );
+      }
+      return { id: tc.id, name: tc.name, args };
+    });
+
+    const finishReason: LLMResponse['finishReason'] =
+      acc.finishReason === 'tool_calls' ? 'tool_calls'
+      : acc.finishReason === 'length' ? 'length'
+      : 'stop';
+
+    // 重组成与非流式同构的线格式响应,供 trace 记录。
+    // 标注 _reassembled_from_stream 是必要的诚实:它不是 API 原样返回的字节,
+    // 排查「响应格式变了」这类问题时必须知道这一点
+    const wireResponse = {
+      _reassembled_from_stream: true,
+      choices: [{
+        index: 0,
+        finish_reason: acc.finishReason,
+        message: {
+          role: 'assistant',
+          content: acc.content || null,
+          ...(acc.reasoning ? { reasoning_content: acc.reasoning } : {}),
+          ...(ordered.length > 0 ? {
+            tool_calls: ordered.map(([, tc]) => ({
+              id: tc.id,
+              type: 'function',
+              function: { name: tc.name, arguments: tc.args },
+            })),
+          } : {}),
+        },
+      }],
+      usage: acc.usage,
+    };
+
+    return {
+      wireResponse,
+      response: {
+        content: acc.content || null,
+        reasoning: acc.reasoning || null,
+        toolCalls,
+        finishReason,
+        usage: acc.usage ? this.extractUsage(acc.usage) : undefined,
+      },
+    };
   }
 
   /**

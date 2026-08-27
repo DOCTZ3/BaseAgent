@@ -13,3 +13,4 @@ export * from './vision-analyzer.js';
 export * from './system-prompt.js';
 export * from './memory.js';
 export * from './memory-manager.js';
+export * from './session.js';

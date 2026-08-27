@@ -2,7 +2,7 @@
 // Core 层:主循环 Orchestrator(集成 Context 管理)
 // ============================================
 
-import { LLMClient, Message } from './llm-client.js';
+import { LLMClient, Message, LLMDelta } from './llm-client.js';
 import { ToolRunner, ToolRegistry } from '../tools/index.js';
 import { Logger, MaxStepsExceededError } from '../platform/index.js';
 import { ContextManager } from './context.js';
@@ -15,7 +15,42 @@ export interface OrchestratorConfig {
   // trace 标签前缀。默认 'main-loop'，子 agent 传 'subagent:<id>'，
   // 这样同一份 trace 里能区分调用来源、按子 agent 归因 token 与步数
   traceLabelPrefix?: string;
+  /**
+   * 过程事件回调 —— 客户端/CLI 用它做实时展示
+   *
+   * 只在**主循环**上给流式:压缩、摘要、记忆抽取那些单发调用的产物是
+   * 给机器解析的 JSON,吐给用户没有意义(见 llm-client.ts 的 onDelta 注释)。
+   *
+   * 子 agent **不转发**这个回调:它的推理过程用户看不到,
+   * 混进主流会让用户分不清哪句是谁说的 —— 与 request_help 不下放同一个理由。
+   */
+  onEvent?: AgentEventSink;
 }
+
+/**
+ * 主循环的过程事件
+ *
+ * 为什么不只做 token 流:用户等的十几秒里,信息量最大的不是逐字吐字,
+ * 而是「它在干什么」。Orchestrator 本来就知道每一步(第几步、调了哪个工具),
+ * 把这些一起推出去,展示层才能给出「正在执行代码…」这种有用的反馈。
+ */
+export type AgentEvent =
+  /** 正文增量 */
+  | { type: 'content'; text: string }
+  /** 推理增量(思维链)。展示层通常折叠 */
+  | { type: 'reasoning'; text: string }
+  /** 重试导致的重来 —— 丢弃本步此前收到的所有增量 */
+  | { type: 'reset' }
+  /** 新的一步开始 */
+  | { type: 'step'; step: number; maxSteps: number }
+  /** 模型请求调用工具(参数已完整) */
+  | { type: 'tool_start'; id: string; name: string; args: Record<string, unknown> }
+  /** 工具执行完毕。result 是给人看的摘要,不是完整返回 */
+  | { type: 'tool_end'; id: string; name: string; ok: boolean; summary: string }
+  /** 本轮结束 */
+  | { type: 'done'; stopReason: AgentRunResult['stopReason']; steps: number };
+
+export type AgentEventSink = (event: AgentEvent) => void;
 
 export interface AgentTurn {
   messages: Message[];
@@ -59,6 +94,44 @@ function buildWrapUpNote(maxSteps: number): string {
     `请基于现有信息给出结论，并明确说明哪些部分尚未完成。`;
 }
 
+/** 工具结果摘要的长度上限。展示层要的是「成了没有」,完整数据在 trace 里 */
+const TOOL_SUMMARY_CLIP = 200;
+
+/**
+ * 把工具返回压成一行摘要
+ *
+ * 不用 JSON.stringify 直接截断:代码执行的结果是 `{stdout, duration_ms}`,
+ * 截断后用户看到的是 `{"stdout":"第1条: 星宇股份被曝批量劝` 这种半截转义 ——
+ * 引号和 \n 会占掉本就不多的字数。取 stdout 这类主字段更有用。
+ */
+function summarizeToolData(data: unknown): string {
+  if (data === undefined || data === null) return '完成';
+  if (typeof data === 'string') return clip(data);
+
+  if (typeof data === 'object') {
+    const o = data as Record<string, unknown>;
+    // 按「人最想看的」排序取第一个命中的字段
+    for (const key of ['stdout', 'content', 'text', 'summary', 'observation']) {
+      const v = o[key];
+      if (typeof v === 'string' && v.trim()) return clip(v);
+    }
+    // 列表类结果报个数就够(search_files / list_files)
+    for (const key of ['files', 'matches', 'items', 'results']) {
+      const v = o[key];
+      if (Array.isArray(v)) return `${v.length} 项`;
+    }
+  }
+
+  return clip(JSON.stringify(data));
+}
+
+function clip(s: string): string {
+  const oneLine = s.replace(/\s+/g, ' ').trim();
+  return oneLine.length > TOOL_SUMMARY_CLIP
+    ? oneLine.slice(0, TOOL_SUMMARY_CLIP) + '…'
+    : oneLine;
+}
+
 export class Orchestrator {
   constructor(
     private llmClient: LLMClient,
@@ -67,7 +140,86 @@ export class Orchestrator {
     private config: OrchestratorConfig,
   ) {}
 
-  async run(initialMessages: Message[]): Promise<AgentRunResult> {
+  /**
+   * 本轮的事件接收方 —— 由 run() 的参数覆盖 config.onEvent
+   *
+   * 为什么不只靠 config:Orchestrator 是**会话级**的(只建一次),而「这一轮
+   * 要不要流式」是**每轮**的事(壳这轮在等着看,记忆抽取那次没人看)。
+   * 若在构造时固定塞一个常驻转发函数,`deltaSink()` 里那个
+   * 「没人听就不付流式成本」的判断就永久为真了。
+   *
+   * 代价:同一个实例不可并发跑两轮(后者会覆盖前者的 sink)。
+   * 现有调用方都是串行的(CLI 排队、子 agent 各自新建实例),
+   * 真要并发就该各建一个实例 —— 它本来也没有跨轮状态。
+   */
+  private sink?: AgentEventSink;
+
+  /**
+   * 发事件 —— 展示层的失败绝不能影响主循环
+   *
+   * 回调是外部给的(SSE 写盘、IPC 发送、终端打印),它抛异常不该让
+   * 这一轮任务失败:那等于「因为界面卡了所以活没干成」。
+   * 与工具错误一律包成 ToolResult 同一个原则 —— 边缘的失败不炸主循环。
+   */
+  private emit(event: AgentEvent): void {
+    const sink = this.sink ?? this.config.onEvent;
+    if (!sink) return;
+    try {
+      sink(event);
+    } catch (e) {
+      this.config.logger.warn('事件回调抛错,已忽略', {
+        type: event.type,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * 把 LLM 分片转成主循环事件
+   *
+   * 返回 undefined 时 adapter 走非流式路径 —— 这是「没人听就不付流式成本」
+   * 的开关所在(流式要多一层分片累积,usage 还得靠 stream_options 额外索要)。
+   */
+  private deltaSink(): ((delta: LLMDelta) => void) | undefined {
+    if (!this.sink && !this.config.onEvent) return undefined;
+
+    return (delta: LLMDelta) => {
+      // reset 优先:它的语义是「丢掉此前所有增量」,和内容互斥
+      if (delta.reset) {
+        this.emit({ type: 'reset' });
+        return;
+      }
+      if (delta.reasoning) this.emit({ type: 'reasoning', text: delta.reasoning });
+      if (delta.content) this.emit({ type: 'content', text: delta.content });
+    };
+  }
+
+  /**
+   * 收口 —— 每条退出路径都从这里出去
+   *
+   * 四个 return 点各写一次 emit 迟早漏掉一个,而漏掉不报错:
+   * 展示层只是永远等不到结束信号(光标一直转)。收在一处后,
+   * 「有返回值就一定发过 done」由类型系统保证。
+   */
+  private finish(result: AgentRunResult): AgentRunResult {
+    this.emit({ type: 'done', stopReason: result.stopReason, steps: result.steps });
+    return result;
+  }
+
+  async run(
+    initialMessages: Message[],
+    onEvent?: AgentEventSink,
+  ): Promise<AgentRunResult> {
+    // 逐轮覆盖。finally 里清掉:留着会让下一轮(可能是没人听的那种)白付流式成本
+    this.sink = onEvent;
+    try {
+      return await this.loop(initialMessages);
+    } finally {
+      this.sink = undefined;
+    }
+  }
+
+  private async loop(initialMessages: Message[]): Promise<AgentRunResult> {
     const context = this.config.context;
 
     // 如果有 Context 管理器，使用它管理消息
@@ -91,6 +243,7 @@ export class Orchestrator {
     while (step < this.config.maxSteps) {
       step++;
       this.config.logger.debug(`主循环步骤 ${step}/${this.config.maxSteps}`);
+      this.emit({ type: 'step', step, maxSteps: this.config.maxSteps });
 
       // 准备 Prompt（触发压缩检查）
       const currentMessages = context ? await context.preparePrompt() : messages;
@@ -100,6 +253,10 @@ export class Orchestrator {
         messages: currentMessages,
         tools: this.toolRegistry.getAllDescriptions(),
         traceLabel: `${this.config.traceLabelPrefix ?? 'main-loop'}:step-${step}`,
+        // 没有 onEvent 就不传 onDelta —— adapter 据此走非流式路径。
+        // 不做成「总是流式、只是没人听」:流式多一层分片累积,
+        // 而且 usage 要靠 stream_options 额外索要,没必要为不展示的调用付这些
+        onDelta: this.deltaSink(),
       });
 
       // 记录 Token 使用量（如果有 Context）
@@ -141,10 +298,29 @@ export class Orchestrator {
         // 依次执行工具(后续可支持并行)
         for (let i = 0; i < response.toolCalls.length; i++) {
           const toolCall = response.toolCalls[i];
+          this.emit({
+            type: 'tool_start',
+            id: toolCall.id,
+            name: toolCall.name,
+            args: toolCall.args,
+          });
+
           const result = await this.toolRunner.run({
             id: toolCall.id,
             name: toolCall.name,
             args: toolCall.args,
+          });
+
+          // 摘要而不是完整结果:工具返回动辄几千字(代码 stdout、文件内容),
+          // 展示层要的是「成了没有」。完整数据在 trace 里
+          this.emit({
+            type: 'tool_end',
+            id: toolCall.id,
+            name: toolCall.name,
+            ok: result.ok,
+            summary: result.ok
+              ? summarizeToolData(result.data)
+              : String(result.error ?? '失败').slice(0, TOOL_SUMMARY_CLIP),
           });
 
           // 只挂在最后一个工具结果上，避免同一提示重复 N 遍
@@ -196,17 +372,17 @@ export class Orchestrator {
           this.config.logger.info('会话统计', stats);
         }
 
-        return { answer: response.content, stopReason: 'complete', steps: step };
+        return this.finish({ answer: response.content, stopReason: 'complete', steps: step });
       }
 
       // 无工具调用 + 无内容 → 模型无有效响应
       // 用 stopReason 表达，不再把这句写死的话混进正常回答通道
       this.config.logger.warn('模型未返回内容且无工具调用');
-      return {
+      return this.finish({
         answer: '任务未完成:模型无有效响应',
         stopReason: 'no_response',
         steps: step,
-      };
+      });
     }
 
     // 到达最大步数：不硬停，再给模型一次机会收尾
@@ -252,11 +428,11 @@ export class Orchestrator {
       if (!response.content) {
         // 不传 tools 时协议上不该发生；仍兜底，不再重试
         this.config.logger.error('收尾调用未返回内容');
-        return {
+        return this.finish({
           answer: `任务因达到步数上限（${this.config.maxSteps} 步）中止，且未能生成结论。`,
           stopReason: 'max_steps',
           steps: step,
-        };
+        });
       }
 
       if (context) {
@@ -264,7 +440,7 @@ export class Orchestrator {
       }
 
       this.config.logger.info('收尾完成', { steps: step });
-      return { answer: response.content, stopReason: 'max_steps', steps: step };
+      return this.finish({ answer: response.content, stopReason: 'max_steps', steps: step });
 
     } catch (error) {
       // 收尾本身失败（网络/限流）→ 没有任何可返回的内容，退回抛错。
