@@ -61,6 +61,32 @@ async function loadAgentModule() {
  * 就是用户读那一行原样命令(见 session.ts 的 CreateSessionOptions 注释)。
  * 这里把它转成一次 IPC 往返 —— 页面弹窗、用户点、答案回来。
  */
+/**
+ * 取会话,没有则建 —— **并发安全**,所有入口都必须走这里
+ *
+ * 不能直接写 `if (!session) await createSession()`:多个 IPC 处理器
+ * (run / info / notices / restart)都会这么判,而它们可以并发到达 ——
+ * 两个同时看到 null 就各建一整套会话。
+ *
+ * 后果不是「多占内存」而是**必然坏一个**:`.browser-profile` 只能被一个
+ * chromium 实例锁住,第二个必然启动超时。实测日志:
+ *   工具桥已启动 → chromium 启动超时,CDP 未就绪 → 工具桥已启动
+ * 装配跑了三次,最后那个会话的 browserCdpUrl 是空的 ——
+ * 于是模型后续再想用浏览器就连不上,而这一切没有任何报错指向真正的原因。
+ *
+ * 用 in-flight promise 而不是布尔标志:后者只能拦住「别建了」,
+ * 拦不住「等那个建好的」—— 第二个调用方需要拿到同一个会话,不是拿到 null。
+ */
+let sessionPromise = null;
+
+function ensureSession() {
+  if (session) return Promise.resolve(session);
+  if (!sessionPromise) {
+    sessionPromise = createSession().finally(() => { sessionPromise = null; });
+  }
+  return sessionPromise;
+}
+
 async function createSession() {
   const factory = await loadAgentModule();
 
@@ -123,7 +149,7 @@ function createWindow() {
 
 // ---------- IPC:跑一轮 ----------
 ipcMain.handle('agent:run', async (_e, runId, input) => {
-  if (!session) await createSession();
+  const s = await ensureSession();
   currentRunId = runId;
 
   const send = event => {
@@ -131,7 +157,9 @@ ipcMain.handle('agent:run', async (_e, runId, input) => {
   };
 
   try {
-    const result = await session.run(input, send);
+    // 用局部的 s,不用全局 session:重建可能在这一轮进行中发生,
+    // 那样 session 会被换掉而这一轮该跑在它原来那个上
+    const result = await s.run(input, send);
     return { stopReason: result.stopReason, answer: result.answer };
   } finally {
     currentRunId = null;
@@ -157,17 +185,17 @@ ipcMain.on('agent:confirm-reply', (_e, reqId, ok) => {
 // pythonDir 曾经两处各算一份,而错位不报错、只表现成
 // 「venv 里装了、代码里 import 不到」
 ipcMain.handle('agent:info', async () => {
-  if (!session) await createSession();
-  const c = session.config;
+  const s = await ensureSession();
+  const c = s.config;
   return {
-    model: session.info.model,
-    baseURL: session.info.baseURL,
-    visionModel: session.info.visionModel || '',
+    model: s.info.model,
+    baseURL: s.info.baseURL,
+    visionModel: s.info.visionModel || '',
     workspace: c.workspace || '',
     pythonEnabled: c.python.enabled,
     allowDangerousTools: c.security.allowDangerousTools,
     // 实际生效值(三个条件的合成),不是用户勾的那个
-    shellEnabled: session.info.shellEnabled,
+    shellEnabled: s.info.shellEnabled,
     subAgentEnabled: c.subAgent.enabled,
     memoryEnabled: c.memory.enabled,
     // 只给掩码。明文 key 不进渲染进程 —— 那里跑着不可信内容
@@ -176,8 +204,8 @@ ipcMain.handle('agent:info', async () => {
 });
 
 ipcMain.handle('agent:notices', async () => {
-  if (!session) await createSession();
-  return session.notices;
+  const s = await ensureSession();
+  return s.notices;
 });
 
 function maskKey(k) {
@@ -212,10 +240,25 @@ ipcMain.handle('config:save', async (_e, patch) => {
   return { needsRestart: true };
 });
 
+/**
+ * 重建会话(改了 workspace 这类需要重启的项之后)
+ *
+ * 三处顺序不能换:
+ * ① 先 await 掉正在进行的装配 —— 否则它建好之后会覆盖掉重建出来的那个,
+ *    而旧的那份再没人 dispose,chromium 就成了孤儿(锁着 profile 目录)
+ * ② dispose 必须在 session = null **之前**取到引用,否则关不掉旧实例
+ * ③ 新会话建好才发 session-changed:壳收到就会去拉 info,
+ *    早发会让它拿到半个状态
+ */
 ipcMain.handle('agent:restart', async () => {
-  await session?.dispose();
+  if (sessionPromise) {
+    // 装配中途点了保存。等它落地再关,不然会漏掉一个 chromium
+    try { await sessionPromise; } catch { /* 装配本身失败,下面照常重建 */ }
+  }
+  const old = session;
   session = null;
-  await createSession();
+  await old?.dispose();
+  await ensureSession();
   if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
   return true;
 });

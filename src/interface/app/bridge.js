@@ -29,8 +29,10 @@
       // 不假装热更新:workspace 派生出 fs 白名单、Python cwd、写边界三样东西,
       // venv 要重新校验、常驻浏览器要重开。所以保存即重建会话
       if (r && r.needsRestart) {
+        // 只调 restart,**不再自己 hydrate** —— restart 落地后主进程会发
+        // session-changed,下面那个监听器负责刷新界面。
+        // 两处都拉的话会 info()/notices() 各发两轮 IPC(旧代码就是这样)
         await bridge.restart();
-        await hydrate();
       }
       return r;
     },
