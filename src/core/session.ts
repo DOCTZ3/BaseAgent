@@ -26,7 +26,7 @@
 
 import path from 'path';
 import {
-  ConsoleLogger,
+  FileLogger,
   LogLevel,
   loadConfig,
   TraceRecorder,
@@ -127,6 +127,8 @@ export interface SessionInfo {
   browserProfileDir?: string;
   browserCdpUrl?: string;
   readDenyCount: number;
+  /** 运行日志的落盘位置。写盘失败时是 undefined(降级为只打终端) */
+  logFile?: string;
   /** 只在代码里可调、不出现在工具清单里的那些 */
   bridgedTools: string[];
   compression: { budget: number; source: '显式配置' | '跟随主模型' | '内置兜底' };
@@ -186,10 +188,22 @@ export async function createAgentSession(
   options: CreateSessionOptions,
 ): Promise<AgentSession> {
   const config = loadConfig(options.configOverrides ?? {});
-  const logger = new ConsoleLogger(LOG_LEVELS[config.logLevel] ?? LogLevel.INFO);
   const modelConfig = config.models.main;
+  // sessionId 必须先算出来:日志文件要落在这次会话自己的目录里,
+  // 与 trace 的 calls/ 和 archive/ 并列
   const sessionId = `${options.idPrefix ?? 'session'}-${Date.now()}`;
   const notices: SessionNotice[] = [];
+
+  // 运行日志落盘。**客户端必须要有这个**:Electron 脱离终端启动时 stdout
+  // 没有去处,而 `chromium 启动超时` / `venv 不可用` 这类只存在于运行日志里,
+  // trace 文件里根本没有 —— 那时它是唯一能看的东西。
+  //
+  // 与 trace 共用会话目录但**不受 TRACE_ENABLED 管**:关掉留痕通常是为了
+  // 不落盘对话内容(隐私),而运行日志里没有对话内容,却正是排障要的
+  const logger = new FileLogger(
+    path.join(config.trace.dir, sessionId, 'agent.log'),
+    LOG_LEVELS[config.logLevel] ?? LogLevel.INFO,
+  );
 
   if (!modelConfig.apiKey) {
     // 这个是硬失败,不是 notice:没有 key 什么都跑不了
@@ -574,6 +588,7 @@ export async function createAgentSession(
     browserProfileDir: config.python.enabled ? browserProfileDir : undefined,
     browserCdpUrl: browserManager?.cdpUrl || undefined,
     readDenyCount: readDenyPaths.length,
+    logFile: logger.filePath,
     bridgedTools: bridgedActive,
     compression: {
       budget: compBudget,
