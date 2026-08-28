@@ -105,6 +105,18 @@ export interface CreateSessionOptions {
   /** 覆盖配置(测试用)。不传则从环境变量加载 */
   configOverrides?: Partial<AgentConfig>;
   /**
+   * 外部提供的常驻浏览器 —— 传它则本会话**不创建也不关闭**浏览器
+   *
+   * 为什么需要这个:浏览器是**进程级**资源,不属于某次对话。默认由 session
+   * 自己创建时,切会话(整个 session 拆了重建)会连带重启 chromium ——
+   * 窗口跳一下、几秒等待,而且**页面停留位置丢了**(登录态在 profile 里能留住,
+   * 停在哪一页留不住,而那正是常驻浏览器存在的理由)。
+   *
+   * 所有权规则:谁创建谁关闭。传进来的实例由调用方(客户端主进程)在退出时
+   * 关掉 —— 它是 detached 的,不关会一直锁着 profile 目录导致下次启动失败。
+   */
+  browserManager?: BrowserManager;
+  /**
    * 续接一个已有会话 —— 传它则不新建 sessionId,而是沿用并灌回历史轮次
    *
    * 沿用同一个 id(而不是新建一个再把历史抄过去)是刻意的:
@@ -181,6 +193,29 @@ export interface AgentSession {
    * profile 目录,导致下次启动失败(实测)。
    */
   dispose(): Promise<void>;
+}
+
+/**
+ * 建一个常驻浏览器并启动
+ *
+ * 抽成导出函数是为了让**壳**也能建:客户端要把它提到进程级(跨会话共享),
+ * 而 profile 路径的解析规则只能有一份 —— 壳自己拼一次必然错位,
+ * 而错位不报错,只表现成「读黑名单挡不住 cookie」或「模型代码连不上浏览器」。
+ * 本项目已在「同一份事实写两处」上栽过四次。
+ *
+ * 启动失败不抛异常:没有浏览器仍能干别的活,而抛出去会让整个会话起不来。
+ */
+export async function createSharedBrowser(
+  config: AgentConfig,
+  logger: Logger,
+): Promise<BrowserManager> {
+  const manager = new BrowserManager({
+    profileDir: path.resolve(config.python.browserProfileDir),
+    headless: false,   // 有头:能看见 agent 在做什么,登录引导也自然
+    logger,
+  });
+  await manager.start();
+  return manager;
 }
 
 const LOG_LEVELS = {
@@ -402,16 +437,14 @@ export async function createAgentSession(
   // ---------- 常驻浏览器(CDP)----------
   // 由框架启动而非模型代码启动,浏览器才能跨轮次存活。
   // 顺带消掉一个软边界:模型再没机会自己造 profile 路径
-  const browserManager = config.python.enabled
-    ? new BrowserManager({
-        profileDir: browserProfileDir,
-        headless: false,   // 有头:能看见 agent 在做什么,登录引导也自然
-        logger,
-      })
-    : undefined;
-  if (browserManager) {
-    await browserManager.start();   // 失败只告警,不阻塞
-  }
+  //
+  // 外部传了就复用,**且不由本会话关闭**(见 options.browserManager)——
+  // 客户端把它提到进程级,于是切会话不再重启 chromium。
+  // 注:传进来的实例必须用同一份 config 创建,否则它的 profile 目录
+  // 与下面读黑名单/env 注入用的 browserProfileDir 不一致(而错位不报错)
+  const ownsBrowser = !options.browserManager;
+  const browserManager = options.browserManager
+    ?? (config.python.enabled ? await createSharedBrowser(config, logger) : undefined);
 
   // ---------- 工具桥(CodeAct)----------
   // 用 describe() 而不是 getAllDescriptions():后者会过滤掉隐藏的工具,
@@ -713,8 +746,10 @@ export async function createAgentSession(
       // SQLite 句柄不关会留下 -wal/-shm 文件
       memoryStorage?.close();
       // 常驻浏览器是 detached 的,不随本进程退出。留下来会一直锁着
-      // profile 目录,导致下次启动失败
-      await browserManager?.stop();
+      // profile 目录,导致下次启动失败。
+      // **只关自己创建的那个**:外部注入的由调用方负责(谁创建谁关闭)——
+      // 在这里关掉共享实例会让切会话之后的会话拿到一个死的 CDP 地址
+      if (ownsBrowser) await browserManager?.stop();
       await toolBridge?.stop();
     },
   };

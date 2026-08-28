@@ -60,6 +60,9 @@ body {
   justify-content: space-between;
   padding: 10px 16px;
   border-bottom: 1px solid var(--line);
+  /* 顶栏与输入区都不能被压缩:.stream 有 flex:1 免于收缩,
+     窗口变矮时全部压力会落到这两个上,于是输入框被顶出视野 */
+  flex-shrink: 0;
   /* -webkit-app-region 让无边框窗口(--app=)仍可拖动 */
   -webkit-app-region: drag;
 }
@@ -206,7 +209,16 @@ body {
   gap: 14px;
 }
 
-.msg { max-width: 780px; width: 100%; margin: 0 auto; }
+/*
+  flex-shrink: 0 是这里的关键,不是保险
+
+  .stream 是 flex 容器(column),而 flex 项**默认 flex-shrink: 1** ——
+  内容超出容器高度时,每个 .msg 会被压扁、里面的文字被裁掉,
+  而容器的 scrollHeight 等于**压扁后**的高度之和。
+  于是表现成:最下面的内容看不见、滚轮到底也没用、窗口缩小时更严重。
+  这三个现象是同一个原因(实测踩到)。
+*/
+.msg { max-width: 780px; width: 100%; margin: 0 auto; flex-shrink: 0; }
 
 .msg.user {
   align-self: center;
@@ -317,39 +329,61 @@ body {
 }
 @keyframes blink { to { visibility: hidden; } }
 
-/* ---------- 思考过程(默认折叠) ---------- */
+/* ---------- 思考过程(按步分块) ----------
+   每步一个块,紧挨着它引发的那次工具调用。不聚合成一个总块 ——
+   那样第 4 步的推理会显示在第 2 步的工具调用上面(见 app.js 的注释)。
+
+   两种形态由字数决定:短的(≤80 字)平铺成一行灰字,长的给折叠块。
+   实测后续步骤的推理常常只有一句,给它套折叠块点开点关比读它还费劲。
+*/
 .think {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-soft);
-  margin-bottom: 10px;
-  overflow: hidden;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--fg-dim);
 }
 
 .think > summary {
   cursor: pointer;
-  padding: 7px 12px;
-  color: var(--fg-dim);
-  font-size: 13px;
+  color: var(--fg-faint);
   list-style: none;
   display: flex;
   align-items: center;
   gap: 6px;
   user-select: none;
+  padding: 3px 0;
+  /* 折叠态的 summary 里有预览文字,长了要截断而不是换行 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .think > summary::-webkit-details-marker { display: none; }
-.think > summary::before { content: '▸'; color: var(--fg-faint); }
+.think > summary::before {
+  content: '▸';
+  flex-shrink: 0;
+  color: var(--fg-faint);
+}
 .think[open] > summary::before { content: '▾'; }
-.think > summary:hover { background: var(--bg-hover); }
+.think > summary:hover { color: var(--fg-dim); }
 
-.think .body {
-  padding: 2px 12px 10px 26px;
-  color: var(--fg-dim);
-  font-size: 13px;
+.think-text {
+  /* 左边一条竖线代替边框:多步任务里会有四五个这种块,
+     每个都加边框会让页面碎成一堆盒子 */
+  border-left: 2px solid var(--line);
+  padding: 2px 0 2px 10px;
+  margin-left: 5px;
   white-space: pre-wrap;
-  border-top: 1px solid var(--line);
-  max-height: 320px;
+  max-height: 300px;
   overflow-y: auto;
+  color: var(--fg-dim);
+}
+
+/* 短推理:去掉三角与交互暗示,读起来就是一行注释 */
+.think.flat > summary {
+  display: none;
+}
+.think.flat .think-text {
+  border-left-color: #2a2d33;
+  color: var(--fg-faint);
 }
 
 /* ---------- 工具调用标签 ---------- */
@@ -402,6 +436,8 @@ body {
   align-items: flex-end;
   padding: 12px 16px 16px;
   border-top: 1px solid var(--line);
+  /* 同 .bar:窗口变矮时不能被压缩,否则输入框被顶出视野 */
+  flex-shrink: 0;
 }
 
 .composer textarea {

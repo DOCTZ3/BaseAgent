@@ -37,6 +37,8 @@ let confirmSeq = 0;
  * 用 tsx 的 ESM 注册器直接吃 .ts,理由见文件头 ②。
  * 失败不能静默:那会表现成「窗口开着但发消息没反应」,最难查的形态。
  */
+let createSharedBrowser = null;
+
 async function loadAgentModule() {
   if (createAgentSession) return createAgentSession;
 
@@ -51,7 +53,28 @@ async function loadAgentModule() {
   ).href;
   const mod = await import(sessionUrl);
   createAgentSession = mod.createAgentSession;
+  createSharedBrowser = mod.createSharedBrowser;
   return createAgentSession;
+}
+
+/**
+ * 常驻浏览器提到**进程级**,不随会话重建
+ *
+ * 它归 AgentSession 所有时,切会话(整个 session 拆了重建)会连带重启
+ * chromium —— 窗口跳一下、几秒等待,而且**页面停留位置丢了**。
+ * 而那正是常驻浏览器存在的理由(登录态在 profile 里能留住,停在哪一页留不住)。
+ *
+ * 谁创建谁关闭:这里创建,所以由 before-quit 负责关。
+ * 漏了就是孤儿进程锁着 profile 目录、下次启动失败。
+ */
+let sharedBrowser = null;
+
+async function ensureBrowser(config) {
+  if (sharedBrowser) return sharedBrowser;
+  if (!config.python.enabled) return undefined;
+  // 启动失败不抛:没有浏览器仍能干别的活
+  sharedBrowser = await createSharedBrowser(config, console);
+  return sharedBrowser;
 }
 
 /**
@@ -118,9 +141,18 @@ async function createSession(resumeSessionId) {
   const { readConfigFile, toOverrides } = await loadConfigStore();
   const configOverrides = toOverrides(readConfigFile());
 
+  // 浏览器要在建会话**之前**就位:会话装配时要拿它的 CDP 地址注入
+  // 子进程环境变量(BROWSER_CDP_URL),晚了模型代码就连不上。
+  // 用同一份 config 建 —— profile 路径的解析必须与会话里的读黑名单同源
+  const { loadConfig } = await loadPlatformConfig();
+  const browser = await ensureBrowser(loadConfig(configOverrides));
+
   session = await factory({
     idPrefix: 'app',
     configOverrides,
+    // 复用进程级实例 —— session 因此**不会**在 dispose 时关掉它,
+    // 于是切会话不再重启 chromium(见 session.ts 的 browserManager 注释)
+    browserManager: browser,
     // 传了就续接那个会话(沿用同一个 sessionId 并灌回历史轮次)
     resumeSessionId,
     onConfirm: req =>
@@ -380,14 +412,28 @@ app.on('activate', () => {
  */
 let cleaningUp = false;
 app.on('before-quit', async e => {
-  if (cleaningUp || !session) return;
+  // 判 sharedBrowser 而不是只判 session:浏览器提到进程级之后,
+  // session 的 dispose() 不再关它(ownsBrowser 为 false)——
+  // 只判 session 的话,session 为 null 时会直接 return、把 chromium 漏掉,
+  // 而它是 detached 的,留下来锁着 profile 目录导致下次启动失败
+  if (cleaningUp || (!session && !sharedBrowser)) return;
   e.preventDefault();
   cleaningUp = true;
+
+  // 会话与浏览器分别 try:前者失败不能让后者漏关(那是不可恢复的那一个)
   try {
-    await session.dispose();
+    await session?.dispose();
   } catch (err) {
-    console.error('收尾失败', err);
+    console.error('会话收尾失败', err);
   }
   session = null;
+
+  try {
+    await sharedBrowser?.stop();
+  } catch (err) {
+    console.error('关闭常驻浏览器失败', err);
+  }
+  sharedBrowser = null;
+
   app.quit();
 });

@@ -44,8 +44,14 @@
     wrap.className = 'msg';
     els.stream.appendChild(wrap);
 
-    let think = null;      // <details> 思考过程
-    let thinkBody = null;
+    // 推理**按步分块**,不聚合成一个总的「思考过程」。
+    //
+    // 聚合的问题不是审美而是**顺序错了**:块的位置在第一次推理到达时就定下,
+    // 于是第 4 步的推理在视觉上出现在第 2 步的工具调用**上面** ——
+    // 而「这段推理导致了那次工具调用」正是这个界面最该表达的东西。
+    // ChatGPT 那种「Thought for 8s」能聚合,是因为推理是不可分割的前置阶段、
+    // 中间没有别的东西交错;一旦工具调用夹在推理之间,聚合必然破坏因果关系。
+    let think = null;      // 当前步的推理块 { el, body, text, touched }
     let answer = null;     // 正文节点
     let buf = '';          // 正文原文。done 时用它做一次性 Markdown 渲染
     const tools = new Map();   // id → 标签节点
@@ -56,26 +62,63 @@
     // 只在用户本来就贴着底部时才跟随。否则用户往上翻看历史会被一直拽回来
     const follow = () => { if (atBottom()) els.stream.scrollTop = els.stream.scrollHeight; };
 
+    /** 短推理的字数上限 —— 到此为止不给折叠块 */
+    const THINK_FLAT = 80;
+
+    /**
+     * 收掉当前推理块 —— 工具开始、正文开始、进入下一步、本轮结束时都要调
+     *
+     * 长度决定形态,这是从 trace 里看出来的:第一步的推理通常几百字(在规划),
+     * 后续常常只有一句 —— 实测有一步只是「我的代码有个语法错误,反斜杠转义了
+     * 引号,让我修复」。给这种一句话套个折叠块,点开点关比读它还费劲。
+     *
+     * 折叠时 summary 带一段预览而不只写「思考」:否则用户无法判断值不值得点开,
+     * 而多步任务里会有四五个这种块。
+     */
+    function closeThink() {
+      if (!think) return;
+      const text = think.text.trim();
+
+      if (!text) {
+        think.el.remove();            // 空块不留:模型这一步没有思维链
+      } else if (text.length <= THINK_FLAT) {
+        think.el.open = true;
+        think.el.classList.add('flat');   // 去掉三角与 hover,读起来就是一行注释
+        think.sum.textContent = '思考';
+      } else {
+        think.el.open = false;
+        const preview = text.replace(/\s+/g, ' ').slice(0, 42);
+        think.sum.textContent = `思考 · ${preview}…`;
+        think.sum.title = `${text.length} 字,点击展开`;
+      }
+      think = null;   // 置空是关键:下一段推理会新建块,于是顺序天然对上
+    }
+
     return {
       reasoning(text) {
         if (!think) {
-          think = document.createElement('details');
-          think.className = 'think';
+          // 用 <details> 而不是 div,是为了收尾时能原地折起来 ——
+          // 换元素类型要做 DOM 手术,而流式中途换节点会让已渲染的文字闪一下
+          const el = document.createElement('details');
+          el.className = 'think';
+          el.open = true;   // 流式期间摊开:边生成边折叠会让内容在眼前跳
           const sum = document.createElement('summary');
-          sum.textContent = '思考过程';
-          thinkBody = document.createElement('div');
-          thinkBody.className = 'body';
-          think.append(sum, thinkBody);
-          wrap.appendChild(think);
+          sum.textContent = '思考';
+          const body = document.createElement('div');
+          body.className = 'think-text';
+          el.append(sum, body);
+          wrap.appendChild(el);
+          think = { el, sum, body, text: '' };
         }
-        thinkBody.textContent += text;
-        // 展开时让思考内容自己也滚到底,否则要手动拖
-        if (think.open) thinkBody.scrollTop = thinkBody.scrollHeight;
+        think.text += text;
+        think.body.textContent = think.text;
         follow();
       },
 
       content(text) {
         if (!answer) {
+          // 正文开始 = 本步推理结束,先把上面那块收掉
+          closeThink();
           answer = document.createElement('div');
           answer.className = 'answer streaming';
           wrap.appendChild(answer);
@@ -94,7 +137,9 @@
 
       /** 重试:丢弃本步已收到的全部增量 */
       reset() {
-        if (thinkBody) thinkBody.textContent = '';
+        // 整块删掉而不是清空文本:重试会从头再说一遍,留着空块
+        // 会在页面上攒下一串空壳
+        if (think) { think.el.remove(); think = null; }
         // buf 必须跟着清:不清的话重试后的正文会拼在上一次那半截后面,
         // 而 done 渲染的是 buf —— 用户看到同一段话说了两遍
         buf = '';
@@ -107,6 +152,8 @@
       },
 
       step(step, maxSteps) {
+        // 新的一步开始 —— 上一步的推理块到此为止(哪怕没有工具调用)
+        closeThink();
         // 第一步不报:刚点发送就跳「第 1 步」是噪音
         if (step <= 1) return;
         const n = document.createElement('div');
@@ -117,7 +164,10 @@
       },
 
       toolStart(id, name) {
-        // 工具要跑了 —— 本步的正文到此结束,收掉光标
+        // 工具要跑了 —— 本步的推理和正文都到此结束。
+        // **这一处是顺序正确的关键**:推理块在工具标签之前收口,
+        // 于是「这段推理 → 这次工具调用」的先后关系在 DOM 里成立
+        closeThink();
         if (answer) { answer.classList.remove('streaming'); answer = null; }
 
         const tag = document.createElement('div');
@@ -155,6 +205,10 @@
        * 这两条路径下事件流里一个 content 都没有,最终答案只在返回值里。
        */
       done(stopReason, finalAnswer) {
+        // 兜底:模型只推理不给正文就结束时(no_response),
+        // 那一块仍然摊着、还带着流式的样子
+        closeThink();
+
         if (answer) {
           answer.classList.remove('streaming');
           // 到这里才做 Markdown:流式期间是纯文本追加(见 content 注释)。
