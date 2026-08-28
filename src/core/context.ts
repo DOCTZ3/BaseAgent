@@ -197,6 +197,18 @@ export class ContextManager {
   // 平铺结构下 Turn 从创建起就是完整形状（messages 至少含用户提问），
   // 不需要 Partial —— 少一层可选性，也就少一处「字段可能不存在」的分支
   private currentTurn: Turn | null = null;
+  /**
+   * 轮次编号,**单调递增,永不回退**
+   *
+   * 不能用 `this.turns.length + 1` 派生:压缩会执行 `this.turns = recentTurns`
+   * 把数组截短(15 轮保留 10 轮后 length 变成 10),于是下一轮算出 turn_id=11 ——
+   * 而第 11 轮已经存在。撞号的后果全是静默的:
+   *   · activeTurnTopics(turn_id → topic_id)映射错乱
+   *   · 归档文件 turn-011.json 被后来那轮覆盖
+   *   · 历史落盘按 turn_id 判断写到哪了,撞号会让压缩之后的每一轮都不再写入
+   * 独立计数器与 turns 的增删完全解耦,这些问题一并消失。
+   */
+  private turnCounter = 0;
   private tokenCounter: TokenCounter;
   private archiveDir: string;
   // 压缩标志位：由 recordTokenUsage() 按 API 返回的 prompt_tokens 置真，
@@ -322,7 +334,8 @@ export class ContextManager {
     this.messages.push(userMsg);
 
     this.currentTurn = {
-      turn_id: this.turns.length + 1,
+      // 用独立计数器,不用 this.turns.length —— 压缩会截短那个数组(见字段注释)
+      turn_id: ++this.turnCounter,
       messages: [userMsg],
       timestamp: Date.now()
     };
@@ -426,6 +439,45 @@ export class ContextManager {
       has_final_response: !!turnFinalResponse(this.currentTurn),
     });
     this.currentTurn = null;
+  }
+
+  /**
+   * 灌回历史轮次(恢复一个此前的会话)
+   *
+   * 必须在 `addSystemMessage()` **之后**调用:system 消息要留在 messages[0],
+   * 而这里是往后 append。
+   *
+   * **刻意只恢复原始轮次,不恢复压缩状态**(主题摘要、轮次到主题的映射、
+   * 归档索引)。那些是 10 个私有字段,逐个序列化再灌回,漏一个就是静默错误 ——
+   * 比如漏了 archivedTurnIds,压缩提示会列出模型读不到的文件名。
+   * 而它们本来就是**可再生的**:恢复后接着聊,水位到了自然重新压一次。
+   *
+   * 同理**不预估 token**:压缩触发靠 recordTokenUsage() 拿 API 返回的真实
+   * prompt_tokens 置标志位,恢复后第一次调用就会拿到含全部历史的真实值。
+   * 在这里估一个数只会多一处与真实值不符的来源(见「不做发送前的 token 预估」)。
+   *
+   * turn_id 由 `this.turns.length + 1` 派生,所以灌回之后新轮次的编号
+   * 天然接着往下走,不会与历史撞号。
+   */
+  restoreTurns(turns: readonly Turn[]) {
+    if (turns.length === 0) return;
+
+    for (const turn of turns) {
+      this.turns.push(turn);
+      // 平铺:轮次内的消息顺序在写入时就是合法的(assistant/tool 配对),
+      // 摊平不需要任何重建逻辑 —— 这正是平铺存储那条决策的收益
+      this.messages.push(...turn.messages);
+      // 计数器必须跟着抬到历史最大值,否则续接后第一轮又从 1 开始、
+      // 与历史第 1 轮撞号(撞号的后果见 turnCounter 字段注释)。
+      // 取 max 而不是 length:文件里可能有坏行被跳过
+      if (turn.turn_id > this.turnCounter) this.turnCounter = turn.turn_id;
+    }
+
+    this.config.logger.info('已恢复历史轮次', {
+      turns: turns.length,
+      messages: this.messages.length,
+      next_turn_id: this.turns.length + 1,
+    });
   }
 
   /**

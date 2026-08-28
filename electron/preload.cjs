@@ -72,6 +72,28 @@ contextBridge.exposeInMainWorld('AgentBridge', {
   /** 注册确认处理器 */
   onConfirm(handler) { confirmHandler = handler; },
 
+  /**
+   * 窗口控制 —— 顶栏是自绘的,系统按钮不存在,只能由页面请求
+   *
+   * 关闭走 win.close() 而非 destroy():后者会跳过 before-quit,
+   * 于是常驻 chromium 不被 dispose、锁着 profile 目录导致下次启动失败
+   */
+  minimize: () => ipcRenderer.invoke('window:minimize'),
+  toggleMaximize: () => ipcRenderer.invoke('window:toggle-maximize'),
+  close: () => ipcRenderer.invoke('window:close'),
+  isMaximized: () => ipcRenderer.invoke('window:is-maximized'),
+
+  /**
+   * 会话历史
+   *
+   * listHistory 刻意**不经会话** —— 列侧边栏只要读几个 turns.jsonl 的第一行,
+   * 而开一个 AgentSession 要起 chromium、建 venv、检依赖。
+   */
+  listHistory: () => ipcRenderer.invoke('history:list'),
+  currentHistory: () => ipcRenderer.invoke('history:current'),
+  openHistory: sessionId => ipcRenderer.invoke('history:open', sessionId),
+  newSession: () => ipcRenderer.invoke('history:new'),
+
   /** 会话重建(改了 workspace 这类需要重启的项之后) */
   restart: () => ipcRenderer.invoke('agent:restart'),
   onSessionChanged(cb) {

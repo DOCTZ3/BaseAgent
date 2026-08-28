@@ -64,7 +64,8 @@ import {
   RequestHelpTool,
   RunCommandTool,
 } from '../tools/builtin/index.js';
-import { ContextManager } from './context.js';
+import { ContextManager, type Turn } from './context.js';
+import { turnsFile, readTurns, appendTurn } from './session-store.js';
 import { DeepSeekAdapter } from './deepseek-adapter.js';
 import {
   Orchestrator,
@@ -103,6 +104,17 @@ export interface CreateSessionOptions {
   idPrefix?: string;
   /** 覆盖配置(测试用)。不传则从环境变量加载 */
   configOverrides?: Partial<AgentConfig>;
+  /**
+   * 续接一个已有会话 —— 传它则不新建 sessionId,而是沿用并灌回历史轮次
+   *
+   * 沿用同一个 id(而不是新建一个再把历史抄过去)是刻意的:
+   * turns.jsonl / calls/ / archive/ / agent.log 都按 sessionId 分目录,
+   * 新建 id 会让同一段对话的产物散在两个目录里,排障时对不上。
+   *
+   * 历史读不出来时**不静默新建**:那样用户以为在续聊、实际模型什么都不记得。
+   * 走 notices 明说。
+   */
+  resumeSessionId?: string;
 }
 
 /**
@@ -152,6 +164,14 @@ export interface AgentSession {
    * 壳可以只在交互轮次听、单发轮次不听。
    */
   run(input: string, onEvent?: AgentEventSink): Promise<AgentRunResult>;
+  /**
+   * 完整原始对话 —— 给壳做历史展示
+   *
+   * 从 turns.jsonl 读,**不是** `context.peekTurns()`:后者被压缩截断过
+   * (旧轮次已移出内存、只剩一条 60 字检索索引)。
+   * 前端显示用户真实说过的话,模型请求走压缩那套 —— 两条路分开。
+   */
+  history(): Turn[];
   /** 中断当前轮次 */
   abort(): void;
   /**
@@ -190,8 +210,10 @@ export async function createAgentSession(
   const config = loadConfig(options.configOverrides ?? {});
   const modelConfig = config.models.main;
   // sessionId 必须先算出来:日志文件要落在这次会话自己的目录里,
-  // 与 trace 的 calls/ 和 archive/ 并列
-  const sessionId = `${options.idPrefix ?? 'session'}-${Date.now()}`;
+  // 与 trace 的 calls/ 和 archive/ 并列。
+  // 续接时沿用原 id —— 否则同一段对话的产物会散在两个目录里
+  const sessionId =
+    options.resumeSessionId ?? `${options.idPrefix ?? 'session'}-${Date.now()}`;
   const notices: SessionNotice[] = [];
 
   // 运行日志落盘。**客户端必须要有这个**:Electron 脱离终端启动时 stdout
@@ -569,6 +591,57 @@ export async function createAgentSession(
     }) + (memory?.prompt() ? '\n\n' + memory.prompt() : ''),
   );
 
+  // ---------- 历史轮次(续接会话)----------
+  // 必须在 addSystemMessage() **之后**:system 消息要留在 messages[0],
+  // restoreTurns 是往后 append
+  const historyFile = turnsFile(config.trace.dir, sessionId);
+  // 声明在 if 之外:下面算 lastPersistedTurnId 要用它
+  let restoredHistory: Turn[] = [];
+  if (options.resumeSessionId) {
+    restoredHistory = readTurns(historyFile);
+    if (restoredHistory.length === 0) {
+      // 不静默新建:用户以为在续聊、模型却什么都不记得,是最坏的形态
+      notices.push({
+        level: 'warn',
+        message: `会话 ${options.resumeSessionId} 没有可恢复的历史,已按新会话开始。`,
+      });
+    } else {
+      context.restoreTurns(restoredHistory);
+    }
+  }
+
+  /**
+   * 把还没落盘的轮次追加进 turns.jsonl
+   *
+   * 用 turn_id 判断写到哪了,**不能用条数**:压缩会把旧轮次移出
+   * `this.turns`(runCompression 里 `this.turns = recentTurns`),
+   * 于是 peekTurns() 的长度会**变小** —— 按条数比对会漏掉压缩之后的每一轮。
+   *
+   * 靠 peekTurns() 而不是等 finalizeTurn():后者只在 addUserMessage() 里调,
+   * 一轮要等下一条用户消息才入库,那样**每个会话的最后一轮永远不落盘**。
+   * 这与 peekTurns 那个 bug 是同一个形态。
+   */
+  // 续接时从已恢复的轮次里取最大 turn_id 作为起点。
+  // 取 max 而不是 length:文件里可能有坏行被跳过,那样 length 会偏小、
+  // 于是已存在的轮次被重复追加一遍
+  let lastPersistedTurnId = restoredHistory.reduce(
+    (max: number, t: Turn) => (t.turn_id > max ? t.turn_id : max),
+    0,
+  );
+
+  function persistNewTurns(): void {
+    for (const turn of context.peekTurns()) {
+      if (turn.turn_id <= lastPersistedTurnId) continue;
+      // 写失败不抛也不重试:历史是增强,不能让存不下来变成任务失败。
+      // 但要留痕,否则「历史怎么少了几轮」无从查起
+      if (appendTurn(historyFile, turn)) {
+        lastPersistedTurnId = turn.turn_id;
+      } else {
+        logger.warn('历史轮次写盘失败', { turn_id: turn.turn_id, file: historyFile });
+      }
+    }
+  }
+
   const compBudget = config.context.compressionMaxTokens ?? modelConfig.maxTokens ?? 4000;
   const info: SessionInfo = {
     model: modelConfig.model,
@@ -613,11 +686,22 @@ export async function createAgentSession(
         [{ role: 'user', content: input }],
         onEvent,
       );
+
+      // 历史落盘。**在记忆抽取之前**且同步做完:抽取是 void 不 await 的,
+      // 而这一步必须在 run() 返回前完成 —— 用户可能立刻关窗口
+      persistNewTurns();
+
       // 记忆抽取:**不 await** —— 它要调一次 LLM(几秒),
       // 挡在这里会让用户干等一个与本轮无关的调用。
       // onTurnEnd 内部不抛异常(记忆是增强不是必需品)
       if (memory) void memory.onTurnEnd(context.peekTurns());
       return result;
+    },
+
+    history() {
+      // 从文件读而非返回 context.peekTurns():后者被压缩截断过,
+      // 而前端要显示的是**完整原始对话**(这正是两条路分开的意义)
+      return readTurns(historyFile);
     },
 
     abort() {

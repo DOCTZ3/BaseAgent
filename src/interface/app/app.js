@@ -19,12 +19,19 @@
 
   const $ = id => document.getElementById(id);
 
+  // Markdown 渲染器(md.js,必须在本文件之前加载)。
+  // 取不到时降级为纯文本 —— 渲染坏掉不该让回答整段消失
+  const md = window.AgentMarkdown ?? {
+    into(node, text) { node.textContent = text; return node; },
+  };
+
   const els = {
     stream: $('stream'),
     input: $('input'),
     send: $('btn-send'),
     stop: $('btn-stop'),
     wsLabel: $('ws-label'),
+    sideList: $('side-list'),
   };
 
   // ---------- 一轮的渲染状态 ----------
@@ -40,6 +47,7 @@
     let think = null;      // <details> 思考过程
     let thinkBody = null;
     let answer = null;     // 正文节点
+    let buf = '';          // 正文原文。done 时用它做一次性 Markdown 渲染
     const tools = new Map();   // id → 标签节点
 
     const atBottom = () =>
@@ -71,16 +79,25 @@
           answer = document.createElement('div');
           answer.className = 'answer streaming';
           wrap.appendChild(answer);
+          buf = '';
         }
-        // textContent 而非 innerHTML:模型的输出是不可信文本,
+        // 流式期间只追加**纯文本**,不做 Markdown:每来一个字符重渲染一次
+        // 是 O(n²) 的 DOM 重建,而且半截的 ``` 或 | 会让结构反复跳变。
+        // 本轮结束时(done)拿 buf 一次性渲染。
+        //
+        // textContent 而非 innerHTML:模型输出是不可信文本,
         // 里面完全可能有 <script> 或从网页抓来的 HTML 片段
-        answer.textContent += text;
+        buf += text;
+        answer.textContent = buf;
         follow();
       },
 
       /** 重试:丢弃本步已收到的全部增量 */
       reset() {
         if (thinkBody) thinkBody.textContent = '';
+        // buf 必须跟着清:不清的话重试后的正文会拼在上一次那半截后面,
+        // 而 done 渲染的是 buf —— 用户看到同一段话说了两遍
+        buf = '';
         if (answer) { answer.remove(); answer = null; }
         const n = document.createElement('div');
         n.className = 'step-sep';
@@ -138,12 +155,20 @@
        * 这两条路径下事件流里一个 content 都没有,最终答案只在返回值里。
        */
       done(stopReason, finalAnswer) {
-        if (answer) answer.classList.remove('streaming');
+        if (answer) {
+          answer.classList.remove('streaming');
+          // 到这里才做 Markdown:流式期间是纯文本追加(见 content 注释)。
+          // 渲染器只构造 DOM 节点、不碰 innerHTML,所以不需要额外消毒
+          answer.classList.add('md');
+          md.into(answer, buf);
+        }
 
         if (!answer && finalAnswer) {
+          // 兜底路径:收尾调用(wrapUp)不走流式、no_response 没有正文,
+          // 这两种情况事件流里一个 content 都没有,答案只在返回值里
           const n = document.createElement('div');
-          n.className = 'answer';
-          n.textContent = finalAnswer;
+          n.className = 'answer md';
+          md.into(n, finalAnswer);
           wrap.appendChild(n);
         }
 
@@ -168,6 +193,66 @@
     n.className = 'notice' + (isError ? ' error' : '');
     n.textContent = text;
     parent.appendChild(n);
+  }
+
+  // ---------- 历史渲染 ----------
+  //
+  // 与流式渲染是**两套**,不复用:流式要处理增量、reset、未闭合状态,
+  // 历史是一次性画完的静态内容。硬凑成一套只会让两边互相将就。
+  //
+  // 显示的是**完整原始对话**(turns.jsonl),不是压缩后的上下文 ——
+  // 模型请求走压缩那套,两条路分开。
+
+  /** 消息内容可能是字符串或图文混排块,统一摊平成文字 */
+  function textOf(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content
+        .map(p => (p.type === 'text' ? p.text : `[图片 ${p.label || ''}]`))
+        .join('');
+    }
+    return '';
+  }
+
+  /** 画一轮历史。位置约定与 core 一致:messages[0] 是提问,末尾不带 toolCalls 的 assistant 是答案 */
+  function renderHistoryTurn(turn) {
+    const msgs = turn.messages || [];
+    if (msgs.length === 0) return;
+
+    const bubble = document.createElement('div');
+    bubble.className = 'msg user';
+    bubble.textContent = textOf(msgs[0].content);
+    els.stream.appendChild(bubble);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'msg';
+    els.stream.appendChild(wrap);
+
+    // 中间过程:模型调过哪些工具。历史里没有成败(那只在事件流里),
+    // 所以用中性样式,不画成绿勾或红叉 —— 那会是编造的信息
+    for (const m of msgs.slice(1)) {
+      for (const tc of m.toolCalls || []) {
+        const tag = document.createElement('div');
+        tag.className = 'tool';
+        const nm = document.createElement('span');
+        nm.className = 'name';
+        nm.textContent = tc.name;
+        tag.appendChild(nm);
+        wrap.appendChild(tag);
+      }
+    }
+
+    // 最终回答:最后一条不带 toolCalls 的 assistant
+    const finals = msgs.filter(m => m.role === 'assistant' && !(m.toolCalls || []).length);
+    const last = finals[finals.length - 1];
+    if (last) {
+      const ans = document.createElement('div');
+      ans.className = 'answer md';
+      // 历史也走 Markdown —— 否则同一段回答「当时看着是排版好的、
+      // 重开会话变成纯文本」,而用户会以为历史存坏了
+      md.into(ans, textOf(last.content));
+      wrap.appendChild(ans);
+    }
   }
 
   // ---------- 事件分发 ----------
@@ -277,6 +362,39 @@
     },
   };
 
+  // ---------- 窗口按钮 ----------
+  //
+  // 只在 Electron 里有意义。浏览器里打开时整组隐藏 ——
+  // 留着三个点不动的按钮比没有更糟。
+  // 判断 **AgentBridge** 而不是在 bridge.js 里包一层:后者要等 bridge.js 执行,
+  // 而脚本顺序是 app.js → bridge.js —— 于是这里永远走 else,按钮被整组隐藏。
+  // (实测踩到:按钮压根不出现。AgentBridge 由 preload 注入,页面脚本执行前就有)
+  if (window.AgentBridge) {
+    const w = window.AgentBridge;
+    $('btn-min').addEventListener('click', () => w.minimize());
+    $('btn-close').addEventListener('click', () => w.close());
+
+    const maxBtn = $('btn-max');
+    // 图标随状态切换:E922 是「最大化」,E923 是「还原」。
+    // 不切的话最大化之后按钮仍显示「最大化」,用户不知道点了会发生什么
+    const syncMaxIcon = maximized => {
+      maxBtn.textContent = maximized ? '' : '';
+      maxBtn.title = maximized ? '还原' : '最大化';
+    };
+    maxBtn.addEventListener('click', async () => {
+      syncMaxIcon(await w.toggleMaximize());
+    });
+    // 双击标题栏也能最大化(系统习惯),状态要跟着变
+    document.querySelector('.bar').addEventListener('dblclick', async e => {
+      if (e.target.closest('.win-btns, .icon-btn')) return;
+      syncMaxIcon(await w.toggleMaximize());
+    });
+    void w.isMaximized().then(syncMaxIcon);
+  } else {
+    const btns = document.querySelector('.win-btns');
+    if (btns) btns.hidden = true;
+  }
+
   // ---------- 配置抽屉 ----------
   const drawer = $('drawer');
   const mask = $('drawer-mask');
@@ -336,6 +454,100 @@
     closeCfg();
   });
 
+  // ---------- 历史侧边栏 ----------
+  let activeSessionId = null;
+
+  /** 清空对话区,回到「空会话」的样子 */
+  function clearStream() {
+    els.stream.textContent = '';
+    const hint = document.createElement('div');
+    hint.className = 'empty';
+    hint.textContent = '描述你要做的事,agent 会自己决定用什么工具。';
+    els.stream.appendChild(hint);
+  }
+
+  /** 把一份历史画进对话区 */
+  function showHistory(sessionId, turns) {
+    activeSessionId = sessionId;
+    els.stream.textContent = '';
+    if (!turns || turns.length === 0) {
+      clearStream();
+    } else {
+      for (const t of turns) renderHistoryTurn(t);
+      els.stream.scrollTop = els.stream.scrollHeight;
+    }
+    markActive();
+  }
+
+  function markActive() {
+    for (const el of els.sideList.querySelectorAll('.side-item')) {
+      el.classList.toggle('active', el.dataset.id === activeSessionId);
+    }
+  }
+
+  /** 刷新侧边栏列表 */
+  async function refreshSidebar() {
+    const api = window.AgentHistory;
+    if (!api) return;
+
+    let list = [];
+    try {
+      list = await api.list();
+    } catch {
+      // 列不出来不影响聊天,只是侧边栏空着
+    }
+
+    els.sideList.textContent = '';
+    if (list.length === 0) {
+      const p = document.createElement('div');
+      p.className = 'side-empty';
+      p.textContent = '还没有历史对话';
+      els.sideList.appendChild(p);
+      return;
+    }
+
+    for (const s of list) {
+      const item = document.createElement('button');
+      item.className = 'side-item';
+      item.dataset.id = s.sessionId;
+      item.title = s.title;
+      item.textContent = s.title;
+
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = `${s.turnCount} 轮 · ${fmtTime(s.updatedAt)}`;
+      item.appendChild(meta);
+
+      item.addEventListener('click', async () => {
+        if (busy || s.sessionId === activeSessionId) return;
+        // 换会话要重建 agent(起 chromium、建 venv),几秒 —— 先给个反馈
+        item.classList.add('active');
+        const r = await api.open(s.sessionId);
+        showHistory(r.sessionId, r.turns);
+      });
+
+      els.sideList.appendChild(item);
+    }
+    markActive();
+  }
+
+  /** 相对时间。侧边栏空间小,「3 分钟前」比完整时间戳有用 */
+  function fmtTime(ms) {
+    const diff = Date.now() - ms;
+    if (diff < 60_000) return '刚刚';
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+    if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} 小时前`;
+    return new Date(ms).toLocaleDateString('zh-CN');
+  }
+
+  $('btn-new').addEventListener('click', async () => {
+    const api = window.AgentHistory;
+    if (!api || busy) return;
+    const r = await api.newSession();
+    showHistory(r.sessionId, []);
+    await refreshSidebar();
+  });
+
   // ---------- 启动 ----------
   window.AgentApp = {
     /** 由 transport 在拿到会话信息后调用,填充界面 */
@@ -364,11 +576,32 @@
         els.stream.appendChild(wrap);
       }
     },
+
+    /**
+     * 载入当前会话的历史并刷新侧边栏
+     *
+     * 由 bridge.js 在会话就绪 / 会话切换后调用。放在这里而不是让 bridge
+     * 直接操作 DOM —— 渲染归 app.js,传输归 bridge.js
+     */
+    async loadHistory() {
+      const api = window.AgentHistory;
+      if (!api) return;
+      try {
+        const r = await api.current();
+        // 只在真有历史时重画:空会话保留「描述你要做的事」那句提示,
+        // 也避免把用户刚发出的第一条消息擦掉
+        if (r.turns && r.turns.length > 0) showHistory(r.sessionId, r.turns);
+        else activeSessionId = r.sessionId;
+      } catch {
+        // 读不出来不影响聊天
+      }
+      await refreshSidebar();
+    },
+
+    /** 一轮结束后刷新列表 —— 新会话的第一轮之后才会出现在里面 */
+    refreshSidebar,
   };
 
-  const hint = document.createElement('div');
-  hint.className = 'empty';
-  hint.textContent = '描述你要做的事,agent 会自己决定用什么工具。';
-  els.stream.appendChild(hint);
+  clearStream();
   els.input.focus();
 })();

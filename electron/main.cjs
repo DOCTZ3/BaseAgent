@@ -79,15 +79,35 @@ async function loadAgentModule() {
  */
 let sessionPromise = null;
 
-function ensureSession() {
+function ensureSession(resumeSessionId) {
   if (session) return Promise.resolve(session);
   if (!sessionPromise) {
-    sessionPromise = createSession().finally(() => { sessionPromise = null; });
+    sessionPromise = createSession(resumeSessionId)
+      .finally(() => { sessionPromise = null; });
   }
   return sessionPromise;
 }
 
-async function createSession() {
+/**
+ * 换会话 —— 切历史 / 开新对话共用这一条路
+ *
+ * 与 restart() 同构(那是改配置后重建),所以顺序上的坑也一样:
+ * 先 await 掉正在进行的装配,否则它落地后会覆盖新建的那个,
+ * 而旧的那份再没人 dispose、chromium 成为孤儿锁住 profile 目录。
+ */
+async function switchSession(resumeSessionId) {
+  if (sessionPromise) {
+    try { await sessionPromise; } catch { /* 装配失败,下面照常重建 */ }
+  }
+  const old = session;
+  session = null;
+  await old?.dispose();
+  const s = await ensureSession(resumeSessionId);
+  if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
+  return s;
+}
+
+async function createSession(resumeSessionId) {
   const factory = await loadAgentModule();
 
   // 配置的三层优先级:配置面板存的 JSON > .env > 内置默认。
@@ -101,6 +121,8 @@ async function createSession() {
   session = await factory({
     idPrefix: 'app',
     configOverrides,
+    // 传了就续接那个会话(沿用同一个 sessionId 并灌回历史轮次)
+    resumeSessionId,
     onConfirm: req =>
       new Promise(resolve => {
         // 窗口没了就拒绝:无人看守时放行等于开了任意命令执行
@@ -170,6 +192,28 @@ ipcMain.handle('agent:abort', () => {
   session?.abort();
   return true;
 });
+
+// ---------- IPC:窗口控制 ----------
+//
+// 顶栏是自绘的(titleBarStyle: 'hidden'),系统的最小化/最大化/关闭按钮
+// 不存在了,所以这三件事必须由页面经 IPC 请求。
+//
+// 用模块级的 win 而不是 BrowserWindow.getFocusedWindow():确认对话框
+// 弹出时焦点可能不在主窗口上,那时 getFocusedWindow() 会返回 null。
+ipcMain.handle('window:minimize', () => { win?.minimize(); });
+
+ipcMain.handle('window:toggle-maximize', () => {
+  if (!win) return false;
+  if (win.isMaximized()) win.unmaximize();
+  else win.maximize();
+  return win.isMaximized();
+});
+
+// close 而不是 destroy:destroy 会跳过 before-quit,于是常驻 chromium
+// 不被 dispose —— 它是 detached 的,留下来会锁住 profile 目录导致下次启动失败
+ipcMain.handle('window:close', () => { win?.close(); });
+
+ipcMain.handle('window:is-maximized', () => !!win?.isMaximized());
 
 ipcMain.on('agent:confirm-reply', (_e, reqId, ok) => {
   const resolve = pendingConfirms.get(reqId);
@@ -250,6 +294,48 @@ ipcMain.handle('config:save', async (_e, patch) => {
  * ③ 新会话建好才发 session-changed:壳收到就会去拉 info,
  *    早发会让它拿到半个状态
  */
+// ---------- IPC:会话历史 ----------
+//
+// 列表**不经会话**:开一个 AgentSession 要起 chromium、建 venv、检依赖,
+// 而这里只要读几个 turns.jsonl 的第一行。为了列侧边栏付那些代价说不通。
+ipcMain.handle('history:list', async () => {
+  const { listSessions } = await loadSessionStore();
+  const { loadConfig } = await loadPlatformConfig();
+  return listSessions(loadConfig().trace.dir);
+});
+
+/** 当前会话的完整原始对话 —— 前端渲染历史用 */
+ipcMain.handle('history:current', async () => {
+  const s = await ensureSession();
+  return { sessionId: s.sessionId, turns: s.history() };
+});
+
+/** 切到某个历史会话 */
+ipcMain.handle('history:open', async (_e, sessionId) => {
+  const s = await switchSession(sessionId);
+  return { sessionId: s.sessionId, turns: s.history() };
+});
+
+/** 开新对话 —— 不传 resumeSessionId 即新建 */
+ipcMain.handle('history:new', async () => {
+  const s = await switchSession(undefined);
+  return { sessionId: s.sessionId, turns: [] };
+});
+
+async function loadSessionStore() {
+  await loadAgentModule();
+  return import(require('url').pathToFileURL(
+    path.join(__dirname, '..', 'src', 'core', 'session-store.ts'),
+  ).href);
+}
+
+async function loadPlatformConfig() {
+  await loadAgentModule();
+  return import(require('url').pathToFileURL(
+    path.join(__dirname, '..', 'src', 'platform', 'config.ts'),
+  ).href);
+}
+
 ipcMain.handle('agent:restart', async () => {
   if (sessionPromise) {
     // 装配中途点了保存。等它落地再关,不然会漏掉一个 chromium

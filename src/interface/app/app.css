@@ -95,6 +95,107 @@ body {
 }
 .icon-btn:hover { background: var(--bg-hover); color: var(--fg); }
 
+/*
+  窗口按钮(最小化/最大化/关闭)
+
+  用 Segoe MDL2 Assets 的字形而不是文字符号:那是 Windows 自己标题栏用的
+  同一套图标,尺寸和视觉重量与系统一致。非 Windows 上回退到普通字体,
+  字形显示成方块 —— 所以 HTML 里用的是 &#xE921; 这类实体,
+  真要跨平台得按 process.platform 换一套,现在只保证 Windows 正确。
+
+  尺寸照抄系统标题栏的 46×32:肌肉记忆在这里是有意义的 ——
+  用户不会去瞄准,而是往右上角那个位置甩鼠标。
+*/
+.win-btns {
+  display: flex;
+  margin-left: 6px;
+  /* 顶栏整体是 drag 区域,按钮必须显式排除,否则点不动 */
+  -webkit-app-region: no-drag;
+}
+
+.win-btn {
+  width: 46px;
+  height: 32px;
+  border: 0;
+  background: none;
+  color: var(--fg-dim);
+  font-family: "Segoe MDL2 Assets", "Segoe Fluent Icons", sans-serif;
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.win-btn:hover { background: var(--bg-hover); color: var(--fg); }
+/* 关闭键用红色:这是唯一不可撤销的那个 */
+.win-btn.close:hover { background: #c42b1c; color: #fff; }
+
+/* ---------- 顶栏之下的两列布局 ---------- */
+.body-row {
+  flex: 1;
+  display: flex;
+  /* min-height:0 是必须的:不给的话 flex 子项会按内容撑高,
+     .stream 的 overflow-y 失效、整页跟着滚(而顶栏和输入框就跟着跑出视野) */
+  min-height: 0;
+}
+
+.main-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  /* 同理:不给 min-width 时长代码行会把主区撑宽、挤掉侧边栏 */
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ---------- 历史会话侧边栏 ---------- */
+.sidebar {
+  width: 232px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  background: #131417;
+}
+
+.side-head { padding: 10px; border-bottom: 1px solid var(--line); }
+
+.new-chat {
+  width: 100%;
+  text-align: left;
+  color: var(--fg);
+}
+
+.side-list { flex: 1; overflow-y: auto; padding: 6px; }
+
+.side-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--fg-dim);
+  font: inherit;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  /* 标题已在后端按 34 字截断,这里再兜一层:字宽因字符而异 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-item:hover { background: var(--bg-hover); color: var(--fg); }
+.side-item.active { background: var(--bg-soft); color: var(--fg); }
+
+.side-item .meta {
+  display: block;
+  font-size: 11px;
+  color: var(--fg-faint);
+  margin-top: 2px;
+}
+
+.side-empty { color: var(--fg-faint); font-size: 12px; padding: 12px 10px; }
+
 /* ---------- 消息流 ---------- */
 .stream {
   flex: 1;
@@ -116,7 +217,97 @@ body {
   white-space: pre-wrap;
 }
 
+/* 流式期间是纯文本,靠 pre-wrap 保住换行 */
 .answer { white-space: pre-wrap; }
+
+/*
+  Markdown 渲染后的正文
+
+  .md 会覆盖掉 pre-wrap —— 渲染成块级元素之后由 <p>/<li> 自己管换行,
+  留着 pre-wrap 会让段落之间多出源文本里的空行(视觉上间距翻倍)。
+*/
+.answer.md { white-space: normal; }
+
+.md p { margin: 0 0 10px; }
+.md > *:last-child { margin-bottom: 0; }
+
+.md .md-h {
+  margin: 16px 0 8px;
+  line-height: 1.4;
+  font-weight: 600;
+}
+.md h1.md-h { font-size: 1.32em; }
+.md h2.md-h { font-size: 1.18em; }
+.md h3.md-h { font-size: 1.06em; }
+.md h4.md-h, .md h5.md-h, .md h6.md-h { font-size: 1em; color: var(--fg-dim); }
+
+.md .md-list { margin: 0 0 10px; padding-left: 22px; }
+.md .md-list li { margin: 3px 0; }
+
+/* 行内代码:与代码块区分开,不给边框免得一行里挤满小方块 */
+.md code {
+  background: #0f1013;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font: 0.92em/1.5 ui-monospace, Consolas, monospace;
+  color: #d7ba7d;
+}
+
+.md .md-code {
+  background: #0f1013;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin: 0 0 12px;
+  overflow-x: auto;   /* 代码不折行:折了缩进就读不出来了 */
+  position: relative;
+}
+.md .md-code code {
+  background: none;
+  padding: 0;
+  color: var(--fg);
+  font-size: 12.5px;
+  white-space: pre;
+}
+/* 语言标签:模型标了 ```python 就显示出来,便于判断这段是什么 */
+.md .md-code[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  font-size: 10px;
+  color: var(--fg-faint);
+  text-transform: lowercase;
+}
+
+.md .md-quote {
+  margin: 0 0 12px;
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--line);
+  color: var(--fg-dim);
+}
+
+.md .md-table {
+  border-collapse: collapse;
+  margin: 0 0 12px;
+  font-size: 13px;
+  display: block;
+  overflow-x: auto;   /* 宽表格自己滚,不撑开整个对话区 */
+  max-width: 100%;
+}
+.md .md-table th,
+.md .md-table td {
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  text-align: left;
+}
+.md .md-table th { background: var(--bg-soft); font-weight: 600; }
+
+.md a { color: var(--accent); text-decoration: none; }
+.md a:hover { text-decoration: underline; }
+
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+.md del { color: var(--fg-faint); }
 
 /* 光标:流式进行中,让用户知道还在生成 */
 .answer.streaming::after {

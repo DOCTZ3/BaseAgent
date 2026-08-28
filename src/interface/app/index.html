@@ -22,16 +22,46 @@
   <div class="bar-right">
     <span class="ws" id="ws-label" title="当前工作区"></span>
     <button class="icon-btn" id="btn-config" title="配置">⚙</button>
+    <!--
+      窗口按钮:顶栏是自绘的(titleBarStyle: 'hidden'),系统按钮不存在。
+      顺序按 Windows 习惯(最小化 / 最大化 / 关闭),关闭单独给红色 hover。
+    -->
+    <div class="win-btns">
+      <button class="win-btn" id="btn-min" title="最小化">&#xE921;</button>
+      <button class="win-btn" id="btn-max" title="最大化">&#xE922;</button>
+      <button class="win-btn close" id="btn-close" title="关闭">&#xE8BB;</button>
+    </div>
   </div>
 </header>
 
-<main id="stream" class="stream"></main>
+<!-- 顶栏之下分两列:历史侧边栏 + 对话主区 -->
+<div class="body-row">
 
-<footer class="composer">
-  <textarea id="input" rows="1" placeholder="描述你要做的事…  (Enter 发送,Shift+Enter 换行)"></textarea>
-  <button id="btn-send" class="send">发送</button>
-  <button id="btn-stop" class="stop" hidden>停止</button>
-</footer>
+  <!--
+    历史会话侧边栏
+
+    标题取每个会话第一条用户提问的截断(见 session-store.ts 的 titleOf)。
+    列表由主进程扫目录得来,不维护索引文件 —— 索引和真实目录不一致时
+    列表里会出现打不开的条目。
+  -->
+  <aside class="sidebar" id="sidebar">
+    <div class="side-head">
+      <button class="btn new-chat" id="btn-new">＋ 新对话</button>
+    </div>
+    <div class="side-list" id="side-list"></div>
+  </aside>
+
+  <div class="main-col">
+    <main id="stream" class="stream"></main>
+
+    <footer class="composer">
+      <textarea id="input" rows="1" placeholder="描述你要做的事…  (Enter 发送,Shift+Enter 换行)"></textarea>
+      <button id="btn-send" class="send">发送</button>
+      <button id="btn-stop" class="stop" hidden>停止</button>
+    </footer>
+  </div>
+
+</div>
 
 <!-- 配置抽屉 -->
 <div class="drawer-mask" id="drawer-mask" hidden></div>
@@ -101,6 +131,8 @@
   顺序有意义:app.js 定义渲染层,bridge.js 在 Electron 里接真实 IPC,
   mock.js 只在没有 AgentBridge 时接手(双击本文件看界面的场景)。
 -->
+<!-- md.js 必须在 app.js 之前:后者在渲染回答时要用 window.AgentMarkdown -->
+<script src="md.js"></script>
 <script src="app.js"></script>
 <script src="bridge.js"></script>
 <script src="mock.js"></script>

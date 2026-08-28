@@ -27,7 +27,8 @@
 ┌──────────────────────────────────────────────────────────┐
 │  interface/  交互层(壳,可替换)                            │
 │    · cli          已实现:REPL/单发 + 调试回显(turn/token)  │
-│    · app/         已实现:Electron 客户端(流式、原生窗口)   │
+│    · app/         已实现:Electron 客户端(流式、历史侧边栏) │
+│                   含自写 Markdown 渲染(只建 DOM,不碰 HTML) │
 │    · voice        预留:ASR 语音转文字 / TTS 播报            │
 │    职责:只做 输入→文本 / 结构化结果→展示,零业务逻辑        │
 │    关键:两个壳共用 core/session.ts 一份装配,壳不重算事实   │
@@ -36,6 +37,7 @@
 ┌───────────────────────────┴──────────────────────────────┐
 │  core/  Agent 内核(大脑)                                  │
 │    · session       一次会话的全部接线(壳共用,零输出)      │
+│    · session-store 会话历史:append-only 的轮次日志         │
 │    · orchestrator  主循环:调 LLM → 拿决策 → 派发 → 观察    │
 │    · planner       复杂任务的多步拆解(可选增强)           │
 │    · llm-client    封装 LLM API 调用                       │
@@ -695,6 +697,52 @@ interface TopicSummary {
     实测报错是 `Cannot read properties of undefined (reading 'handle')` ——
     完全指不到真正的原因。IDE 与各类工具会设它且会继承,所以在启动路径上删,
     不靠文档提醒
+- **会话历史与压缩归档是两份存储,不合并**:
+  - **`archive/` 不是历史**:它只有被压缩挤出上下文的轮次。实测 8 个客户端
+    会话的 archive 全为空 —— 窗口 1M、阈值 0.7,压缩从没触发过,于是所有轮次
+    只活在内存里、关掉客户端就没了。缺的是「轮次完成即落盘」
+  - **两条路分开**是整个设计的关键:前端显示读 `turns.jsonl`(完整原始对话,
+    append-only,永不压缩),模型请求走 ContextManager 那套(一个字不改)。
+    分开之后**不需要序列化 ContextManager 的内部状态** —— 主题摘要、
+    轮次到主题的映射、归档索引、token 计数共 10 个私有字段,逐个灌回
+    漏一个就是静默错误(漏了 `archivedTurnIds`,压缩提示会列出模型读不到的文件名)。
+    而它们本来是**可再生的**:恢复后水位到了自然重新压一次
+  - 因此 `restoreTurns()` 刻意**只恢复原始轮次**,也**不预估 token** ——
+    压缩触发靠 `recordTokenUsage()` 拿 API 返回的真实值,在这里估一个数
+    只会多一处与真实值不符的来源
+  - **不能复用 archive/ 的写入路径**:它现在做的是「归档 + 写 index.json +
+    标记 topic_id」,而那份索引是给**模型回溯**用的(压缩后提示它 `read_file`
+    读 index.json 找早期对话)。每轮都写会让索引里塞满没被压缩的轮次,
+    而模型看到索引却发现那些内容还在上下文里 —— 索引的语义就坏了
+  - 代价(已确认接受):压缩发生后同一轮在两处都有。保留冗余是因为读者不同
+    (模型 vs 前端),且 archive 那侧的文件带 `topic_id` 这类压缩元信息
+  - **格式选 JSONL**:追加是一次 `appendFileSync`,不必读出整个数组改完写回;
+    崩溃只损坏最后一行,前面的历史仍可读(单个 JSON 数组会整份失效)
+  - **列表靠扫目录,不维护索引文件**:索引要在会话开始、每轮结束时更新,
+    而它与真实目录不一致时(手动删了某个目录、或写索引那次崩了)
+    列表里会出现打不开的条目。扫目录是自愈的
+  - **落盘挂在 `session.run()` 之后、用 `peekTurns()`**,不等 `finalizeTurn()`:
+    后者只在 `addUserMessage()` 里调,一轮要等下一条用户消息才入库 ——
+    照那样挂钩子,**每个会话的最后一轮永远不落盘**(与 peekTurns 那个 bug 同形)
+- **⚠️ 连带修掉一个既有 bug:`turn_id` 撞号**。原先由 `this.turns.length + 1`
+  派生,而压缩执行 `this.turns = recentTurns` 把数组截短 —— 15 轮压到保留 10 轮后
+  下一轮算出 11,与已存在的第 11 轮撞。后果全是静默的:`activeTurnTopics`
+  映射错乱、归档文件 `turn-011.json` 被覆盖、历史落盘按 turn_id 判断进度
+  于是压缩之后的每一轮都不再写入。改为独立的单调计数器,与 turns 的增删解耦;
+  续接会话时抬到历史最大 id(取 max 而非 length —— 文件里可能有坏行被跳过)
+- **Markdown 渲染自己写,不用 marked + DOMPurify**:
+  - **安全靠结构而不靠消毒**。库的做法是「markdown → HTML 字符串 → innerHTML」,
+    于是必须再挂一个消毒器,漏配一个选项就是 XSS。而渲染的是模型输出与它从
+    网页抓回来的片段,全是不可信文本。自写的版本全程 `createElement` +
+    `textContent` —— 没有 HTML 解析,就没有 HTML 注入
+  - 刻意不支持:原始 HTML 块(正是要避免的);图片 `![]()` ——
+    会让模型输出触发外部请求(等于信标),渲染成链接;多级嵌套列表(用得少、要一套栈)
+  - 链接按协议白名单(`http`/`https`/`mailto`),其余原样显示成文本
+  - **流式期间不渲染**:每来一个字符重渲染是 O(n²) 的 DOM 重建,而且半截的
+    ``` 或 `|` 会让结构反复跳变。做法是流式追加纯文本、`done` 时一次性渲染。
+    `reset`(重试)必须同时清掉缓冲,否则重试后的正文会拼在上一次那半截后面
+  - 历史渲染走同一套:否则同一段回答「当时排版好、重开会话变纯文本」,
+    用户会以为历史存坏了
 - **客户端配置存 JSON,不写回 `.env`**:
   - **改了不生效**:`config.ts` 的 `defaultConfig` 是**模块级常量** ——
     所有 `process.env.XXX` 在该模块首次 import 时求值一次,之后永不再读。
@@ -963,6 +1011,9 @@ interface TopicSummary {
 - system-prompt (提示词组装:环境约定由 `buildEnvironmentPrompt` 产出,
   主 agent 与子 agent **共用同一份**,角色说明各自保留。
   详见「子 agent 的提示词必须与主 agent 环境同源」那条决策)
+- session-store (会话历史:append-only 的 `turns.jsonl`、恢复、扫目录列会话。
+  与压缩归档是**两份存储** —— 前端显示原始对话、模型请求走压缩那套。
+  详见「会话历史与压缩归档是两件事」那条决策)
 - memory (长期记忆的纯逻辑:6 个维度、合并、按 hits 淘汰、凭证形态过滤、
   渲染。不依赖 LLM,可独立测试)
 - MemoryManager (抽取驱动:何时抽、给它看哪一段、结果怎么落盘。
@@ -971,11 +1022,15 @@ interface TopicSummary {
 **Interface 层**(两个壳共用 `core/session.ts` 一份装配):
 - CLI (REPL / 单发两种模式,斜杠命令 + 每轮可观测回显 —— **调试壳**,
   turn/token/压缩次数/trace 路径都在这里看)
-- Electron 客户端 (`electron/` + `src/interface/app/`):原生无边框窗口、
-  流式正文与可折叠思考过程、工具调用标签、原生目录选择、配置面板、
+- Electron 客户端 (`electron/` + `src/interface/app/`):原生无边框窗口
+  (自绘顶栏 + 窗口按钮)、流式正文与可折叠思考过程、工具调用标签、
+  历史会话侧边栏(切换/新建)、Markdown 渲染、原生目录选择、配置面板、
   危险工具确认(命令原样呈现)。**不显示** turn/token 这类调试信息。
   agent 直接跑在主进程,无端口无 HTTP;渲染进程按不可信环境对待。
-  详见「客户端用 Electron」那条决策
+  详见「客户端用 Electron」「Markdown 渲染自己写」两条决策
+- `scripts/import-history.ts` (一次性脚本:把旧会话的对话从
+  `calls/*.json` 的 wire_request 反推成 `turns.jsonl`。默认预演不写盘 ——
+  切分靠位置约定,判错会往每个目录塞一份错的历史且不报错)
 
 ### ⏳ 待实现
 
