@@ -193,13 +193,27 @@ export class DeepSeekAdapter implements LLMClient {
    * 上一次可能**已经吐给用户半截回答**,所以每次重试前先发 reset 让调用方丢弃。
    */
   private async completeStreaming(
-    wireRequest: Record<string, unknown>,
+    baseRequest: Record<string, unknown>,
     onDelta: DeltaSink,
     callIndex: number,
     label: string,
     startedAt: number,
   ): Promise<LLMResponse> {
     let attempts = 0;
+
+    // 流式的线格式请求体在**这里**定型,发送和 trace 共用同一个对象。
+    //
+    // 之前 stream / stream_options 是在 consumeStream 里展开进 create() 的,
+    // 而 trace 记的是没有这两项的 baseRequest —— 于是 trace 里的请求体和
+    // 线上真正发出的不是同一个东西:照着 trace 复现会得到一个**非流式**请求,
+    // 首 token 时序完全对不上(排查流式延迟时正好用不上它)。
+    // trace 的全部价值就是「这才是真正发出去的内容」,不能有第二个版本
+    const wireRequest = {
+      ...baseRequest,
+      stream: true,
+      // 见 consumeStream ②:不加这个,流式下拿不到 usage
+      stream_options: { include_usage: true },
+    };
 
     try {
       const { response, wireResponse } = await this.retryHandler.execute(
@@ -271,6 +285,8 @@ export class DeepSeekAdapter implements LLMClient {
    * ② **usage 要显式索要**。流式默认不返回用量,不加 `stream_options.include_usage`
    *    会让 token 统计和缓存命中率静默变成 0,而 /stats 整个显示都依赖那些数。
    *    它只在最后一个分片里给(那个分片的 choices 是空数组)。
+   *    那个开关现在由 completeStreaming 加进 wireRequest —— 本函数**原样发出**,
+   *    这样 trace 记的就是真正发出去的请求体。
    *
    * ③ **finishReason 从分片里读,不能默认 stop**。否则带 tool_calls 的轮次
    *    会被误判成「模型给出了最终回答」,主循环直接收尾 —— 工具不会被执行。
@@ -282,12 +298,26 @@ export class DeepSeekAdapter implements LLMClient {
     wireRequest: Record<string, unknown>,
     onDelta: DeltaSink,
   ): Promise<{ response: LLMResponse; wireResponse: unknown }> {
-    const stream = await this.client.chat.completions.create({
-      ...wireRequest,
-      stream: true,
-      // 见 ②:不加这个,流式下拿不到 usage
-      stream_options: { include_usage: true },
-    } as any) as unknown as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
+    // t0 必须在 create() **之前**。
+    //
+    // 第一版埋点放在 await 之后,量出的首片延迟恒为 0.0s —— 与实际体感
+    // (发完十几秒没动静)直接矛盾。原因是 SDK 的这个 await **不是**
+    // 「请求已发出」就 resolve,而要等 HTTP 响应头到达、流变为可读。
+    // 也就是说用户等的那段时间整个落在这个 await 里,而旧埋点从它之后才计时。
+    // 这一条是排查流式延迟的全部关键:分不开「等首 token」和「分片间隔」,
+    // 就无法判断该改配置还是改代码。
+    const t0 = Date.now();
+
+    // wireRequest 已经带上 stream / stream_options(在 completeStreaming 里定型)——
+    // 这里**原样发出**,不再追加任何字段。追加就等于 trace 记的和发出的不一致,
+    // 而那正是之前 trace 里 stream_options 显示 undefined 的原因
+    const stream = await this.client.chat.completions.create(
+      wireRequest as any,
+    ) as unknown as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
+
+    // 流可读的时刻。它减去 t0 = 请求 + 排队 + 服务端首 token 前的处理 ——
+    // 输入越长这段越久,而它与我们的代码无关(只能靠配置或缩短上下文)
+    const streamReadyMs = Date.now() - t0;
 
     const acc: StreamAccumulator = {
       content: '',
@@ -296,7 +326,31 @@ export class DeepSeekAdapter implements LLMClient {
       finishReason: null,
     };
 
+    /**
+     * 首字延迟埋点 —— 流式下**只有这几个数**能解释体感
+     *
+     * `duration_ms`(整段流消费完)回答不了「为什么卡一会才开始吐字」。
+     * 四个时间点,全部相对 t0(= create() 调用前):
+     * - streamReady  流变为可读。这段是「请求 + 排队 + 服务端首 token 前的处理」,
+     *   与我们的代码无关 —— 只能靠缩短上下文或换配置
+     * - firstChunk   收到任何分片(含空 delta)
+     * - firstReason  收到第一个思维链增量
+     * - firstContent 收到第一个正文增量
+     *
+     * 分开 reasoning 与 content 是因为处置不同:DeepSeek 推理模型先生成
+     * reasoning_content 再生成 content。firstReason 晚 → API 在攒思维链
+     * (只能关 MAIN_ENABLE_THINKING);firstReason 早而 firstContent 晚 →
+     * 推理边吐边发、只是正文来得慢,属正常。
+     */
+    let firstChunkMs: number | undefined;
+    let firstReasonMs: number | undefined;
+    let firstContentMs: number | undefined;
+    let chunkCount = 0;
+
     for await (const chunk of stream) {
+      chunkCount++;
+      firstChunkMs ??= Date.now() - t0;
+
       // usage 分片的 choices 是空数组,所以先取 usage 再看 choices
       if (chunk.usage) acc.usage = chunk.usage;
 
@@ -310,11 +364,13 @@ export class DeepSeekAdapter implements LLMClient {
 
       // 推理和正文分开推:客户端要把思维链折叠显示,混在一起就没法区分
       if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+        firstReasonMs ??= Date.now() - t0;
         acc.reasoning += delta.reasoning_content;
         onDelta({ reasoning: delta.reasoning_content });
       }
 
       if (typeof delta.content === 'string' && delta.content) {
+        firstContentMs ??= Date.now() - t0;
         acc.content += delta.content;
         onDelta({ content: delta.content });
       }
@@ -377,7 +433,35 @@ export class DeepSeekAdapter implements LLMClient {
         },
       }],
       usage: acc.usage,
+      /**
+       * 流式时序 —— 放在这里是为了跟着 trace 落盘
+       *
+       * 加下划线前缀标明它不是 API 返回的字段(同 _reassembled_from_stream)。
+       * 没有这几个数就无法区分「API 攒着不给」与「我们自己攒着不发」,
+       * 而两者的处置完全不同。
+       */
+      _stream_timing: {
+        // 这一项是排查的起点:它大 = 服务端在憋首 token(与我们的代码无关);
+        // 它小而 first_reasoning_ms 大 = API 在攒思维链
+        stream_ready_ms: streamReadyMs,
+        first_chunk_ms: firstChunkMs,
+        first_reasoning_ms: firstReasonMs,
+        first_content_ms: firstContentMs,
+        total_ms: Date.now() - t0,
+        chunks: chunkCount,
+      },
     };
+
+    // 用 info 而不是 debug:这个数是排查「为什么卡一会才吐字」的第一现场,
+    // 放在默认关闭的级别上等于每次要查都得先改配置重启一遍(实测踩到)
+    this.config.logger.info('流式时序', {
+      stream_ready_ms: streamReadyMs,
+      first_chunk_ms: firstChunkMs,
+      first_reasoning_ms: firstReasonMs,
+      first_content_ms: firstContentMs,
+      total_ms: Date.now() - t0,
+      chunks: chunkCount,
+    });
 
     return {
       wireResponse,

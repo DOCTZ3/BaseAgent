@@ -249,6 +249,24 @@
     parent.appendChild(n);
   }
 
+  /**
+   * 往消息流里留一条系统提示(配置已更新之类)
+   *
+   * 必须包一层 .msg:裸的 .notice 会通栏显示、与对话内容对不齐
+   * (max-width 和居中都在 .msg 上)。
+   *
+   * 为什么用消息流而不是按钮上的临时文字:重建会话现在很快(浏览器已提到
+   * 进程级、不再重启 chromium),按钮上那行「正在应用…」一闪而过看不见 ——
+   * 实测就是这样。留在流里的痕迹不依赖用户恰好在看某个位置。
+   */
+  function streamNote(text, isError) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg';
+    note(wrap, text, isError);
+    els.stream.appendChild(wrap);
+    els.stream.scrollTop = els.stream.scrollHeight;
+  }
+
   // ---------- 历史渲染 ----------
   //
   // 与流式渲染是**两套**,不复用:流式要处理增量、reset、未闭合状态,
@@ -472,16 +490,17 @@
     $(id).addEventListener('change', syncShellHint));
 
   $('btn-pick').addEventListener('click', async () => {
-    // 原型阶段先用输入框顶着。接上 server 后换成 /dirs 目录浏览:
-    // 纯网页拿不到绝对路径(webkitdirectory 只给相对路径、
-    // showDirectoryPicker 只给 handle),而 workspace 必须是绝对路径 ——
-    // 所以由 Node 侧列目录、前端点着选
-    const v = prompt('工作区绝对路径', $('cfg-workspace').value || '');
-    if (v !== null) {
-      $('cfg-workspace').value = v.trim();
-      applyWorkspace(v.trim());
-      syncShellHint();
-    }
+    // **不能用 window.prompt()**:Electron 刻意没实现它 —— 调用后什么都不发生
+    // 且不报错,表现成「按钮点了没反应」(实测踩到,这里原先就是 prompt)。
+    //
+    // 原生对话框还顺带解决了纯网页拿不到绝对路径这个问题
+    // (webkitdirectory 只给相对路径、showDirectoryPicker 只给 handle),
+    // 而 workspace 必须是绝对路径 —— 填错的后果是所有文件类工具静默全拒
+    const picked = await window.AgentBridge?.pickDirectory();
+    if (!picked) return;      // 用户取消
+    $('cfg-workspace').value = picked;
+    applyWorkspace(picked);
+    syncShellHint();
   });
 
   function applyWorkspace(p) {
@@ -503,9 +522,26 @@
       subAgentEnabled: $('cfg-subagent').checked,
       memoryEnabled: $('cfg-memory').checked,
     };
-    await window.AgentConfigApi?.save(patch);
-    $('cfg-key').value = '';    // 明文不留在 DOM 里
-    closeCfg();
+
+    // 保存要重建会话(检依赖、起工具桥)。禁用按钮不只是为了好看:
+    // 重复点会并发触发多次装配 —— 那正是「两个 chromium 抢同一个 profile」
+    // 那个 bug 的触发条件
+    const btn = $('btn-save');
+    btn.disabled = true;
+
+    try {
+      await window.AgentConfigApi?.save(patch);
+      $('cfg-key').value = '';    // 明文不留在 DOM 里
+      closeCfg();
+      // 结果留在消息流里,不做按钮上的临时文字:重建现在很快
+      // (浏览器已提到进程级、不再重启 chromium),按钮上那行字一闪而过看不见
+      streamNote('配置已更新,会话已重建。');
+    } catch (e) {
+      // 失败必须说出来:静默的话用户以为存上了,而实际跑的还是旧配置
+      streamNote(`配置保存失败: ${e && e.message ? e.message : String(e)}`, true);
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   // ---------- 历史侧边栏 ----------

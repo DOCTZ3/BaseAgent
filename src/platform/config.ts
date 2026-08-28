@@ -40,6 +40,49 @@ function resolveWorkspace(): string {
   return '';
 }
 
+/**
+ * 工作区路径归一化
+ *
+ * 环境变量那条路径已经过 resolveWorkspace 的 trim + resolve,但**客户端那条没有**:
+ * config.json 里的值是原样存的字符串,直接进 overrides。留着相对路径会让
+ * SecurityGuard 与 Python 子进程按不同基准解析(子进程 cwd 是工作区本身),
+ * 于是「授权了却读不到」。空串保持空串 —— 它的含义是「未配置」,
+ * 绝不能 resolve 成 cwd(那等于把整个项目目录交给模型)。
+ */
+function normalizeWorkspace(raw: string): string {
+  const trimmed = raw.trim();
+  return trimmed ? path.resolve(trimmed) : '';
+}
+
+/**
+ * 由工作区派生文件授权列表 —— **唯一一份**派生规则
+ *
+ * 抽出来是因为它原先只在 defaultConfig 里算过一次(用的是环境变量),
+ * 而 loadConfig 的 security 段是浅合并:传 `overrides.workspace` 时
+ * workspace 变了、fsGrants 还钉在环境变量的旧值上。实测过 ——
+ * `loadConfig({ workspace: 'D:\\别的目录' })` 得到的 fsGrants 与 .env 一致,
+ * 完全没跟着走。客户端的工作区走 config.json、不经环境变量,所以在界面里
+ * 换目录只改了显示值,权限边界没动:表现成「面板显示已授权、fs 工具全被拒」,
+ * 而且两边路径碰巧相同时症状会被完全掩盖。
+ *
+ * @param workspace 已归一化的绝对路径;空串表示未配置
+ * @param traceDir 归档所在目录(压缩后的历史在 <traceDir>/<session>/archive/)
+ */
+function deriveFsGrants(workspace: string, traceDir: string): FsGrant[] {
+  // 未配置时必须是**空数组**而不是 [''] —— 空串在 path.resolve 下等于 cwd,
+  // 那会把整个项目目录(含 src/ 和 .env)当成白名单,
+  // 比「什么都读不到」糟得多的失败模式
+  if (!workspace) return [];
+
+  return [
+    { path: workspace, mode: 'rw' as const },
+    // 归档目录由框架自动加入,不要用户配:压缩后模型会被提示用 read_file
+    // 回溯早期对话,读不到就等于历史彻底丢失。
+    // 只给 ro —— 模型要读它回溯,但不能覆盖自己的归档
+    { path: path.resolve(traceDir), mode: 'ro' as const },
+  ];
+}
+
 // 单个模型配置
 export interface ModelConfig {
   provider: 'deepseek' | 'openai';
@@ -389,20 +432,12 @@ export const defaultConfig: AgentConfig = {
   // 兼容旧的 FS_SANDBOX_PATHS（取第一项）—— 那时它是逗号分隔的多路径列表
   workspace: resolveWorkspace(),
   security: {
-    // 未配置时必须是**空数组**而不是 ['']：空串在 path.resolve 下等于 cwd，
-    // 那会把整个项目目录（含 src/ 和 .env）当成白名单交给模型 ——
-    // 比「什么都读不到」糟得多的失败模式
-    //
-    // 归档目录由框架自动加入，不要用户配：压缩后模型会被提示用 read_file
-    // 回溯早期对话（traces/<session>/archive/），读不到就等于历史彻底丢失。
-    // 它只需可读 —— Python 的写边界仍只允许工作区，写不进这里
-    fsGrants: resolveWorkspace()
-      ? [
-          { path: resolveWorkspace(), mode: 'rw' as const },
-          // ro：模型要读归档回溯早期对话，但不能覆盖自己的归档
-          { path: path.resolve(process.env.TRACE_DIR || 'traces'), mode: 'ro' as const },
-        ]
-      : [],
+    // 派生规则只有一份,在 deriveFsGrants 里 —— loadConfig 换了 workspace
+    // 也要走同一条规则重算,否则就是「显示新目录、边界还是旧的」
+    fsGrants: deriveFsGrants(
+      resolveWorkspace(),
+      process.env.TRACE_DIR || 'traces',
+    ),
     allowDangerousTools: process.env.ALLOW_DANGEROUS_TOOLS === 'true',
   },
   python: {
@@ -511,10 +546,38 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     }
   }
 
+  // 工作区要**先归一化再派生**,顺序不能反。
+  // 环境变量那条路径在 resolveWorkspace 里已经 trim + resolve 过,
+  // 但客户端那条是 config.json 里的原样字符串,直接进 overrides ——
+  // 不归一化会留下相对路径,而 SecurityGuard 和 Python 子进程的解析基准不同
+  const workspace = normalizeWorkspace(
+    overrides.workspace ?? defaultConfig.workspace,
+  );
+
+  const trace = { ...defaultConfig.trace, ...overrides.trace };
+
+  // fsGrants 必须跟着 workspace 重算。
+  //
+  // 之前这里只有一句 `security: {...defaultConfig.security, ...overrides.security}`,
+  // 而 fsGrants 是 defaultConfig 里用**环境变量**算出来的 —— 于是传
+  // overrides.workspace 时 workspace 变了、授权列表没变。客户端的工作区走
+  // config.json、不经环境变量,表现就是「面板显示新目录、fs 工具全被拒」,
+  // 而两边路径碰巧相同时症状被完全掩盖(实测:换成别的目录后 fsGrants 原样不动)。
+  //
+  // 显式传 fsGrants 仍然优先:测试和嵌入式调用要能直接给定授权,
+  // 不该被这里的派生覆盖掉
+  const security: AgentConfig['security'] = {
+    ...defaultConfig.security,
+    ...overrides.security,
+    fsGrants:
+      overrides.security?.fsGrants ?? deriveFsGrants(workspace, trace.dir),
+  };
+
   return {
     ...defaultConfig,
     ...overrides,
     models,
+    workspace,
     execution: { ...defaultConfig.execution, ...overrides.execution },
     context: {
       ...defaultConfig.context,
@@ -525,7 +588,7 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
         ...overrides.context?.compressionClip,
       },
     },
-    security: { ...defaultConfig.security, ...overrides.security },
+    security,
     python: { ...defaultConfig.python, ...overrides.python },
     // 新增顶层配置段必须在这里合并 —— 漏了不会报错,只会让整段 overrides 生效
     // 但默认值丢失(或反之)。models.vision 就是这么漏过一次的
@@ -533,6 +596,8 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     retry: { ...defaultConfig.retry, ...overrides.retry },
     subAgent: { ...defaultConfig.subAgent, ...overrides.subAgent },
     memory: { ...defaultConfig.memory, ...overrides.memory },
-    trace: { ...defaultConfig.trace, ...overrides.trace },
+    // 复用上面那个 trace —— fsGrants 的归档 ro 授权是按它的 dir 派生的,
+    // 在这里重新合并一次会让两者有机会不一致
+    trace,
   };
 }

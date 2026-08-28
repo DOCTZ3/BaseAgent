@@ -148,3 +148,104 @@ describe('沙箱 venv 配置', () => {
     expect(loadConfig().python.pythonPath).toBe('python');
   });
 });
+
+// ============================================
+// workspace → fsGrants 的派生
+// ============================================
+//
+// 这一组盯的是**客户端换工作区不生效**那个 bug,形状仍然是「逐字段拷贝」:
+// fsGrants 原先只在 defaultConfig 里用**环境变量**算过一次,而 loadConfig 的
+// security 段是浅合并 —— 传 overrides.workspace 时 workspace 变了、
+// 授权列表还钉在环境变量的旧值上。
+//
+// 为什么它能藏那么久:客户端的工作区走 config.json,而 .env 里通常配的是
+// 同一个目录 —— 两边相同时症状被完全掩盖。只有在界面里选一个**不同**的
+// 目录才会暴露,而那时的表现是「设置面板显示新路径、fs 工具全被拒」,
+// 看起来像权限 bug,不像配置合并 bug。
+// ============================================
+describe('workspace → fsGrants 派生', () => {
+  it('overrides.workspace 必须让 fsGrants 跟着重算 —— 客户端换目录靠这条', async () => {
+    const { loadConfig } = await freshConfig({ WORKSPACE: 'D:\\env-workspace' });
+
+    const c = loadConfig({ workspace: path.resolve('D:\\gui-workspace') });
+    const rw = c.security.fsGrants.filter(g => g.mode === 'rw');
+
+    expect(rw).toHaveLength(1);
+    expect(rw[0].path).toBe(path.resolve('D:\\gui-workspace'));
+    // 关键断言:环境变量那个旧路径不能残留在授权列表里
+    expect(c.security.fsGrants.some(g => g.path.includes('env-workspace'))).toBe(false);
+  });
+
+  it('工作区仍带 ro 的归档授权 —— 压缩后模型要读它回溯早期对话', async () => {
+    const { loadConfig } = await freshConfig({ TRACE_DIR: undefined });
+
+    const c = loadConfig({ workspace: path.resolve('D:\\ws') });
+    const ro = c.security.fsGrants.filter(g => g.mode === 'ro');
+
+    expect(ro).toHaveLength(1);
+    expect(ro[0].path).toBe(path.resolve('traces'));
+  });
+
+  it('自定义 TRACE_DIR 时归档授权跟着走 —— 否则历史读不到', async () => {
+    const { loadConfig } = await freshConfig({ TRACE_DIR: 'D:\\custom-trace' });
+
+    const c = loadConfig({ workspace: path.resolve('D:\\ws') });
+    expect(c.security.fsGrants.some(g => g.path === path.resolve('D:\\custom-trace')))
+      .toBe(true);
+  });
+
+  it('空串工作区 = 未配置:授权列表为空,**不能** resolve 成 cwd', async () => {
+    // 这是最危险的一条。空串在 path.resolve 下等于 cwd,
+    // 那会把整个项目目录(含 src/ 和 .env)当成 rw 白名单交给模型 ——
+    // 比「什么都读不到」糟得多。设置面板里清空工作区就会走到这条
+    const { loadConfig } = await freshConfig({ WORKSPACE: 'D:\\env-workspace' });
+
+    const c = loadConfig({ workspace: '' });
+    expect(c.workspace).toBe('');
+    expect(c.security.fsGrants).toHaveLength(0);
+  });
+
+  it('全空格工作区同样视为未配置 —— 界面里粘进空白很容易', async () => {
+    const { loadConfig } = await freshConfig({ WORKSPACE: 'D:\\env-workspace' });
+
+    const c = loadConfig({ workspace: '   ' });
+    expect(c.workspace).toBe('');
+    expect(c.security.fsGrants).toHaveLength(0);
+  });
+
+  it('相对路径的工作区归一化成绝对路径 —— 两边解析基准不同会「授权了却读不到」', async () => {
+    // 环境变量那条路径在 resolveWorkspace 里已经 resolve 过,但 config.json
+    // 里的值是原样字符串直接进 overrides。留着相对路径的话,SecurityGuard
+    // 按项目根解析、Python 子进程按工作区自身解析(它的 cwd 就是工作区)
+    const { loadConfig } = await freshConfig({});
+
+    const c = loadConfig({ workspace: 'some/rel/dir' });
+    expect(path.isAbsolute(c.workspace)).toBe(true);
+    expect(c.workspace).toBe(path.resolve('some/rel/dir'));
+    expect(c.security.fsGrants[0].path).toBe(path.resolve('some/rel/dir'));
+  });
+
+  it('显式传 fsGrants 优先于派生 —— 测试和嵌入式调用要能直接给定授权', async () => {
+    const { loadConfig } = await freshConfig({});
+
+    const c = loadConfig({
+      workspace: path.resolve('D:\\ws'),
+      security: {
+        fsGrants: [{ path: path.resolve('D:\\explicit'), mode: 'ro' }],
+        allowDangerousTools: false,
+      },
+    });
+
+    expect(c.security.fsGrants).toHaveLength(1);
+    expect(c.security.fsGrants[0].path).toBe(path.resolve('D:\\explicit'));
+  });
+
+  it('不传 workspace 时沿用环境变量的派生结果 —— CLI 不受影响', async () => {
+    const { loadConfig } = await freshConfig({ WORKSPACE: 'D:\\env-workspace' });
+
+    const c = loadConfig();
+    expect(c.workspace).toBe(path.resolve('D:\\env-workspace'));
+    expect(c.security.fsGrants.some(g => g.mode === 'rw'
+      && g.path === path.resolve('D:\\env-workspace'))).toBe(true);
+  });
+});
