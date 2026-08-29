@@ -321,6 +321,9 @@ async function main() {
           `${YELLOW}注意${RESET} 回答被 max_tokens 截断` +
           `(当前 ${session.config.models.main.maxTokens ?? '未设置'}),内容不完整`
         );
+      } else if (run.stopReason === 'aborted') {
+        // 用 dim 而非 RED:中断是用户主动要求的,不是故障
+        console.log(dim('已停止(用户中断)'));
       }
 
       console.log(dim('─── 本轮 LLM 调用 ───'));

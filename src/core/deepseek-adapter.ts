@@ -4,7 +4,7 @@
 
 import OpenAI from 'openai';
 import { LLMClient, LLMRequest, LLMResponse, ToolCallMessage, TraceSink, DeltaSink, ContentPart } from './llm-client.js';
-import { Logger, LLMError, RetryHandler, RetryConfig } from '../platform/index.js';
+import { Logger, LLMError, RetryHandler, RetryConfig, AbortedError, isAbortError } from '../platform/index.js';
 
 /**
  * 流式分片累积的中间态
@@ -112,7 +112,7 @@ export class DeepSeekAdapter implements LLMClient {
     // 代价是 trace 与 catch 那段在流式分支里重复一次 —— 这笔交易值得做
     if (request.onDelta) {
       return await this.completeStreaming(
-        wireRequest, request.onDelta, callIndex, label, startedAt,
+        wireRequest, request.onDelta, callIndex, label, startedAt, request.signal,
       );
     }
 
@@ -121,7 +121,12 @@ export class DeepSeekAdapter implements LLMClient {
       const completion = await this.retryHandler.execute(
         () => {
           attempts++;
-          return this.client.chat.completions.create(wireRequest as any);
+          // signal 走**第二个参数**(RequestOptions),不能塞进请求体 ——
+          // 塞进去会被当成模型参数发给服务端
+          return this.client.chat.completions.create(
+            wireRequest as any,
+            { signal: request.signal },
+          );
         },
         'DeepSeek API 调用'
       );
@@ -190,6 +195,11 @@ export class DeepSeekAdapter implements LLMClient {
         },
       });
 
+      // 用户主动中断**不是**失败,必须换一个类型抛。
+      // 包成 LLMError 的话上层会当成 API 故障:界面标红、日志报 error ——
+      // 而用户只是点了「停止」,那看起来像是自己把程序弄坏了
+      if (isAbortError(error)) throw new AbortedError();
+
       // 原始消息走 detail，**不进 message**：
       // message 里出现 "ECONNRESET" 这类特征会被外层 RetryHandler 匹配到、
       // 再重试一轮，调用次数变成 4×4=16。而 RetryHandler 只看 message/code/status，
@@ -221,6 +231,7 @@ export class DeepSeekAdapter implements LLMClient {
     callIndex: number,
     label: string,
     startedAt: number,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
     let attempts = 0;
 
@@ -244,7 +255,7 @@ export class DeepSeekAdapter implements LLMClient {
           attempts++;
           // 不发 reset 的话用户会看到「同一段话说了两遍」而且中间是断的
           if (attempts > 1) onDelta({ reset: true });
-          return this.consumeStream(wireRequest, onDelta);
+          return this.consumeStream(wireRequest, onDelta, signal);
         },
         'DeepSeek API 流式调用',
       );
@@ -287,6 +298,11 @@ export class DeepSeekAdapter implements LLMClient {
         },
       });
 
+      // 中断不是失败(同非流式那条)。流式下它尤其常见:
+      // 用户点停止时屏幕上往往已经有半截推理,那半截要保留 ——
+      // 所以这里只换错误类型,不发 reset
+      if (isAbortError(error)) throw new AbortedError();
+
       // 与非流式同一个理由:原始消息走 detail 而不进 message,
       // 否则外层 RetryHandler 会匹配到并再次重试,调用次数相乘。
       // 内容审查(「Output data may contain inappropriate content.」)走的就是这条路 ——
@@ -323,6 +339,7 @@ export class DeepSeekAdapter implements LLMClient {
   private async consumeStream(
     wireRequest: Record<string, unknown>,
     onDelta: DeltaSink,
+    signal?: AbortSignal,
   ): Promise<{ response: LLMResponse; wireResponse: unknown }> {
     // t0 必须在 create() **之前**。
     //
@@ -337,8 +354,13 @@ export class DeepSeekAdapter implements LLMClient {
     // wireRequest 已经带上 stream / stream_options(在 completeStreaming 里定型)——
     // 这里**原样发出**,不再追加任何字段。追加就等于 trace 记的和发出的不一致,
     // 而那正是之前 trace 里 stream_options 显示 undefined 的原因
+    // signal 走**第二个参数**(RequestOptions),不能塞进请求体 ——
+    // 塞进去会被当成模型参数发给服务端。
+    // 流式下它的作用尤其重要:没有它,点停止之后分片还会继续到达,
+    // 用户看到「停了但字还在往外冒」
     const stream = await this.client.chat.completions.create(
       wireRequest as any,
+      { signal },
     ) as unknown as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
 
     // 流可读的时刻。它减去 t0 = 请求 + 排队 + 服务端首 token 前的处理 ——
@@ -411,6 +433,20 @@ export class DeepSeekAdapter implements LLMClient {
         acc.toolCalls.set(idx, cur);
       }
     }
+
+    // 中断检查必须在**解析之前**。
+    //
+    // openai SDK 的 Stream 在 abort 时**不抛异常,而是安静地结束迭代**:
+    //   catch (e) { if (e.name === 'AbortError') return; throw e; }
+    // 于是上面那个 for await 正常退出,代码继续往下走 —— 去解析一个只收到
+    // 半截的 arguments 字符串。JSON.parse 必然失败,抛出
+    // 「流式工具调用参数不是合法 JSON」,而 isAbortError 认不出它。
+    //
+    // 实测后果:点停止之后界面弹一条红色报错,内容是半段 Python 代码 ——
+    // 看起来像模型输出坏了,而用户只是点了停止。
+    // 「SDK 抛错」那条路已经在 completeStreaming 的 catch 里接住了,
+    // 这里补的是「SDK 静默返回」那条。
+    if (signal?.aborted) throw new AbortedError();
 
     // 按 index 排序:Map 的插入序通常就是 index 序,但不保证 ——
     // 而顺序错了会让「先读文件再写文件」这类调用反过来

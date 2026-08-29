@@ -18,7 +18,16 @@ import { FsDriver, PythonExecutor, ShellExecutor, BrowserOps } from '../executor
 export interface RunnerConfig {
   sessionId: string;
   logger: Logger;
-  signal: AbortSignal;
+  /**
+   * 取当前的中断信号 —— 是**函数**而不是 AbortSignal 本身
+   *
+   * AbortController 一旦 abort 就永久失效,而 ToolRunner 是会话级的(只建一次)。
+   * 存一个 AbortSignal 的话:用户点过一次「停止」之后,这个会话里后续每次
+   * 工具调用拿到的都是那个已中止的信号 —— 表现成「点过一次停止,
+   * 之后什么都跑不了」,而且不报错,只是每个工具都立刻返回。
+   * 取函数则每次现取,由 session 每轮换一个新的。
+   */
+  getSignal: () => AbortSignal;
   onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
   allowDangerousTools: boolean;
   // 授权列表(带 ro/rw 档位)。未授权的路径读和写都会被拒
@@ -183,7 +192,8 @@ export class ToolRunner {
     return {
       sessionId: this.config.sessionId,
       logger: this.config.logger,
-      signal: this.config.signal,
+      // 现取:buildContext 每次工具调用都会跑,所以拿到的总是本轮那个
+      signal: this.config.getSignal(),
       confirm: this.config.onConfirmRequired,
       executors,
     };

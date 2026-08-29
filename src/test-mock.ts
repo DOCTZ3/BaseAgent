@@ -31,7 +31,7 @@ async function testRun() {
   const runner = new ToolRunner(registry, {
     sessionId: 'test-session-mock',
     logger,
-    signal: abortController.signal,
+    getSignal: () => abortController.signal,
     onConfirmRequired: async (req) => {
       logger.warn(`需要确认: ${req.reason}`, { tool: req.toolName });
       return true;

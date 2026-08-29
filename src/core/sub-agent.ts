@@ -45,7 +45,13 @@ import {
 export interface SubAgentConfig {
   parentSessionId: string;
   logger: Logger;
-  signal: AbortSignal;
+  /**
+   * 取当前中断信号 —— 函数而非 AbortSignal(见 RunnerConfig.getSignal)
+   *
+   * 子 agent 与父级**共享同一个信号**:用户点停止时,正在跑的子 agent
+   * 也该停下。存一份的话点过一次之后子 agent 永久起不来
+   */
+  getSignal: () => AbortSignal;
   onConfirmRequired: (req: ConfirmRequest) => Promise<boolean>;
   /**
    * 从主 agent 继承的资源与安全边界(整份传,不逐字段列举)
@@ -127,8 +133,9 @@ export class LocalSubAgentRunner implements SubAgentRunner {
       return { ok: false, error };
     }
 
-    // 父任务已取消时不该再起新的子 agent
-    if (this.config.signal.aborted) {
+    // 父任务已取消时不该再起新的子 agent。
+    // 现取信号:存一份的话用户点过一次停止之后,这个会话里再也起不了子 agent
+    if (this.config.getSignal().aborted) {
       return { ok: false, error: '任务已取消，不再启动子 agent' };
     }
 
@@ -167,7 +174,7 @@ export class LocalSubAgentRunner implements SubAgentRunner {
         ...this.config.inherited,
         sessionId,
         logger,
-        signal: this.config.signal,
+        getSignal: this.config.getSignal,
         onConfirmRequired: this.config.onConfirmRequired,
       });
 
@@ -177,6 +184,9 @@ export class LocalSubAgentRunner implements SubAgentRunner {
         context,
         // trace 里能按子 agent 归因 token 与步数
         traceLabelPrefix: `subagent:${subAgentId}`,
+        // 子 agent 的 LLM 请求也要能被打断 —— 它可能跑满 15 步、几分钟,
+        // 漏掉这条的话点停止只停主循环,子 agent 还在后台烧 token
+        getSignal: this.config.getSignal,
       });
 
       // 环境约定与主 agent 同源（同一个函数产出），差别只在角色部分
@@ -196,7 +206,9 @@ export class LocalSubAgentRunner implements SubAgentRunner {
       // 而不是「因为步数不够」。漏掉 'truncated' 的话主 agent 会把
       // 停在半句的回答当成定论用,而那正是这个字段存在的理由
       const truncated =
-        run.stopReason === 'max_steps' || run.stopReason === 'truncated';
+        run.stopReason === 'max_steps'
+        || run.stopReason === 'truncated'
+        || run.stopReason === 'aborted';
 
       logger.info('子 agent 完成', {
         sub_agent_id: subAgentId,

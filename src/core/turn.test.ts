@@ -289,3 +289,128 @@ describe('Turn 平铺存储', () => {
     });
   });
 });
+
+// ============================================
+// discardCurrentTurn —— 中断的轮次不留痕
+// ============================================
+//
+// 用户点停止后那一轮**整轮丢掉**。不丢的两个后果都不报错:
+//
+// ① peekTurns() 会把「已有 assistant 消息」的 currentTurn 也算进去,
+//    于是跑过几步工具再停的轮次被写进 turns.jsonl —— 一条没有结论的
+//    半截历史,而文件里没有任何东西标明它是被打断的。
+// ② 留在内存里的话,下一轮 addUserMessage() 会 finalizeTurn() 把它封进 turns。
+//    模型于是看到「提问 → 调了几个工具 → 没有结论」,很可能以为自己上次
+//    没答完而接着干 —— 而用户停它恰恰是不想要那个结果。
+// ============================================
+describe('discardCurrentTurn', () => {
+  it('把本轮消息从 messages 里全部移除,系统消息不受影响', async () => {
+    const ctx = makeContext();
+    ctx.addSystemMessage('系统提示');
+    await ctx.addUserMessage('问题');
+    ctx.addAssistantMessage('我来查', [{ id: 'c1', name: 'f', args: {} }]);
+    ctx.addToolResult('c1', '结果');
+
+    expect(ctx.peekMessages()).toHaveLength(4);
+
+    ctx.discardCurrentTurn();
+
+    const left = ctx.peekMessages();
+    expect(left).toHaveLength(1);
+    expect(left[0].role).toBe('system');
+  });
+
+  it('丢弃后 peekTurns 不再包含它 —— 这是不落盘的关键', async () => {
+    // persistNewTurns() 遍历的就是 peekTurns()。它把有 assistant 消息的
+    // currentTurn 也算进去,所以「跑过几步工具再停」的轮次原本会被写进文件
+    const ctx = makeContext();
+    await ctx.addUserMessage('问题');
+    ctx.addAssistantMessage('我来查', [{ id: 'c1', name: 'f', args: {} }]);
+    ctx.addToolResult('c1', '结果');
+
+    expect(ctx.peekTurns()).toHaveLength(1);   // 丢弃前:会被落盘
+
+    ctx.discardCurrentTurn();
+    expect(ctx.peekTurns()).toHaveLength(0);
+  });
+
+  it('下一轮不会把丢弃的轮次封进 turns —— 模型看不到半截历史', async () => {
+    const ctx = makeContext();
+    await ctx.addUserMessage('被中断的问题');
+    ctx.addAssistantMessage('查了一半', [{ id: 'c1', name: 'f', args: {} }]);
+    ctx.addToolResult('c1', '结果');
+    ctx.discardCurrentTurn();
+
+    // 下一轮:addUserMessage 会 finalizeTurn(),而那时已经没有 currentTurn 了
+    await ctx.addUserMessage('新问题');
+    ctx.addFinalResponse('答案');
+    await ctx.addUserMessage('第三轮');
+
+    const turns = ctx.peekTurns();
+    expect(turns).toHaveLength(1);
+    // turnUserMessage 返回 Message 而不是字符串
+    expect(turnUserMessage(turns[0])?.content).toBe('新问题');
+  });
+
+  it('turn_id **不回退** —— 回退会造成撞号(压缩那个 bug 的同一形状)', async () => {
+    // 留个空号无害;而回退会让下一轮拿到同一个 id,
+    // 后果是归档文件互相覆盖、主题映射错乱,全部静默
+    const ctx = makeContext();
+    await ctx.addUserMessage('第一轮');
+    ctx.addFinalResponse('答案');
+    await ctx.addUserMessage('第二轮');       // turn_id = 2
+    ctx.addAssistantMessage('查一半', [{ id: 'c1', name: 'f', args: {} }]);
+    ctx.discardCurrentTurn();                 // 丢掉 2
+
+    await ctx.addUserMessage('第三轮');
+    const current = (ctx as any).currentTurn as Turn;
+    expect(current.turn_id).toBe(3);          // 不是 2
+  });
+
+  it('已完成的轮次不受影响 —— 只丢当前那一轮', async () => {
+    const ctx = makeContext();
+    await ctx.addUserMessage('第一轮');
+    ctx.addFinalResponse('答案一');
+    await ctx.addUserMessage('第二轮');       // 第一轮在此入库
+    ctx.addAssistantMessage('查一半', [{ id: 'c1', name: 'f', args: {} }]);
+
+    ctx.discardCurrentTurn();
+
+    const turns = ctx.peekTurns();
+    expect(turns).toHaveLength(1);
+    expect(turnFinalResponse(turns[0])?.content).toBe('答案一');
+    // 第一轮的消息还在
+    expect(ctx.peekMessages().map(m => m.role)).toEqual(['user', 'assistant']);
+  });
+
+  it('没有 currentTurn 时是 no-op —— 中断可能发生在第一次请求之前', async () => {
+    const ctx = makeContext();
+    expect(() => ctx.discardCurrentTurn()).not.toThrow();
+
+    // 连续调也安全:abort 分支不保证只走一次
+    await ctx.addUserMessage('问题');
+    ctx.discardCurrentTurn();
+    expect(() => ctx.discardCurrentTurn()).not.toThrow();
+    expect(ctx.peekMessages()).toHaveLength(0);
+  });
+
+  it('按**对象身份**移除,messages 被重排也正确 —— 压缩会重建那个数组', async () => {
+    // 压缩把 this.messages 整个重建、再把 currentTurn 的消息追加到末尾。
+    // 按位置截尾的实现在压缩发生过之后就会切错行 —— 而那不报错,
+    // 只表现成「历史里多出或少了几条消息」
+    const ctx = makeContext();
+    ctx.addSystemMessage('系统');
+    await ctx.addUserMessage('问题');
+    ctx.addAssistantMessage('查一半', [{ id: 'c1', name: 'f', args: {} }]);
+
+    // 模拟压缩重建:顺序变了,但对象还是同一批引用
+    const msgs = (ctx as any).messages as any[];
+    (ctx as any).messages = [msgs[1], msgs[0], msgs[2]];
+
+    ctx.discardCurrentTurn();
+
+    const left = ctx.peekMessages();
+    expect(left).toHaveLength(1);
+    expect(left[0].role).toBe('system');
+  });
+});

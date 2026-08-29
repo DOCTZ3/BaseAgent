@@ -20,7 +20,7 @@
 // 配置参数见：.env.example 的 RETRY_* 部分
 // ============================================
 
-import { BaseAgentError } from './errors.js';
+import { BaseAgentError, isAbortError } from './errors.js';
 
 /**
  * 显式可重试错误：业务层主动抛出以请求重试
@@ -152,6 +152,18 @@ export class RetryHandler {
    * 匹配顺序：显式标记 → 错误码 / 状态码 / 消息子串
    */
   private isRetryable(error: unknown): boolean {
+    // 用户主动中断**永远不重试**,而且这条判断必须在最前面。
+    //
+    // 这不是优化,是修一个会让「停止」变成反效果的 bug:中断抛出的
+    // APIUserAbortError 带 message「Request was aborted.」——
+    // 里面没有可重试特征,但只要将来有人往 retryableErrors 里加了 'abort'
+    // 或 'canceled' 之类的词,点一次停止就会打出三次新请求。
+    // 那时的表现是「越点停止越忙」,而账单上才看得见。
+    // 显式挡在这里,与 retryableErrors 的内容彻底解耦。
+    if (isAbortError(error)) {
+      return false;
+    }
+
     if (error instanceof RetryableError) {
       return true;
     }

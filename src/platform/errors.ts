@@ -69,3 +69,34 @@ export class MaxStepsExceededError extends BaseAgentError {
     super(`达到最大步数限制 ${steps}`, 'MAX_STEPS_EXCEEDED', false);
   }
 }
+
+/**
+ * 用户主动中断 —— **不是**失败
+ *
+ * 单独一个类型而不复用 LLMError:两者的处置完全相反。
+ * 失败要重试、要告警、要在界面上标红;中断要立刻停手、安静收场。
+ * 混在一起的话点一次「停止」会看到一条红色报错,像是自己把程序弄坏了。
+ */
+export class AbortedError extends BaseAgentError {
+  constructor(message = '已中断') {
+    super(message, 'ABORTED', false);
+  }
+}
+
+/**
+ * 判断一个错误是不是「中断」
+ *
+ * 认两个 name:
+ * - `AbortError` —— DOM 标准(fetch / AbortController 抛的就是它)
+ * - `APIUserAbortError` —— openai SDK 的包装
+ * 按 name 而不是 instanceof:错误跨了 SDK 边界,instanceof 依赖同一份类定义,
+ * 而 SDK 升级或多副本安装都会让它静默失效。
+ *
+ * 放在 platform 层是有意的 —— RetryHandler 要用它,而 platform 不该 import SDK。
+ * 认 name 就不需要那个依赖。
+ */
+export function isAbortError(error: unknown): boolean {
+  if (error instanceof AbortedError) return true;
+  const name = (error as { name?: unknown })?.name;
+  return name === 'AbortError' || name === 'APIUserAbortError';
+}

@@ -414,6 +414,38 @@ export class ContextManager {
   }
 
   /**
+   * 丢弃当前 Turn —— 用户中断时调用
+   *
+   * 中断的轮次**不该留下任何痕迹**:它既不落盘,也不能留在内存里,
+   * 否则下一轮 addUserMessage() 会把它封进 turns,模型于是看到
+   * 「提问 → 调了几个工具 → 没有结论」—— 很可能以为自己上次没答完而接着干,
+   * 而用户停它恰恰是不想要那个结果。
+   *
+   * 按**对象身份**移除而不是截尾:currentTurn.messages 里的对象与
+   * this.messages 里的是同一批引用(addUserMessage/addAssistantMessage
+   * 都往两处 push 同一个对象)。压缩会重建 this.messages 并把 currentTurn
+   * 的消息重新追加到末尾(见 compress),位置假设不牢靠,身份判断则总是对的。
+   *
+   * **不回退 turnCounter**:留个空号无害,而回退会让下一轮拿到同一个 id ——
+   * 那正是压缩截短 turns 数组时踩过的撞号 bug(归档文件互相覆盖、
+   * 主题映射错乱,全部静默)。
+   */
+  discardCurrentTurn(): void {
+    if (!this.currentTurn) return;
+
+    const doomed = new Set<Message>(this.currentTurn.messages);
+    const before = this.messages.length;
+    this.messages = this.messages.filter(m => !doomed.has(m));
+
+    this.config.logger.info('已丢弃中断的轮次', {
+      turn_id: this.currentTurn.turn_id,
+      dropped_messages: before - this.messages.length,
+    });
+
+    this.currentTurn = null;
+  }
+
+  /**
    * 完成当前 Turn
    */
   private finalizeTurn() {

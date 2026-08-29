@@ -89,6 +89,17 @@ export interface LLMRequest {
    * 只有主循环需要。adapter 级开关会让那三类调用也白走流式路径。
    */
   onDelta?: DeltaSink;
+  /**
+   * 中断信号 —— 传下去就能**立即**掐掉正在进行的 HTTP 请求
+   *
+   * openai SDK 的 RequestOptions 支持它,流式也会当场断开。
+   * 没有它的话「停止」最快也只能等当前这一步跑完(十几秒到一分钟),
+   * 而用户点停止时想要的是马上停。
+   *
+   * 中断后 SDK 抛 APIUserAbortError。它**不能**落进重试分支 ——
+   * 否则点一次停止会触发三次重试,变成「越停越忙」。
+   */
+  signal?: AbortSignal;
 }
 
 // LLM 响应(内部格式)

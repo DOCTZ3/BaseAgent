@@ -89,7 +89,7 @@ function makeRunner(
   return new LocalSubAgentRunner(client, parentRegistry, {
     parentSessionId: 'test-parent',
     logger,
-    signal: new AbortController().signal,
+    getSignal: () => new AbortController().signal,
     onConfirmRequired: async () => true,
     inherited,
     environment,
@@ -218,7 +218,7 @@ describe('子 agent 配额与取消', () => {
     const runner = new LocalSubAgentRunner(scriptedClient(), registry, {
       parentSessionId: 'test-parent',
       logger,
-      signal: new AbortController().signal,
+      getSignal: () => new AbortController().signal,
       onConfirmRequired: async () => true,
       inherited: FULL_INHERITED,
       environment,
@@ -247,7 +247,7 @@ describe('子 agent 配额与取消', () => {
     const runner = new LocalSubAgentRunner(scriptedClient(), registry, {
       parentSessionId: 'test-parent',
       logger,
-      signal: aborted.signal,
+      getSignal: () => aborted.signal,
       onConfirmRequired: async () => true,
       inherited: FULL_INHERITED,
       environment,

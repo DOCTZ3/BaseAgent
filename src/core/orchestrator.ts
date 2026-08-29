@@ -2,14 +2,32 @@
 // Core 层:主循环 Orchestrator(集成 Context 管理)
 // ============================================
 
-import { LLMClient, Message, LLMDelta } from './llm-client.js';
+import { LLMClient, Message, LLMDelta, LLMResponse } from './llm-client.js';
 import { ToolRunner, ToolRegistry } from '../tools/index.js';
-import { Logger, MaxStepsExceededError } from '../platform/index.js';
+import { Logger, MaxStepsExceededError, isAbortError } from '../platform/index.js';
 import { ContextManager } from './context.js';
+
+/**
+ * 中断时返回的正文
+ *
+ * 必须有内容而不是空串:空串会让展示层走「无回答」那条兜底路径,
+ * 与 no_response 混在一起。这句话本身也是给用户的确认 ——
+ * 点了停止之后屏幕上得有东西说明「确实停了」。
+ */
+const ABORT_NOTE = '已停止。';
 
 export interface OrchestratorConfig {
   maxSteps: number;
   logger: Logger;
+  /**
+   * 中断信号 —— 传下去 LLM 请求才能被**立即**掐掉
+   *
+   * 注意它是**每轮**的,不是会话级的:AbortController 一旦 abort 就永久失效,
+   * 会话级那一个用过一次之后,后续每轮的请求都会带着已中止的信号发出去 ——
+   * 表现成「点过一次停止,这个会话再也发不出请求」。
+   * 所以取的是函数而非 AbortSignal 本身,由 session 每轮换一个新的。
+   */
+  getSignal?: () => AbortSignal | undefined;
   context?: ContextManager;  // 可选的上下文管理器
   modelKey?: 'main' | 'fast' | 'reasoning';  // 指定使用哪个模型配置
   // trace 标签前缀。默认 'main-loop'，子 agent 传 'subagent:<id>'，
@@ -77,8 +95,12 @@ export interface AgentRunResult {
    * 而没有任何东西指向 max_tokens。它也必须与 no_response 分开 ——
    * 开着思维链且预算给小时,预算会被思维链吃光、content 为空,
    * 那时报「模型无有效响应」是错的归因:模型响应了,是我们没给它说完的余量。
+   *
+   * aborted 是**用户主动中断**,不是失败。它必须是一条正常的退出路径而不是
+   * 异常:走异常的话界面会标红、日志报 error —— 用户只是点了「停止」,
+   * 那看起来像自己把程序弄坏了。而且异常会丢掉已经生成的半截内容。
    */
-  stopReason: 'complete' | 'max_steps' | 'no_response' | 'truncated';
+  stopReason: 'complete' | 'max_steps' | 'no_response' | 'truncated' | 'aborted';
   steps: number;   // 主循环实际执行的步数（收尾调用不计入）
 }
 
@@ -248,6 +270,14 @@ export class Orchestrator {
     this.config.logger.info('开始主循环', { maxSteps: this.config.maxSteps });
 
     while (step < this.config.maxSteps) {
+      // 每步开头查一次:中断可能发生在**上一步的工具执行期间**,
+      // 而工具错误一律包成 ToolResult 不抛异常(项目约定),
+      // 所以那种中断不会经由下面的 catch —— 不查这里就会白跑一整步
+      if (this.config.getSignal?.()?.aborted) {
+        this.config.logger.info('本轮已中断', { steps: step });
+        return this.finish({ answer: ABORT_NOTE, stopReason: 'aborted', steps: step });
+      }
+
       step++;
       this.config.logger.debug(`主循环步骤 ${step}/${this.config.maxSteps}`);
       this.emit({ type: 'step', step, maxSteps: this.config.maxSteps });
@@ -255,16 +285,30 @@ export class Orchestrator {
       // 准备 Prompt（触发压缩检查）
       const currentMessages = context ? await context.preparePrompt() : messages;
 
-      // 调用 LLM
-      const response = await this.llmClient.complete({
-        messages: currentMessages,
-        tools: this.toolRegistry.getAllDescriptions(),
-        traceLabel: `${this.config.traceLabelPrefix ?? 'main-loop'}:step-${step}`,
-        // 没有 onEvent 就不传 onDelta —— adapter 据此走非流式路径。
-        // 不做成「总是流式、只是没人听」:流式多一层分片累积,
-        // 而且 usage 要靠 stream_options 额外索要,没必要为不展示的调用付这些
-        onDelta: this.deltaSink(),
-      });
+      // 调用 LLM。中断是**正常退出**而非异常:走异常的话界面标红、
+      // 日志报 error,而用户只是点了停止 —— 那看起来像自己把程序弄坏了
+      let response: LLMResponse;
+      try {
+        response = await this.llmClient.complete({
+          messages: currentMessages,
+          tools: this.toolRegistry.getAllDescriptions(),
+          traceLabel: `${this.config.traceLabelPrefix ?? 'main-loop'}:step-${step}`,
+          // 没有 onEvent 就不传 onDelta —— adapter 据此走非流式路径。
+          // 不做成「总是流式、只是没人听」:流式多一层分片累积,
+          // 而且 usage 要靠 stream_options 额外索要,没必要为不展示的调用付这些
+          onDelta: this.deltaSink(),
+          // 每步都重新取:signal 是每轮换的(见 getSignal 的注释),
+          // 在 loop 外面取一次会让后续轮次拿到上一轮那个已中止的
+          signal: this.config.getSignal?.(),
+        });
+      } catch (error) {
+        // 只接中断,其余错误照旧往上抛 —— 把 API 故障也吞成「已停止」
+        // 会让真正的失败无声消失,那比报错难查得多
+        if (!isAbortError(error)) throw error;
+
+        this.config.logger.info('请求被中断', { steps: step });
+        return this.finish({ answer: ABORT_NOTE, stopReason: 'aborted', steps: step });
+      }
 
       // 记录 Token 使用量（如果有 Context）
       // 整个 usage 直接透传：逐字段列举时新增字段会被静默丢掉
@@ -467,6 +511,9 @@ export class Orchestrator {
         messages: currentMessages,
         // 刻意不传 tools
         traceLabel: `${prefix}:final-wrap`,
+        // 收尾调用也要能被打断:它同样是一次完整的 LLM 请求(可能几十秒),
+        // 漏掉这里的话「点了停止还在转圈」
+        signal: this.config.getSignal?.(),
       });
 
       // 整个 usage 透传，理由同主循环那一处
@@ -492,6 +539,13 @@ export class Orchestrator {
       return this.finish({ answer: response.content, stopReason: 'max_steps', steps: step });
 
     } catch (error) {
+      // 中断要先接住,否则会被下面包成 MaxStepsExceededError ——
+      // 那是**错的归因**:用户点了停止,而界面会显示「达到最大步数限制」
+      if (isAbortError(error)) {
+        this.config.logger.info('收尾调用被中断', { steps: step });
+        return this.finish({ answer: ABORT_NOTE, stopReason: 'aborted', steps: step });
+      }
+
       // 收尾本身失败（网络/限流）→ 没有任何可返回的内容，退回抛错。
       // MaxStepsExceededError 因此保留用途，只是从「必然抛出」变成「极少抛出」
       this.config.logger.error('收尾调用失败', {

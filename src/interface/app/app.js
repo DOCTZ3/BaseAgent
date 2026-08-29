@@ -32,7 +32,49 @@
     stop: $('btn-stop'),
     wsLabel: $('ws-label'),
     sideList: $('side-list'),
+    toBottom: $('btn-to-bottom'),
   };
+
+  // ---------- 滚动 ----------
+  //
+  // 这三个函数**只有一份**,不各处直接写 scrollTop = scrollHeight。
+  // 原先是后者:六处散落的赋值,而「贴底判定」只存在于 newTurn 的闭包里 ——
+  // 于是新增一个滚动点就会漏掉按钮状态的同步,表现成「已经到底了按钮还亮着」。
+
+  /** 距底 80px 以内算「贴着底部」。给余量是因为流式期间高度一直在变 */
+  const BOTTOM_SLACK = 80;
+
+  const atBottom = () =>
+    els.stream.scrollHeight - els.stream.scrollTop - els.stream.clientHeight
+      <= BOTTOM_SLACK;
+
+  /** 无条件滚到底,并同步按钮 */
+  function scrollToBottom() {
+    els.stream.scrollTop = els.stream.scrollHeight;
+    syncToBottomBtn();
+  }
+
+  /**
+   * 只在用户本来就贴着底部时才跟随
+   *
+   * 无条件跟随会让用户往上翻看历史时被一直拽回来 —— 而多步任务里
+   * 流式输出持续几十秒,那期间根本没法读前面的内容
+   */
+  function follow() {
+    if (atBottom()) els.stream.scrollTop = els.stream.scrollHeight;
+    syncToBottomBtn();
+  }
+
+  /** 按钮只在往上翻走之后出现:贴底时它没用,常驻会挡住右下角的正文 */
+  function syncToBottomBtn() {
+    if (els.toBottom) els.toBottom.hidden = atBottom();
+  }
+
+  els.stream.addEventListener('scroll', syncToBottomBtn);
+  els.toBottom?.addEventListener('click', () => {
+    els.stream.scrollTo({ top: els.stream.scrollHeight, behavior: 'smooth' });
+    // 平滑滚动是异步的,scroll 事件会在滚动过程中把按钮点掉,不必手动同步
+  });
 
   // ---------- 一轮的渲染状态 ----------
   //
@@ -56,11 +98,9 @@
     let buf = '';          // 正文原文。done 时用它做一次性 Markdown 渲染
     const tools = new Map();   // id → 标签节点
 
-    const atBottom = () =>
-      els.stream.scrollHeight - els.stream.scrollTop - els.stream.clientHeight < 80;
-
-    // 只在用户本来就贴着底部时才跟随。否则用户往上翻看历史会被一直拽回来
-    const follow = () => { if (atBottom()) els.stream.scrollTop = els.stream.scrollHeight; };
+    // atBottom / follow 用模块级那一份(见文件顶部的「滚动」段)。
+    // 这里原先有一份同名的闭包实现 —— 两份并存时「回到底部」按钮的状态
+    // 同步只发生在其中一份里,表现成「已经到底了按钮还亮着」
 
     /** 短推理的字数上限 —— 到此为止不给折叠块 */
     const THINK_FLAT = 80;
@@ -235,14 +275,19 @@
           // (有正文、无工具调用),不提示的话只表现成「话说到一半就没了」,
           // 而设置里那个数值框是唯一的解释
           note(wrap, '回答被「单次生成上限」截断,内容不完整。可在设置里调大该值。', true);
+        } else if (stopReason === 'aborted') {
+          // **不标红**:中断是用户自己要求的,不是故障。
+          // 标红会让人以为「停止」这个动作出了错
+          note(wrap, '已停止。');
         }
-        els.stream.scrollTop = els.stream.scrollHeight;
+        // 收尾无条件滚到底:这里是本轮的结论,即使用户翻上去了也该带他回来
+        scrollToBottom();
       },
 
       fail(message) {
         if (answer) answer.classList.remove('streaming');
         note(wrap, message, true);
-        els.stream.scrollTop = els.stream.scrollHeight;
+        scrollToBottom();
       },
     };
   }
@@ -269,7 +314,7 @@
     wrap.className = 'msg';
     note(wrap, text, isError);
     els.stream.appendChild(wrap);
-    els.stream.scrollTop = els.stream.scrollHeight;
+    scrollToBottom();
   }
 
   // ---------- 历史渲染 ----------
@@ -371,6 +416,13 @@
     bubble.className = 'msg user';
     bubble.textContent = text;
     els.stream.appendChild(bubble);
+
+    // 发送即归位,**无条件**滚到底(不走 follow)。
+    //
+    // 用 follow 的话:用户翻上去看旧内容、然后直接在输入框打字发送,
+    // 视口会停在原处 —— 自己刚发的那条在屏幕外,看起来像「发送没反应」。
+    // 主动发消息就是明确表达了「我要看接下来发生什么」,这时拽回底部不算打扰。
+    scrollToBottom();
 
     els.input.value = '';
     els.input.style.height = 'auto';
@@ -589,6 +641,10 @@
     hint.className = 'empty';
     hint.textContent = '描述你要做的事,agent 会自己决定用什么工具。';
     els.stream.appendChild(hint);
+    // 清空后必须同步按钮:内容从「很长且翻在中间」变成一句提示,
+    // 而 scroll 事件在内容缩短时不保证触发 —— 漏掉就是空会话上挂着一个
+    // 点了没反应的「回到底部」
+    syncToBottomBtn();
   }
 
   /** 把一份历史画进对话区 */
@@ -599,7 +655,8 @@
       clearStream();
     } else {
       for (const t of turns) renderHistoryTurn(t);
-      els.stream.scrollTop = els.stream.scrollHeight;
+      // 打开历史落在最新一轮:那是用户要接着聊的地方,而不是几十轮之前
+      scrollToBottom();
     }
     markActive();
   }

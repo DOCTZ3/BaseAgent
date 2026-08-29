@@ -326,7 +326,19 @@ export async function createAgentSession(
   }
   if (config.subAgent.enabled) registry.register(new SpawnSubAgentTool());
 
-  const abortController = new AbortController();
+  /**
+   * 中断控制器 —— **每轮一个**,不是整个会话一个
+   *
+   * AbortController 一旦 abort 就**永久失效**。会话级只建一个的话:
+   * 用户点过一次「停止」之后,这个会话里后续每一次 LLM 请求和工具调用
+   * 都带着那个已中止的信号发出去 —— 表现成「点过一次停止,之后什么都跑不了」,
+   * 而且不报错,只是每一步都立刻返回。
+   *
+   * 所以下游一律拿 getSignal() 现取,而不是存一份 AbortSignal。
+   * run() 在开头换新的,abort() 只作用于当前这一轮。
+   */
+  let runAbort = new AbortController();
+  const getSignal = () => runAbort.signal;
   const onConfirmRequired = options.onConfirm;
 
   // ---------- LLM ----------
@@ -566,7 +578,9 @@ export async function createAgentSession(
     ? new LocalSubAgentRunner(llmClient, registry, {
         parentSessionId: sessionId,
         logger,
-        signal: abortController.signal,
+        // 传取信号的**函数**,不传 AbortSignal —— 子 agent runner 也是会话级的,
+        // 存一份就会在用户点过一次停止之后永久失效
+        getSignal,
         onConfirmRequired,
         inherited,
         environment,
@@ -580,7 +594,7 @@ export async function createAgentSession(
     ...inherited,
     sessionId,
     logger,
-    signal: abortController.signal,
+    getSignal,
     onConfirmRequired,
     subAgentRunner,
   });
@@ -593,6 +607,9 @@ export async function createAgentSession(
     maxSteps: config.execution.maxSteps,
     logger,
     context,
+    // 主循环靠它把信号传进每次 LLM 请求 —— 没有这条,「停止」最快也只能
+    // 等当前这步跑完(十几秒到一分钟)
+    getSignal,
   });
 
   // ---------- 长期记忆 ----------
@@ -721,10 +738,33 @@ export async function createAgentSession(
     notices,
 
     async run(input: string, onEvent?: AgentEventSink) {
+      // 换一个新的 controller —— 这一行是「停止」能反复用的全部原因。
+      // 不换的话上一轮 abort 过的信号会一直生效,后续每轮的请求
+      // 一发出去就被立刻掐掉,表现成「点过一次停止,之后什么都跑不了」
+      runAbort = new AbortController();
+
       const result = await orchestrator.run(
         [{ role: 'user', content: input }],
         onEvent,
       );
+
+      // 被中断的轮次**整轮丢掉**,既不落盘也不进记忆。
+      //
+      // 必须在 persistNewTurns() 之前:那个函数遍历 peekTurns(),
+      // 而 peekTurns 会把「已有 assistant 消息」的 currentTurn 也算进去 ——
+      // 也就是说跑过几步工具再停的轮次会被写进 turns.jsonl,
+      // 成为一条没有结论的半截历史。
+      //
+      // 丢掉也是为了下一轮:留在内存里的话 addUserMessage() 会把它封进 turns,
+      // 模型看到「提问 → 调了几个工具 → 没有结论」,很可能接着往下干 ——
+      // 而用户点停止恰恰是不想要那个结果。
+      //
+      // 代价是明确的:那一轮的 token 已经付过,工具抓到的东西也一起没了。
+      // 这是用户的选择 —— 停掉的东西不留痕。
+      if (result.stopReason === 'aborted') {
+        context.discardCurrentTurn();
+        return result;
+      }
 
       // 历史落盘。**在记忆抽取之前**且同步做完:抽取是 void 不 await 的,
       // 而这一步必须在 run() 返回前完成 —— 用户可能立刻关窗口
@@ -744,7 +784,10 @@ export async function createAgentSession(
     },
 
     abort() {
-      abortController.abort();
+      // 只中止**当前这一轮**。下一轮 run() 会换一个新的 controller ——
+      // 不换的话点过一次停止之后整个会话都发不出请求了(AbortController
+      // 一旦 abort 就永久失效)
+      runAbort.abort();
     },
 
     async dispose() {

@@ -52,7 +52,23 @@
   </aside>
 
   <div class="main-col">
-    <main id="stream" class="stream"></main>
+    <!--
+      对话箱体
+
+      为什么给对话区加一层边框而不是让它铺满主区:铺满时内容从窗口边缘直接
+      开始、也直接到底,视觉上没有「这段到此为止」的界线 —— 于是最后一条
+      离输入框只有几像素,分不清哪里是内容尽头、哪里是控件。
+      箱体同时是「回到底部」按钮的定位基准(position: relative)。
+    -->
+    <div class="stream-box" id="stream-box">
+      <main id="stream" class="stream"></main>
+
+      <!--
+        回到底部。只在用户往上翻走之后出现 —— 常驻会挡住右下角的正文,
+        而贴着底部时它没有任何用处。
+      -->
+      <button class="to-bottom" id="btn-to-bottom" title="回到最新" hidden>↓</button>
+    </div>
 
     <footer class="composer">
       <textarea id="input" rows="1" placeholder="描述你要做的事…  (Enter 发送,Shift+Enter 换行)"></textarea>

@@ -135,7 +135,7 @@ function orchestratorWith(client: LLMClient) {
   const runner = new ToolRunner(registry, {
     sessionId: 'test-budget',
     logger,
-    signal: new AbortController().signal,
+    getSignal: () => new AbortController().signal,
     onConfirmRequired: async () => false,
     allowDangerousTools: false,
     fsGrants: [],
