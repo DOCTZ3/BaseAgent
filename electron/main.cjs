@@ -214,7 +214,23 @@ ipcMain.handle('agent:run', async (_e, runId, input) => {
     // 用局部的 s,不用全局 session:重建可能在这一轮进行中发生,
     // 那样 session 会被换掉而这一轮该跑在它原来那个上
     const result = await s.run(input, send);
-    return { stopReason: result.stopReason, answer: result.answer };
+    return { ok: true, stopReason: result.stopReason, answer: result.answer };
+  } catch (err) {
+    // 失败**当成正常返回值**回去,不让异常穿过 IPC。两个理由:
+    //
+    // ① Electron 序列化异常时只带 message,自定义字段(LLMError.detail)会被丢掉 ——
+    //    而 detail 里正是服务端的原话(如「Output data may contain inappropriate
+    //    content.」= 输出被内容审查拦下),丢了就又回到「只显示 LLM API 调用失败」
+    // ② 它还会给消息加上「Error invoking remote method 'agent:run':」前缀,
+    //    那半截是实现细节,不该出现在用户眼前
+    console.error('本轮执行失败', err);
+    return {
+      ok: false,
+      error: err && err.message ? err.message : String(err),
+      // 服务端原话。渲染进程只把它当文本显示,不做任何解析
+      detail: err && err.detail ? String(err.detail) : undefined,
+      code: err && err.code ? String(err.code) : undefined,
+    };
   } finally {
     currentRunId = null;
   }
@@ -270,10 +286,20 @@ ipcMain.handle('agent:info', async () => {
     workspace: c.workspace || '',
     pythonEnabled: c.python.enabled,
     allowDangerousTools: c.security.allowDangerousTools,
-    // 实际生效值(三个条件的合成),不是用户勾的那个
+    // shell 要给**两个**值,不能只给一个:
+    // - shellEnabled 是实际生效值(shell.enabled && workspace && allowDangerousTools 的合成)
+    // - shellConfigured 是用户勾的那个原始值
+    // 只给合成值会静默丢配置:勾了 shell 但没勾「允许危险工具」时,
+    // 面板回填成未勾选,用户下次保存就把自己存的 true 写成了 false
     shellEnabled: s.info.shellEnabled,
+    shellConfigured: c.shell.enabled,
     subAgentEnabled: c.subAgent.enabled,
     memoryEnabled: c.memory.enabled,
+    // 运行参数:给**实际生效值**。maxTokens 未配时是 undefined,
+    // 原样传出去让面板显示空(= 走默认),不要兜成 0
+    maxTokens: c.models.main.maxTokens,
+    maxSteps: c.execution.maxSteps,
+    enableThinking: c.models.main.enableThinking,
     // 只给掩码。明文 key 不进渲染进程 —— 那里跑着不可信内容
     apiKeyMasked: maskKey(c.models.main.apiKey),
   };
@@ -311,9 +337,19 @@ ipcMain.handle('config:get', async () => {
 
 ipcMain.handle('config:save', async (_e, patch) => {
   const { writeConfigFile } = await loadConfigStore();
-  writeConfigFile(patch);
+
+  // 校验失败要**当成正常返回值**回去,不能让异常穿过 IPC:
+  // Electron 会把抛出的 Error 包成
+  // 「Error invoking remote method 'config:save': Error: 单次生成上限应在…」——
+  // 前缀那半截是实现细节,而这条消息是直接给用户看的
+  try {
+    writeConfigFile(patch);
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+
   // 不假装热更新:改完要重建会话才生效(见 config-store 顶部说明)
-  return { needsRestart: true };
+  return { ok: true, needsRestart: true };
 });
 
 /**

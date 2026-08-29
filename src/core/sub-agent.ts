@@ -192,7 +192,11 @@ export class LocalSubAgentRunner implements SubAgentRunner {
       const run = await orchestrator.run([{ role: 'user', content: userContent }]);
 
       const stats = context.getStats();
-      const truncated = run.stopReason === 'max_steps';
+      // max_tokens 截断也算 truncated —— 语义是「这个答案不完整」,
+      // 而不是「因为步数不够」。漏掉 'truncated' 的话主 agent 会把
+      // 停在半句的回答当成定论用,而那正是这个字段存在的理由
+      const truncated =
+        run.stopReason === 'max_steps' || run.stopReason === 'truncated';
 
       logger.info('子 agent 完成', {
         sub_agent_id: subAgentId,

@@ -70,8 +70,15 @@ export interface AgentRunResult {
    * complete    正常给出最终回答
    * max_steps   触达步数上限、由收尾调用产出结论（结论可能不完整）
    * no_response 模型既无工具调用也无内容
+   * truncated   生成被 max_tokens 截断，回答停在半句
+   *
+   * truncated 必须与 complete 分开:被截断的回答**看起来**是正常回答
+   * (有内容、无工具调用),混在一起的话用户只会看到「话说到一半就没了」,
+   * 而没有任何东西指向 max_tokens。它也必须与 no_response 分开 ——
+   * 开着思维链且预算给小时,预算会被思维链吃光、content 为空,
+   * 那时报「模型无有效响应」是错的归因:模型响应了,是我们没给它说完的余量。
    */
-  stopReason: 'complete' | 'max_steps' | 'no_response';
+  stopReason: 'complete' | 'max_steps' | 'no_response' | 'truncated';
   steps: number;   // 主循环实际执行的步数（收尾调用不计入）
 }
 
@@ -351,9 +358,25 @@ export class Orchestrator {
         continue;
       }
 
+      // 生成被 max_tokens 截断。
+      //
+      // 这个字段原先**没人看** —— 被截断的回答有内容、无工具调用,
+      // 与正常回答完全同形,于是走 complete 通道返回,用户只看到
+      // 「话说到一半就没了」,而没有任何东西指向 max_tokens。
+      // 实测触发条件很容易达到:把单次生成上限调到 256 且开着思维链,
+      // 预算会先被思维链吃掉,正文一个字都出不来
+      const cut = response.finishReason === 'length';
+
       // 无工具调用 + 有内容 → 任务完成
       if (response.content) {
-        this.config.logger.info('任务完成', { steps: step });
+        if (cut) {
+          this.config.logger.warn('回答被 max_tokens 截断', {
+            steps: step,
+            completion_tokens: response.usage?.completion_tokens,
+          });
+        } else {
+          this.config.logger.info('任务完成', { steps: step });
+        }
 
         // 记录最终回复：压缩后重建保留轮次时，这是答案的唯一来源
         if (context) {
@@ -372,7 +395,33 @@ export class Orchestrator {
           this.config.logger.info('会话统计', stats);
         }
 
-        return this.finish({ answer: response.content, stopReason: 'complete', steps: step });
+        // 半截回答仍然**原样返回** —— 它是模型真实产出的一部分,
+        // 丢掉等于让用户白等一轮。区别只在 stopReason 上,由展示层说明原因
+        return this.finish({
+          answer: response.content,
+          stopReason: cut ? 'truncated' : 'complete',
+          steps: step,
+        });
+      }
+
+      // 无工具调用 + 无内容 + 被截断 → 预算被思维链吃光,正文没轮到
+      //
+      // 必须与下面的 no_response 分开:那句「模型无有效响应」在这里是**错的归因**。
+      // 模型响应了,是我们没给它说完的余量 —— 而这两种情况的处置完全相反
+      // (一个该查模型/提示,一个该调大 max_tokens 或关掉思维链)
+      if (cut) {
+        this.config.logger.warn('生成预算耗尽,正文为空', {
+          steps: step,
+          completion_tokens: response.usage?.completion_tokens,
+          // 扁平字段:嵌套的 completion_tokens_details 由 adapter 吸收掉了
+          reasoning_tokens: response.usage?.reasoning_tokens,
+        });
+        return this.finish({
+          answer: '任务未完成:生成预算(max_tokens)已耗尽,正文未能输出。'
+            + '请调大「单次生成上限」,或关闭「输出思考过程」。',
+          stopReason: 'truncated',
+          steps: step,
+        });
       }
 
       // 无工具调用 + 无内容 → 模型无有效响应

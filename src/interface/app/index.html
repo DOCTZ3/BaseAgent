@@ -106,6 +106,33 @@
       <label class="row"><input type="checkbox" id="cfg-subagent"> 子 agent</label>
       <label class="row"><input type="checkbox" id="cfg-memory"> 长期记忆</label>
     </section>
+
+    <!--
+      这一组与上面几组的区别:填错了**看不见**。
+      模型名填错马上报错、工作区没选马上有告警,而这三项填错只表现成
+      「回答莫名被截断」「任务半途停下」「变慢」—— 所以每一项都要
+      写出默认值和范围,留空即回落。
+    -->
+    <section>
+      <h3>运行参数 <span class="hint">留空 = 用默认值</span></h3>
+
+      <label>单次生成上限
+        <input type="number" id="cfg-maxtokens" min="256" max="200000" step="256"
+               placeholder="(默认:不限制,由服务端决定)">
+        <span class="hint">思维链<strong>计入</strong>这个预算 —— 给小了正文会空。压缩摘要默认跟随它。</span>
+      </label>
+
+      <label>最大工具调用轮数
+        <input type="number" id="cfg-maxsteps" min="1" max="200" step="1"
+               placeholder="(默认:20)">
+        <span class="hint">用满了会中止并标记 max_steps,模型不知道自己被截断。</span>
+      </label>
+
+      <label class="row">
+        <input type="checkbox" id="cfg-thinking"> 输出思考过程
+        <span class="hint">关掉能砍掉首字延迟的大头(实测占等待时间过半),代价是回答质量。</span>
+      </label>
+    </section>
   </div>
 
   <div class="drawer-foot">

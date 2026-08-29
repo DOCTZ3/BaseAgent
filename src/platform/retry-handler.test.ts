@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { RetryHandler, RetryableError } from './retry-handler.js';
+import { LLMError } from './errors.js';
 
 describe('RetryHandler', () => {
   let mockLogger: any;
@@ -216,6 +217,73 @@ describe('RetryHandler', () => {
           max_retries: 1,
         })
       );
+    });
+  });
+
+  // ============================================
+  // LLMError.detail 不得扩大重试匹配范围
+  // ============================================
+  //
+  // detail 存的是**服务端原话**,而 message 只放我们自己的概括。
+  // 拆成两个字段的唯一理由就是这条:原话一旦进 message,
+  // 「ECONNRESET」这类特征会被 isRetryable 匹配到 ——
+  // 而 adapter 内部已经重试过一轮,外层再匹配一次会让总调用数相乘(4×4=16)。
+  //
+  // 所以这批测试盯的是**边界**:detail 里放最毒的特征串,
+  // 断言它一次都不触发重试。这个性质错了不报错,
+  // 只表现成「一次网络抖动打出十六次请求」,而账单上才看得见。
+  describe('detail 字段与重试匹配的隔离', () => {
+    it('detail 里含 ECONNRESET 也**不**触发重试 —— 否则调用次数相乘', async () => {
+      const handler = new RetryHandler({ maxRetries: 3 }, mockLogger);
+      const err = new LLMError('LLM API 调用失败 (APIConnectionError)', true, 'ECONNRESET');
+      const fn = vi.fn().mockRejectedValue(err);
+
+      await expect(handler.execute(fn, 'op')).rejects.toThrow();
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['429', 'rate limit', 'timeout', 'socket hang up', 'overloaded', '503'])(
+      'detail = %s 同样不触发重试',
+      async pattern => {
+        const handler = new RetryHandler({ maxRetries: 3 }, mockLogger);
+        const fn = vi.fn().mockRejectedValue(new LLMError('LLM API 调用失败', true, pattern));
+
+        await expect(handler.execute(fn, 'op')).rejects.toThrow();
+        expect(fn).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('detail 原样保留在抛出的错误上 —— 界面靠它显示原因', async () => {
+      // 实测场景:中转站的输出审查。它不可重试,而「为什么失败」全在这句里
+      const handler = new RetryHandler({ maxRetries: 2 }, mockLogger);
+      const detail = 'Output data may contain inappropriate content.';
+      const fn = vi.fn().mockRejectedValue(new LLMError('LLM API 调用失败 (Error)', true, detail));
+
+      // 标注成 LLMError 而不是让它推断成 unknown:
+      // 下面要读 detail/fullMessage,unknown 上取属性 tsc 直接报错
+      const caught: unknown = await handler.execute(fn, 'op').catch(e => e);
+
+      expect(caught).toBeInstanceOf(LLMError);
+      const llmErr = caught as LLMError;
+      expect(llmErr.detail).toBe(detail);
+      // 概括与原话拼在一起才是给人看的完整描述
+      expect(llmErr.fullMessage).toBe(`LLM API 调用失败 (Error): ${detail}`);
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it('detail 缺省时 fullMessage 退化成 message,不出现悬空的冒号', () => {
+      expect(new LLMError('LLM API 调用失败').fullMessage).toBe('LLM API 调用失败');
+      // 空串也算没有 —— 服务端偶尔给空消息,拼出来会是「...: 」
+      expect(new LLMError('失败', true, '').fullMessage).toBe('失败');
+    });
+
+    it('message 里的特征仍然照常匹配 —— 没把重试能力一起关掉', async () => {
+      // 反向对照:这条失败说明拆字段拆过头了,真正的网络错误不再重试
+      const handler = new RetryHandler({ maxRetries: 2, baseDelay: 1 }, mockLogger);
+      const fn = vi.fn().mockRejectedValue(new Error('connect ECONNRESET 1.2.3.4:443'));
+
+      await expect(handler.execute(fn, 'op')).rejects.toThrow();
+      expect(fn).toHaveBeenCalledTimes(3);   // 首次 + 2 次重试
     });
   });
 });

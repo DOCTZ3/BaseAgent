@@ -27,6 +27,21 @@ export interface DeepSeekConfig {
   baseURL: string;
   model: string;
   enableThinking: boolean;  // 是否开启推理模式
+  /**
+   * 该模型的默认生成上限 / 采样温度 —— 调用方没传时用它们
+   *
+   * 放在 adapter 上而**不是**让每个调用点自己传:原先就是后者,
+   * 结果 MAIN_MAX_TOKENS 和 MAIN_TEMPERATURE 配了等于没配 ——
+   * 主循环那两处 complete() 都没传,请求体里 max_tokens 恒为 undefined
+   * (trace 实证:配了 256,某次输出仍有 14485 个 completion token)。
+   *
+   * 这是本项目栽过四次的同一个形状:models.vision 被 loadConfig 丢掉、
+   * 新增顶层配置段忘了合并、fsGrants 不跟随 workspace,以及这一次。
+   * 共性是**逐字段转发**,而漏掉的那一份不报错。所以默认值收在这里,
+   * 新增调用点不必记得传。
+   */
+  maxTokens?: number;
+  temperature?: number;
   logger: Logger;
   retry?: Partial<RetryConfig>;  // 重试策略(未配置则用 RetryHandler 默认值)
   onTrace?: TraceSink;           // 可观测钩子(未设置则零开销)
@@ -70,8 +85,10 @@ export class DeepSeekAdapter implements LLMClient {
       model: this.config.model,
       messages,
       tools: tools && tools.length > 0 ? tools : undefined,
-      temperature: request.temperature,
-      max_tokens: request.maxTokens,
+      // `??` 而不是 `||`:temperature 的 0 是合法值(要确定性输出时就填 0),
+      // 用真值判断会把它当成「没填」而回落到模型默认的 0.7 —— 静默失效
+      temperature: request.temperature ?? this.config.temperature,
+      max_tokens: request.maxTokens ?? this.config.maxTokens,
       ...(request.responseFormat === 'json_object' ? {
         response_format: { type: 'json_object' as const }
       } : {}),
@@ -173,12 +190,18 @@ export class DeepSeekAdapter implements LLMClient {
         },
       });
 
-      // 关键修复：不透传原始错误消息（会包含网络错误特征如 "ECONNRESET"），
-      // 避免外层 RetryHandler 匹配到并再次重试，导致调用次数相乘（4×4=16）。
-      // 保留错误类型（如 APIConnectionError）方便排查，但消息统一为 "LLM API 调用失败"
+      // 原始消息走 detail，**不进 message**：
+      // message 里出现 "ECONNRESET" 这类特征会被外层 RetryHandler 匹配到、
+      // 再重试一轮，调用次数变成 4×4=16。而 RetryHandler 只看 message/code/status，
+      // 所以 detail 能一路透传到界面，匹配范围一个字节没变宽。
+      //
+      // 原先是把原话整个丢掉 —— 代价是排查线索一起没了：中转站的
+      // 「Output data may contain inappropriate content.」（输出被内容审查拦下）
+      // 与普通网络抖动在界面上长得一模一样，只能去翻 trace 文件才能区分
       throw new LLMError(
         `LLM API 调用失败${error instanceof Error ? ` (${error.name})` : ''}`,
-        true
+        true,
+        error instanceof Error ? error.message : String(error),
       );
     }
   }
@@ -264,11 +287,14 @@ export class DeepSeekAdapter implements LLMClient {
         },
       });
 
-      // 与非流式同一个理由:不透传原始消息(含 ECONNRESET 这类特征),
-      // 否则外层 RetryHandler 会匹配到并再次重试,调用次数相乘
+      // 与非流式同一个理由:原始消息走 detail 而不进 message,
+      // 否则外层 RetryHandler 会匹配到并再次重试,调用次数相乘。
+      // 内容审查(「Output data may contain inappropriate content.」)走的就是这条路 ——
+      // 它发生在流已经开始之后,而那时用户屏幕上已经有半截推理了
       throw new LLMError(
         `LLM API 调用失败${error instanceof Error ? ` (${error.name})` : ''}`,
         true,
+        error instanceof Error ? error.message : String(error),
       );
     }
   }

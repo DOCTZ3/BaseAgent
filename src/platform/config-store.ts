@@ -33,9 +33,18 @@ import type { AgentConfig } from './config.js';
 /**
  * 客户端可配置的项
  *
- * 刻意**只放用户真正需要决定的**。压缩阈值、clip 上限、重试退避那些
- * 仍然只走 .env —— 它们要理解内部机制才填得对,放进界面等于把
- * 「能填错的东西」变多。
+ * 划界的依据是**填错的后果看不看得见**,不是「理解成本高不高」。
+ * 前一批(模型、baseURL、工作区、能力开关)填错马上有反应;
+ * 后一批(maxTokens / maxSteps / enableThinking)填错只表现成
+ * 「回答被截断」「任务半途停下」「变慢」—— 所以它们要显式给出默认值与范围,
+ * 而不是靠用户自己去翻 .env。
+ *
+ * 仍然只走 .env 的:压缩阈值、clip 上限、重试退避、各类路径
+ * (MEMORY_DB_PATH / SANDBOX_VENV_DIR / TRACE_DIR)。前三类要理解内部机制,
+ * 后一类填错会让「模型能改自己的记忆/venv」那几条安全前提失效。
+ *
+ * 数值项的 null 有特殊含义:**删掉这一项**,回落到 .env / 默认值。
+ * 不能用 undefined 表示 —— 那已经被 apiKey 占用为「不修改」了。
  */
 export interface StoredConfig {
   apiKey?: string;
@@ -48,6 +57,54 @@ export interface StoredConfig {
   shellEnabled?: boolean;
   subAgentEnabled?: boolean;
   memoryEnabled?: boolean;
+  /** 主模型单次生成上限。思维链**计入**这个预算 —— 给小了正文会空 */
+  maxTokens?: number | null;
+  /** 主模型是否输出思维链。关掉能砍掉首字延迟的大头,代价是质量 */
+  enableThinking?: boolean;
+  /** 单轮最大工具调用轮数。给小了复杂任务会在半途停下 */
+  maxSteps?: number | null;
+}
+
+/**
+ * 数值项的合法区间(闭区间)
+ *
+ * 校验放在这里而不是只放界面上:界面是渲染进程(跑着不可信内容),
+ * 而这里是所有写入路径的唯一收口。范围本身是为了挡住那种
+ * **不报错的错**:maxSteps=0 会让主循环一步不走就返回 max_steps,
+ * maxTokens=1 会让每次回答都是空的。
+ */
+const NUMERIC_RANGES = {
+  maxTokens: { min: 256, max: 200_000, label: '单次生成上限' },
+  maxSteps: { min: 1, max: 200, label: '最大工具调用轮数' },
+} as const;
+
+/**
+ * 校验一份待写入的配置,返回人话错误列表(空数组 = 通过)
+ *
+ * 不抛异常、返回列表:一次保存里可能有多项都不对,逐项抛会让用户
+ * 改一个、再存、再看下一个报错。
+ */
+export function validateStored(patch: StoredConfig): string[] {
+  const errors: string[] = [];
+
+  for (const [key, range] of Object.entries(NUMERIC_RANGES)) {
+    const v = patch[key as keyof StoredConfig];
+    if (v === undefined || v === null) continue;   // 不修改 / 清空
+
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      errors.push(`${range.label}必须是数字`);
+      continue;
+    }
+    if (!Number.isInteger(v)) {
+      errors.push(`${range.label}必须是整数`);
+      continue;
+    }
+    if (v < range.min || v > range.max) {
+      errors.push(`${range.label}应在 ${range.min}~${range.max} 之间(当前 ${v})`);
+    }
+  }
+
+  return errors;
 }
 
 /**
@@ -95,6 +152,14 @@ export function readConfigFile(): StoredConfig {
  * 但在 macOS/Linux 上是有意义的,而设了不亏。
  */
 export function writeConfigFile(patch: StoredConfig): StoredConfig {
+  // 校验在**写盘之前**。放到界面上不够:渲染进程跑着不可信内容,
+  // 而这里是所有写入路径的唯一收口。范围错的值一旦落盘,
+  // 下次启动会静默生效(maxSteps=0 = 一步不走就返回 max_steps)
+  const errors = validateStored(patch);
+  if (errors.length > 0) {
+    throw new Error(errors.join(';'));
+  }
+
   const file = configFilePath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
 
@@ -104,6 +169,15 @@ export function writeConfigFile(patch: StoredConfig): StoredConfig {
   for (const [k, v] of Object.entries(patch)) {
     // undefined = 不修改(apiKey 留空走这条)。空串是**有意清空**,要保留
     if (v === undefined) continue;
+
+    // null = 删掉这一项,回落到 .env / 默认值。
+    // 数值输入框清空时走这条 —— 存成 null 而不是 0:
+    // 0 是个合法数字,会被当成「用户就要 0」而写进配置
+    if (v === null) {
+      delete (merged as Record<string, unknown>)[k];
+      continue;
+    }
+
     (merged as Record<string, unknown>)[k] = v;
   }
 
@@ -138,7 +212,21 @@ export function toOverrides(stored: StoredConfig): Partial<AgentConfig> {
   if (stored.apiKey) model.apiKey = stored.apiKey;
   if (stored.baseURL) model.baseURL = stored.baseURL;
   if (stored.model) model.model = stored.model;
+
+  // 数值项用 `!= null` 一次挡掉 undefined 和 null —— 两者都表示
+  // 「这里不给值」,由 defaultConfig 从 .env 取。
+  // 不能用真值判断:0 会被当成「没填」,而 0 恰好是最危险的那个值
+  if (stored.maxTokens != null) model.maxTokens = stored.maxTokens;
+  if (stored.enableThinking !== undefined) {
+    model.enableThinking = stored.enableThinking;
+  }
   if (Object.keys(model).length > 0) out.models = { main: model };
+
+  // maxSteps 落在 execution 段,不在 models —— 它是主循环的预算,
+  // 与模型无关(换模型不该重设它)
+  if (stored.maxSteps != null) {
+    out.execution = { maxSteps: stored.maxSteps };
+  }
 
   if (stored.workspace !== undefined) out.workspace = stored.workspace;
 

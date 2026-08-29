@@ -21,6 +21,22 @@
   window.AgentTransport = {
     async run(input, onEvent) {
       const r = await bridge.run(input, onEvent);
+
+      // 主进程把失败当**返回值**回来(见 main.cjs 的 agent:run):
+      // 异常穿过 IPC 会丢掉 LLMError.detail 里的服务端原话,还会带上
+      // 「Error invoking remote method」前缀。在这里翻回异常,
+      // 交给 app.js 那个 catch 统一显示。
+      //
+      // 只认**显式**的 ok === false:mock.js 走的是同一份契约但不带这个字段,
+      // 用真值判断会把每一次成功也当成失败
+      if (r && r.ok === false) {
+        const err = new Error(r.detail ? `${r.error}: ${r.detail}` : r.error);
+        // 原始字段也挂上去,将来要按类型分流(如内容审查单独提示)不必改协议
+        err.detail = r.detail;
+        err.code = r.code;
+        throw err;
+      }
+
       // 一轮跑完刷新侧边栏:新会话要等第一轮落盘之后才会出现在列表里
       // (列表靠扫 turns.jsonl,而那个文件在第一轮结束时才被创建),
       // 已有会话则要更新「N 轮 · 刚刚」。
@@ -34,6 +50,16 @@
   window.AgentConfigApi = {
     async save(patch) {
       const r = await bridge.saveConfig(patch);
+
+      // 校验失败是**正常返回值**(主进程刻意不让异常穿过 IPC —— 那会带上
+      // 「Error invoking remote method」前缀)。在这里翻回异常,
+      // 让 app.js 那个 try/catch 一处统一显示错误。
+      // 不翻的话 ok:false 会一路走到下面的 needsRestart 判断:
+      // 没存上、也不重启,而界面照样报「配置已更新」
+      if (r && r.ok === false) {
+        throw new Error(r.error || '配置校验未通过');
+      }
+
       // 不假装热更新:workspace 派生出 fs 白名单、Python cwd、写边界三样东西,
       // venv 要重新校验、常驻浏览器要重开。所以保存即重建会话
       if (r && r.needsRestart) {

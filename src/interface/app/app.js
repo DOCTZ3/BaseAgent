@@ -230,6 +230,11 @@
           note(wrap, '达到步数上限后收尾,结论可能不完整。');
         } else if (stopReason === 'no_response') {
           note(wrap, '模型未返回有效内容。', true);
+        } else if (stopReason === 'truncated') {
+          // 必须说出原因和**具体改哪一项**:被截断的回答与正常回答同形
+          // (有正文、无工具调用),不提示的话只表现成「话说到一半就没了」,
+          // 而设置里那个数值框是唯一的解释
+          note(wrap, '回答被「单次生成上限」截断,内容不完整。可在设置里调大该值。', true);
         }
         els.stream.scrollTop = els.stream.scrollHeight;
       },
@@ -489,6 +494,16 @@
   ['cfg-shell', 'cfg-danger'].forEach(id =>
     $(id).addEventListener('change', syncShellHint));
 
+  // 「需要重建会话」的提示原先只在选工作区时露出来(applyWorkspace 里)。
+  // 但**每一项**都要重建会话才生效 —— 运行参数尤其看不出来:
+  // 改了 maxSteps 却以为立刻生效,下一轮还是旧预算,而这没有任何反馈。
+  // 用 input 而非 change:数字框里边打字边看到提示,不必等失焦
+  ['cfg-maxtokens', 'cfg-maxsteps'].forEach(id =>
+    $(id).addEventListener('input', () => { $('restart-hint').hidden = false; }));
+  ['cfg-thinking', 'cfg-python', 'cfg-danger', 'cfg-shell', 'cfg-subagent', 'cfg-memory']
+    .forEach(id =>
+      $(id).addEventListener('change', () => { $('restart-hint').hidden = false; }));
+
   $('btn-pick').addEventListener('click', async () => {
     // **不能用 window.prompt()**:Electron 刻意没实现它 —— 调用后什么都不发生
     // 且不报错,表现成「按钮点了没反应」(实测踩到,这里原先就是 prompt)。
@@ -509,6 +524,23 @@
     $('restart-hint').hidden = false;
   }
 
+  /**
+   * 数值输入框 → 存储值
+   *
+   * 空 = null(删掉这一项,回落到 .env / 默认),不是 0 ——
+   * 0 是个合法数字,存进去会被当成「用户就要 0」,而 maxSteps=0
+   * 表现成「主循环一步不走就返回 max_steps」,看起来像卡死。
+   *
+   * 非法输入(number 输入框仍可粘进文字)也回落 null,由后端校验兜底:
+   * 这里返回 NaN 的话 JSON 序列化会变成 null,行为一样但意图不明确
+   */
+  function numOrNull(id) {
+    const raw = $(id).value.trim();
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
   $('btn-save').addEventListener('click', async () => {
     const patch = {
       apiKey: $('cfg-key').value || undefined,   // 留空 = 不修改
@@ -521,6 +553,9 @@
       shellEnabled: $('cfg-shell').checked,
       subAgentEnabled: $('cfg-subagent').checked,
       memoryEnabled: $('cfg-memory').checked,
+      maxTokens: numOrNull('cfg-maxtokens'),
+      maxSteps: numOrNull('cfg-maxsteps'),
+      enableThinking: $('cfg-thinking').checked,
     };
 
     // 保存要重建会话(检依赖、起工具桥)。禁用按钮不只是为了好看:
@@ -650,10 +685,25 @@
       $('cfg-workspace').value = info.workspace || '';
       $('cfg-python').checked = !!info.pythonEnabled;
       $('cfg-danger').checked = !!info.allowDangerousTools;
-      $('cfg-shell').checked = !!info.shellEnabled;
+      // 回填**用户勾的那个原始值**,不是合成后的生效值。
+      // 用 shellEnabled(合成值)的话会静默丢配置:勾了 shell 但没勾
+      // 「允许危险工具」时,面板显示未勾选,用户下次保存就把自己存的
+      // true 写成了 false —— 而这个过程没有任何提示
+      $('cfg-shell').checked = info.shellConfigured !== undefined
+        ? !!info.shellConfigured
+        : !!info.shellEnabled;   // 兼容旧的 info(只有合成值那份)
       $('cfg-subagent').checked = !!info.subAgentEnabled;
       $('cfg-memory').checked = !!info.memoryEnabled;
       $('cfg-key').placeholder = info.apiKeyMasked || '(未配置)';
+
+      // 运行参数回填的是**实际生效值**,而 placeholder 写的是默认值 ——
+      // 两者要能区分:输入框有值 = 显式配过,空 = 走默认。
+      // maxTokens 未配时 info 里是 undefined(不是 0),所以用 != null:
+      // 真值判断会把合法的 0 也当成没配,而那正是最该看见的错值
+      $('cfg-maxtokens').value = info.maxTokens != null ? info.maxTokens : '';
+      $('cfg-maxsteps').value = info.maxSteps != null ? info.maxSteps : '';
+      $('cfg-thinking').checked = info.enableThinking !== false;   // 默认开
+
       syncShellHint();
     },
 

@@ -314,6 +314,13 @@ async function main() {
         );
       } else if (run.stopReason === 'no_response') {
         console.log(`${RED}注意${RESET} 模型未返回有效内容`);
+      } else if (run.stopReason === 'truncated') {
+        // 把当前生效值一并打出来 —— 只说「被截断」的话,用户还得自己去翻
+        // 配置才知道该往上调多少
+        console.log(
+          `${YELLOW}注意${RESET} 回答被 max_tokens 截断` +
+          `(当前 ${session.config.models.main.maxTokens ?? '未设置'}),内容不完整`
+        );
       }
 
       console.log(dim('─── 本轮 LLM 调用 ───'));
@@ -344,8 +351,15 @@ async function main() {
       }
       console.log();
     } catch (error) {
+      // detail 是**独立字段**,不在 message 里(见 LLMError:原话进 message 会被
+      // 外层 RetryHandler 匹配到、让调用次数相乘)。所以这里要单独取,
+      // 否则只显示「LLM API 调用失败」这句概括,服务端说了什么完全看不到
       const msg = error instanceof Error ? error.message : String(error);
+      const detail = (error as { detail?: unknown })?.detail;
       console.error(`\n${RED}执行失败${RESET} ${msg}`);
+      if (typeof detail === 'string' && detail) {
+        console.error(`${dim('  服务端返回:')} ${detail}`);
+      }
       const failed = session.recorder.since(callsBefore);
       if (failed.length > 0) {
         console.error(dim('  相关调用:'));

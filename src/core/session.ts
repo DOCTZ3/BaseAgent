@@ -335,6 +335,12 @@ export async function createAgentSession(
     baseURL: modelConfig.baseURL!,
     model: modelConfig.model,
     enableThinking: modelConfig.enableThinking ?? true,
+    // 这两项**必须**在这里注入,否则主循环的请求体里根本没有它们:
+    // adapter 原先只认 request.maxTokens/temperature,而 orchestrator 两处
+    // complete() 都不传 —— 于是 MAIN_MAX_TOKENS / MAIN_TEMPERATURE 配了等于没配。
+    // trace 实证:配了 256,某次输出仍有 14485 个 completion token
+    maxTokens: modelConfig.maxTokens,
+    temperature: modelConfig.temperature,
     retry: config.retry,
     onTrace: recorder.sink,
     logger,
