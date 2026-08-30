@@ -346,6 +346,14 @@ export class Orchestrator {
         // 写入时就带上，而不是事后回头改历史消息 —— 后者会让 messages 与 Turn 不一致
         const isLastStep = step >= this.config.maxSteps;
 
+        // 本步失败的工具调用数 —— 循环里累计,循环结束后一次性交给 context。
+        //
+        // 必须在这里取:`result.ok` 在这一层是干净的布尔值,而进了
+        // addToolResult 就只剩 JSON.stringify 之后的字符串 ——
+        // 要重新 parse 才能读,而 payload 在最后一步会换形状(塞收尾提示)、
+        // 结果还被 clip 过(截断后不是合法 JSON,parse 直接抛)
+        let stepFailures = 0;
+
         // 依次执行工具(后续可支持并行)
         for (let i = 0; i < response.toolCalls.length; i++) {
           const toolCall = response.toolCalls[i];
@@ -364,6 +372,8 @@ export class Orchestrator {
 
           // 摘要而不是完整结果:工具返回动辄几千字(代码 stdout、文件内容),
           // 展示层要的是「成了没有」。完整数据在 trace 里
+          if (!result.ok) stepFailures++;
+
           this.emit({
             type: 'tool_end',
             id: toolCall.id,
@@ -397,6 +407,11 @@ export class Orchestrator {
             });
           }
         }
+
+        // 一步记一次 —— 不是每个工具调用记一次。
+        // 循环外面调是关键:放进 for 里的话一步并发三个工具就算成 3 步,
+        // 8 步门槛两三步就被撞上(见 ContextManager.recordToolStep 的注释)
+        context?.recordToolStep(stepFailures);
 
         // 继续循环,把工具结果喂回模型
         continue;

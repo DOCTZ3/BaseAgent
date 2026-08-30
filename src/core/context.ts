@@ -224,6 +224,28 @@ export class ContextManager {
   // 不能用 turns 数量反推：turns 要到下一轮开始才递增，新会话第一轮会误报。
   private compressionCount = 0;
 
+  /**
+   * 本轮的工具活动量 —— skill 沉淀的准入判据
+   *
+   * 两个数的**粒度不同**,不能合并:
+   * - toolSteps 一步一次(模型选择行动而非回答)。这是「来回摸索了几次」,
+   *   也是 8 步门槛的单位
+   * - toolFails 按**每次工具调用**累加。一步里可以并发声明多个 tool_calls
+   *
+   * 为什么必须由 orchestrator 推进来、不能在这里自己数:
+   * ① `addToolResult` 每个工具调用都会被调一次 —— 按它计步,
+   *    一步并发三个工具就算成 3,8 步门槛两三步就被撞上
+   * ② `ok` 进了 `addToolResult` 已经是 `JSON.stringify` 之后的字符串,
+   *    要重新 parse 才能读。而 payload 在最后一步会被换成另一种形状
+   *    (塞收尾提示),结果也被 clip 过 —— 截断后不是合法 JSON,parse 直接抛
+   *
+   * 与 compressionCount 同一个先例:观测发生在 orchestrator,存储在这里。
+   * 按轮清零(addUserMessage 是轮边界),中断丢弃时也要清 ——
+   * 不清的话一个跑了六步然后被丢弃的轮次,会让下一个两步的任务凭空够格。
+   */
+  private toolStepsThisTurn = 0;
+  private toolFailsThisTurn = 0;
+
   // 压缩调用的输出预算：显式配置 > 主模型 maxTokens > 内置兜底
   private compressionMaxTokens: number;
   // 压缩输入的逐字段截断上限
@@ -329,6 +351,11 @@ export class ContextManager {
       this.finalizeTurn();
     }
 
+    // 工具活动量按轮清零。这里是唯一的轮边界 ——
+    // 不清的话计数会跨轮累加,一个两步的任务凭空够 8 步的门槛
+    this.toolStepsThisTurn = 0;
+    this.toolFailsThisTurn = 0;
+
     // 开启新 Turn：user 消息是首条，位置本身就是「这是用户提问」的标记
     const userMsg: Message = { role: 'user', content };
     this.messages.push(userMsg);
@@ -414,6 +441,22 @@ export class ContextManager {
   }
 
   /**
+   * 记录一步工具活动 —— 由 orchestrator 在工具分支里调用
+   *
+   * **一步调一次**,不是每个工具调用调一次。调用点在
+   * `if (response.toolCalls.length > 0)` 分支的开头,与 `recordTokenUsage`
+   * 同一个位置层级(都是「一次 LLM 调用之后」)。
+   *
+   * @param failures 本步失败的工具调用数。在 orchestrator 的 for 循环里
+   *   按 `result.ok` 累计后一次性传进来 —— 那里的 ok 是干净的布尔值,
+   *   而进了 addToolResult 就只剩序列化过的字符串
+   */
+  recordToolStep(failures: number): void {
+    this.toolStepsThisTurn += 1;
+    this.toolFailsThisTurn += failures;
+  }
+
+  /**
    * 丢弃当前 Turn —— 用户中断时调用
    *
    * 中断的轮次**不该留下任何痕迹**:它既不落盘,也不能留在内存里,
@@ -440,9 +483,15 @@ export class ContextManager {
     this.config.logger.info('已丢弃中断的轮次', {
       turn_id: this.currentTurn.turn_id,
       dropped_messages: before - this.messages.length,
+      dropped_tool_steps: this.toolStepsThisTurn,
     });
 
     this.currentTurn = null;
+
+    // 计数也要清:被丢弃的轮次可能已经跑了六步,留着会累加到下一轮 ——
+    // 于是一个两步的任务凭空够格触发 skill 沉淀
+    this.toolStepsThisTurn = 0;
+    this.toolFailsThisTurn = 0;
   }
 
   /**
@@ -1367,7 +1416,18 @@ export class ContextManager {
       // 实际执行过的压缩次数（跳过的不计），供上层判断某一轮是否发生压缩
       compressions: this.compressionCount,
       topics: this.topicSummaries.size,
-      tokens: this.tokenCounter.getStats()
+      tokens: this.tokenCounter.getStats(),
+      /**
+       * **本轮**的工具活动量 —— 与上面几项语义不同,故单开一层
+       *
+       * 上面那些是会话累计(total_prompt / compressions),这两个每轮清零。
+       * 混在同一层将来一定有人读错:把「本轮 8 步」当成「整个会话 8 步」,
+       * 或反之 —— 而那不报错,只是 skill 沉淀在该触发时不触发。
+       */
+      currentTurn: {
+        toolSteps: this.toolStepsThisTurn,
+        toolFails: this.toolFailsThisTurn,
+      },
     };
   }
 
