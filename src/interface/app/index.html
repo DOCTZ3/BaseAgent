@@ -21,6 +21,14 @@
   <div class="brand">BaseAgent</div>
   <div class="bar-right">
     <span class="ws" id="ws-label" title="当前工作区"></span>
+    <!--
+      技能按钮:有待审批时显示一个计数角标。
+      不做成消息流里的弹窗 —— 审批要看清步骤和坑才能判断,
+      塞在流里容易随手点过,而错批一条含糊描述的代价是它永久误导模型。
+    -->
+    <button class="icon-btn" id="btn-skills" title="技能库">
+      ✦<span class="badge" id="skill-badge" hidden></span>
+    </button>
     <button class="icon-btn" id="btn-config" title="配置">⚙</button>
     <!--
       窗口按钮:顶栏是自绘的(titleBarStyle: 'hidden'),系统按钮不存在。
@@ -47,6 +55,14 @@
   <aside class="sidebar" id="sidebar">
     <div class="side-head">
       <button class="btn new-chat" id="btn-new">＋ 新对话</button>
+      <!--
+        执行中锁住切换入口时的说明。
+        没有这句话时按钮只是点不动 —— 而「点了没反应」和「界面卡了」
+        在用户眼里是同一回事,所以必须说出原因和出路。
+      -->
+      <p class="hint busy-lock" id="busy-lock-hint" hidden>
+        执行中,暂时不能切换会话。要切请先点「停止」。
+      </p>
     </div>
     <div class="side-list" id="side-list"></div>
   </aside>
@@ -153,7 +169,48 @@
 
   <div class="drawer-foot">
     <span class="hint" id="restart-hint" hidden>这些改动需要重建会话才生效</span>
+    <!--
+      保存会重建会话(dispose 掉当前这个),而进行中的那一轮跑在旧实例上 ——
+      工具桥和 DB 句柄被关掉之后它会开始报一串莫名的工具失败。
+      所以执行期间禁用保存,并说清为什么。
+    -->
+    <span class="hint" id="save-busy-hint" hidden>执行中不能保存(保存会重建会话)</span>
     <button class="btn primary" id="btn-save">保存</button>
+  </div>
+</aside>
+
+<!--
+  技能抽屉 —— 审批待入库的技能
+
+  为什么审批必须是个能慢慢看的面板,而不是消息流里的一张卡:
+  判断一条技能值不值得留,要看清它的步骤和坑 —— 描述含糊的技能
+  (「知乎相关操作」这种)等于不存在,模型永远不会选它,而没有任何
+  自动信号能发现这件事。塞在流里容易随手点过,而错批一条的代价是
+  它永久占着索引预算、或更糟:被选中然后误导模型。
+
+  与配置抽屉共用 .drawer 那套样式和遮罩层级,但**各自一个遮罩** ——
+  共用一个的话关掉技能抽屉会把配置抽屉的遮罩也带走。
+-->
+<div class="drawer-mask" id="skill-mask" hidden></div>
+<aside class="drawer" id="skill-drawer" hidden>
+  <div class="drawer-head">
+    <h2>技能库</h2>
+    <button class="icon-btn" id="btn-close-skills">✕</button>
+  </div>
+
+  <div class="drawer-body" id="skill-body">
+    <!-- 内容由 app.js 的 renderSkills() 填充 -->
+  </div>
+
+  <div class="drawer-foot">
+    <span class="hint">通过审批后才会进入提示词索引,模型才可能用到它。</span>
+    <!--
+      审批**不影响当前对话** —— 技能索引在会话装配时拼进 system 消息就冻住了,
+      之后没有任何路径会重算它。这不是懒,是刻意的:system 消息是 prompt cache
+      前缀里最稳定的部分(实测命中率 60~77%),为一次审批重写它会让整段缓存失效。
+      所以说清「下次新对话生效」,与配置面板那个 restart-hint 同一个模式。
+    -->
+    <span class="hint" id="skill-apply-hint" hidden>已审批的技能在<strong>下次新对话</strong>生效。</span>
   </div>
 </aside>
 

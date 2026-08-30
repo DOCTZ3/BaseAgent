@@ -163,6 +163,11 @@ async function createSession(resumeSessionId) {
         pendingConfirms.set(reqId, resolve);
         win.webContents.send('agent:confirm', reqId, req);
       }),
+    // 技能沉淀完了通知渲染层刷角标。窗口没了就静默丢弃 ——
+    // 库已经落盘,下次开窗口拉列表时自然带出来
+    onSkillsChanged: () => {
+      if (win && !win.isDestroyed()) win.webContents.send('agent:skills-changed');
+    },
   });
 
   return session;
@@ -388,6 +393,41 @@ ipcMain.handle('history:open', async (_e, sessionId) => {
 ipcMain.handle('history:new', async () => {
   const s = await switchSession(undefined);
   return { sessionId: s.sessionId, turns: [] };
+});
+
+// ---------- IPC:技能审批 ----------
+//
+// 沉淀出来的轨迹一律 pending —— 审批前不进索引、load_skill 也取不到。
+// 没有这套出口的话功能等于不存在:沉淀会发生、会写进库,但用户看不到也批不了。
+//
+// 与配置保存同一个约定:**不让异常穿过 IPC**。Electron 会把抛出的 Error
+// 包成「Error invoking remote method 'skills:approve': ...」,那半截前缀
+// 是实现细节,不该出现在用户眼前。
+
+/** 全部技能(含待审批)。渲染层自己按 pending 分组 */
+ipcMain.handle('skills:list', async () => {
+  const s = await ensureSession();
+  if (!s.skills) return { ok: false, error: '技能库未启用' };
+  return { ok: true, skills: s.skills.list() };
+});
+
+ipcMain.handle('skills:approve', async (_e, name) => {
+  const s = await ensureSession();
+  if (!s.skills) return { ok: false, error: '技能库未启用' };
+
+  // approve 返回 false = 名字不存在或它本来就不是待审状态。
+  // 两种都不算错误,但要让渲染层知道「没发生变化」,否则列表刷新后
+  // 用户会以为自己点了却没反应
+  const changed = s.skills.approve(name);
+  return { ok: true, changed, skills: s.skills.list() };
+});
+
+ipcMain.handle('skills:reject', async (_e, name) => {
+  const s = await ensureSession();
+  if (!s.skills) return { ok: false, error: '技能库未启用' };
+
+  const changed = s.skills.reject(name);
+  return { ok: true, changed, skills: s.skills.list() };
 });
 
 async function loadSessionStore() {

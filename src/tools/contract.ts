@@ -20,7 +20,8 @@ import { Logger } from '../platform/index.js';
 // 'shell' 是**装包等系统操作的正式通道**,只给 run_command(danger:true)。
 // 它没有任何机制边界:Python 的写边界是进程内的 audit hook,shell 起的进程
 // 根本不经过它。安全性全部来自那次人工确认 —— 见 run-command.ts 顶部。
-export type ResourceType = 'fs' | 'python' | 'shell' | 'browser' | 'http' | 'agent' | 'vision';
+export type ResourceType =
+  | 'fs' | 'python' | 'shell' | 'browser' | 'http' | 'agent' | 'vision' | 'skill';
 
 // 工具上下文:runner 组装、传给工具的"工具箱"
 export interface ToolContext {
@@ -36,6 +37,9 @@ export interface ToolContext {
     http?: unknown;    // HTTP 客户端(后续实现)
     agent?: SubAgentRunner;  // 子 agent 执行器(实现在 core 层,见下方接口注释)
     vision?: VisionAnalyzer; // 视觉插件(实现在 core 层,未配视觉模型时为 undefined)
+    // skill 轨迹读取(实现在 core 层)。**只读** —— 写入是主 agent 的轮末动作,
+    // 工具侧拿不到写方法(与子 agent 拿不到 spawn 同一条原则)
+    skill?: SkillReader;
   };
 }
 
@@ -84,6 +88,34 @@ export interface VisionAnalyzer {
   analyze(request: VisionRequest): Promise<VisionResult>;
   /** 视觉模型名,写进工具返回值让模型知道是谁看的 */
   readonly modelName: string;
+}
+
+// ============================================
+// Skill 读取契约(实现在 core 层)
+// ============================================
+//
+// 与 SubAgentRunner / VisionAnalyzer 同一个注入模式:接口在 tools,实现在 core。
+//
+// **只读**。写入是主 agent 的轮末动作(由 SkillManager 做),
+// 工具侧拿不到任何写方法 —— 与「子 agent 拿不到 spawn」同一条原则:
+// 能力从结构上不给,比靠约定不去用可靠。
+//
+// 这也是 skill 不需要 fs 授权的原因:正文由这个接口在 TS 侧读出来,
+// 沙箱代码完全够不到 store。于是「模型不能改自己的行为规则」这条约束
+// 靠结构就满足了,不用像 .agent-memory.db 那样靠「放在工作区外」来保证。
+
+export interface SkillLookupResult {
+  ok: boolean;
+  /** 渲染好的轨迹正文(Markdown)。直接给模型看 */
+  body?: string;
+  error?: string;
+  /** 库里现有的调用名 —— 取错名字时列出来,省一轮试错 */
+  available?: string[];
+}
+
+export interface SkillReader {
+  /** 按调用名取轨迹。取不到不抛异常,以 ok:false 返回并附可用名单 */
+  load(name: string): SkillLookupResult;
 }
 
 // ============================================

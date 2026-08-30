@@ -236,6 +236,50 @@ describe('mergeSkillExtraction', () => {
     expect(findSkill(r.skills, 'zhihu-hot')!.hits).toBe(12);
   });
 
+  // 名字比对必须**归一化**。原先是 `s.name === name`,而抽取模型两次写出的
+  // 名字只要差一个空格,就会被当成两条不同的轨迹 push 进库 ——
+  // 界面上是两个看起来一模一样的名字,各带一半步骤,谁也不完整。
+  // 而且它绕过了「保留 hits」那条规则:新条目 hits 从 0 开始,
+  // 老条目的资历被一条同名残缺条目稀释掉。实测踩到(见 skill.ts 的注释)。
+  it.each([
+    ['前后空格', ' weibo-hot '],
+    ['中间空格', 'weibo -hot'],
+    ['大小写', 'Weibo-Hot'],
+  ])('名字只差%s时视为**更新**,不新建', (_label, variant) => {
+    const existing = [skill({ name: 'weibo-hot', hits: 7 })];
+    const r = mergeSkillExtraction(existing, { ...good, name: variant }, T0 + 5000);
+
+    expect(r.changed).toBe('updated');
+    expect(r.skills).toHaveLength(1);
+    expect(r.skills[0].hits).toBe(7);          // 资历没被稀释
+    expect(r.skills[0].name).toBe('weibo-hot'); // 存的仍是库里那个名字
+  });
+
+  it('更新时回报**库里那个名字**,不是这次抽出来的', () => {
+    // 两者可能只差一个空格。日志里打新名字会让人以为库里存的是新的那个,
+    // 而按那个名字去查压根查不到
+    const existing = [skill({ name: 'weibo-hot' })];
+    const r = mergeSkillExtraction(existing, { ...good, name: 'Weibo-Hot' }, T0 + 5000);
+    expect(r.name).toBe('weibo-hot');
+  });
+
+  it('归一化**不跨标点**合并 —— 那可能真是两件事', () => {
+    // 去空白和大小写是安全的(中文名不受大小写影响,空白是模型最常见的抖动),
+    // 但去标点会把「导出-CSV」和「导出CSV」并成一条,而它们未必等价
+    const existing = [skill({ name: '导出-CSV' })];
+    const r = mergeSkillExtraction(existing, { ...good, name: '导出CSV' }, T0 + 5000);
+
+    expect(r.changed).toBe('added');
+    expect(r.skills).toHaveLength(2);
+  });
+
+  it('findSkill 也走同一套归一化 —— load_skill 与审批都靠它', () => {
+    const skills = [skill({ name: 'weibo-hot' })];
+    expect(findSkill(skills, 'weibo-hot')).toBeDefined();   // 严格相等仍是第一顺位
+    expect(findSkill(skills, ' Weibo-Hot ')).toBeDefined();
+    expect(findSkill(skills, '不存在的')).toBeUndefined();
+  });
+
   it('同名视为更新,**保留 hits 与 createdAt**(那是它的资历)', () => {
     const existing = [skill({ name: 'weibo-hot', hits: 7, createdAt: T0 })];
     const r = mergeSkillExtraction(

@@ -53,9 +53,12 @@ export interface MemoryManagerConfig {
   retry?: Partial<RetryConfig>;
 }
 
+// maxTokens **刻意不在这里给默认值** —— 与 SkillManager 同一个理由:
+// 兜底 2000 是个暗默预算,配了 MAIN_MAX_TOKENS 也管不到抽取调用,
+// 而思维链计入输出预算,不够时 content 直接是空的(技能抽取那边实测踩到,
+// 见 skill-manager.ts 的说明)。不传则由 adapter 回落到主模型那份配置。
 const DEFAULTS = {
   turnsPerExtraction: 3,
-  maxTokens: 2000,
 };
 
 /** 单条用户发言的截断长度。抽取只需要看**倾向**,不需要全文 */
@@ -193,7 +196,8 @@ export class MemoryManager {
           { role: 'user', content: userContent },
         ],
         temperature: 0.3,
-        maxTokens: this.config.maxTokens ?? DEFAULTS.maxTokens,
+        // 不传即跟随主模型(见 DEFAULTS 上方说明)
+        maxTokens: this.config.maxTokens,
         responseFormat: 'json_object',
         traceLabel: 'memory:extraction',
       });

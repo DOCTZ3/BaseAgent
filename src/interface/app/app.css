@@ -99,6 +99,30 @@ body {
 .icon-btn:hover { background: var(--bg-hover); color: var(--fg); }
 
 /*
+  待审批计数角标
+
+  做成**行内**小药丸而不是绝对定位的右上角圆点:后者要给 .icon-btn 加
+  position: relative,而顶栏那几个按钮尺寸不一,角标会各自偏到不同位置。
+  行内的代价是按钮变宽一点 —— 换来的是数字永远不会压在字形上。
+
+  用 accent 底色而不是红色:待审批不是错误,是「有东西等你看」。
+*/
+.badge {
+  display: inline-block;
+  min-width: 16px;
+  margin-left: 3px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #0d1117;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  vertical-align: top;
+}
+
+/*
   窗口按钮(最小化/最大化/关闭)
 
   用 Segoe MDL2 Assets 的字形而不是文字符号:那是 Windows 自己标题栏用的
@@ -198,6 +222,21 @@ body {
 }
 
 .side-empty { color: var(--fg-faint); font-size: 12px; padding: 12px 10px; }
+
+/*
+  执行期间锁住的控件
+
+  禁用态必须**看得出来**,不能只是点不动:原先侧边栏那个点击处理器
+  第一行就是 `if (busy) return`,于是执行中点会话名静默无反应 ——
+  而「点了没反应」和「界面卡了」在用户眼里是同一回事。
+
+  cursor: default 而不是 not-allowed:后者那个禁止符号看着像出错了,
+  而这里只是「现在不行,等会儿就行」。
+*/
+.locked, .locked * { pointer-events: none; }
+.locked { opacity: .45; cursor: default; }
+
+.busy-lock { margin: 8px 2px 2px; line-height: 1.5; }
 
 /* ---------- 消息流 ---------- */
 
@@ -607,6 +646,90 @@ body {
 .btn:hover { background: var(--bg-hover); }
 .btn.primary { background: var(--accent); color: #0d1117; border-color: transparent; font-weight: 600; }
 .btn.danger { background: #5c2b2b; border-color: #6e3535; }
+
+/* ---------- 技能卡片 ---------- */
+
+/*
+  一条技能一张卡。分组标题(待审批 / 已启用)靠 .skill-group 的上边距分开。
+
+  待审批的卡给左侧一条 accent 竖线:抽屉里两组混着看时,要能不读标题
+  就分出哪些还等着处理 —— 审批完它会跳到下面那组,竖线消失即反馈。
+*/
+.skill-group { margin: 4px 0 18px; }
+.skill-group h3 {
+  font-size: 13px;
+  color: var(--fg-dim);
+  margin: 14px 0 10px;
+  font-weight: 600;
+}
+
+.skill-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.skill-card.pending { border-left: 2px solid var(--accent); }
+
+.skill-name {
+  font: 13px/1.5 ui-monospace, Consolas, monospace;
+  color: var(--accent);
+  word-break: break-all;
+}
+
+/*
+  新增 / 更新 标记
+
+  为什么这个标记是必需的:待审批列表里只显示名字和步骤时,一条「在已有轨迹上
+  改出来的」和一条「全新的」长得一模一样 —— 于是看到相似的两条只能猜,
+  然后干脆都不批。实测就是这样(用户以为只有新建机制,没有更新)。
+
+  更新用 warn 色而不是 accent:它意味着「你审过的那条内容变了」,
+  比新增更需要看一眼 —— 老条目的 hits 是它已经被用过的证据,而新内容还没有。
+*/
+.skill-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font: 400 11px/18px system-ui, sans-serif;
+  vertical-align: middle;
+}
+.skill-tag.new { background: #23303f; color: var(--accent); }
+.skill-tag.upd { background: #3a2f1c; color: var(--warn); }
+
+.skill-desc { font-size: 13px; margin: 4px 0 8px; }
+
+/*
+  步骤列表
+
+  goal 与 how 视觉上分层:goal 是耐久的(网站改版也不变),how 会过期。
+  混成一段的话审批时读不出「这一步的目的」和「当时的做法」——
+  而失效时模型正是要据 goal 自己重新找路,所以目的写得含糊就是这条技能
+  报废的信号,必须在审批这一眼里就能看出来。
+*/
+.skill-steps { margin: 0 0 8px; padding-left: 20px; font-size: 13px; }
+.skill-steps li { margin: 4px 0; }
+.skill-steps .how {
+  display: block;
+  color: var(--fg-faint);
+  font-size: 12px;
+}
+
+/* 坑:比正确路径值钱,所以不折叠、给 warn 色,和步骤区分开 */
+.skill-pit {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  font-size: 12px;
+  color: var(--warn);
+}
+
+.skill-meta { color: var(--fg-faint); font-size: 11px; }
+.skill-note { color: var(--fg-faint); font-size: 12px; margin: 0 0 8px; }
+
+.skill-acts { display: flex; gap: 8px; margin-top: 10px; }
+.skill-acts .btn { padding: 5px 12px; font-size: 13px; }
 
 /* ---------- 确认对话框 ---------- */
 .modal-mask { display: flex; align-items: center; justify-content: center; z-index: 20; }

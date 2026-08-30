@@ -70,6 +70,27 @@
     if (els.toBottom) els.toBottom.hidden = atBottom();
   }
 
+  /**
+   * 推理块**自己**的跟随 —— 这不是锦上添花,是修一个实际的 bug
+   *
+   * .think-text 有 max-height: 300px + overflow-y: auto。长推理填满之后,
+   * 后续增量进的是**这个盒子自己的**滚动区,而 follow() 滚的是外层 .stream ——
+   * 它从来不碰这个盒子。于是外层早就到底、滚不动了,文字还在 300px 窗口
+   * 下面继续长(第一步的推理常有几百字)。
+   * 表现成「还在跑,但页面滚不下去了,下面明明还有内容」——
+   * 而从外层看一切正常:scrollHeight 没变,因为盒子高度是固定的。
+   *
+   * 余量比外层的 80 小:那是给整页留的,放在 300px 的窗口里太宽松 ——
+   * 差 80px 时就判定「不算贴底」而停止跟随,等于差三行就不跟了。
+   */
+  const THINK_SLACK = 24;
+
+  function followThink(box) {
+    if (box.scrollHeight - box.scrollTop - box.clientHeight <= THINK_SLACK) {
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
   els.stream.addEventListener('scroll', syncToBottomBtn);
   els.toBottom?.addEventListener('click', () => {
     els.stream.scrollTo({ top: els.stream.scrollHeight, behavior: 'smooth' });
@@ -152,6 +173,9 @@
         }
         think.text += text;
         think.body.textContent = think.text;
+        // 两个滚动区都要跟:外层 .stream 和推理块**自己**那个 300px 的窗口。
+        // 只跟外层就是「还在跑却滚不下去」那个 bug(见 followThink 的注释)
+        followThink(think.body);
         follow();
       },
 
@@ -402,7 +426,33 @@
     els.send.hidden = v;
     els.stop.hidden = !v;
     els.input.disabled = v;
+    lockSwitching(v);
     if (!v) els.input.focus();
+  }
+
+  /**
+   * 执行期间锁住所有会重建会话的入口
+   *
+   * 为什么这不只是"体验问题":switchSession() / restart() 都会
+   * dispose() 掉当前会话 —— 关掉 DB 句柄、停掉工具桥 —— 而
+   * agent:run 刻意持有局部的 session 引用,那一轮会继续跑在被拆掉的
+   * 实例上,表现成任务半途开始报一串莫名的工具失败。
+   *
+   * 原先侧边栏和"新对话"是 `if (busy) return` 静默拦下(所以现象是
+   * 点了没反应),而保存按钮**压根没拦** —— 那是真正暴露这条路的口子。
+   *
+   * 用 class 而不是 disabled 属性:侧边栏那些会话是 <button>,
+   * 逐个 disabled 要在每次 refreshSidebar() 之后重新打一遍标记,
+   * 漏一次就又能点进去了。挂在容器上则天然覆盖后来渲染的子项。
+   */
+  function lockSwitching(v) {
+    els.sideList.classList.toggle('locked', v);
+    $('btn-new').classList.toggle('locked', v);
+    $('busy-lock-hint').hidden = !v;
+
+    // 保存会走 restart() → 同一套 dispose()
+    $('btn-save').disabled = v;
+    $('save-busy-hint').hidden = !v;
   }
 
   async function submit() {
@@ -631,6 +681,282 @@
     }
   });
 
+  // ---------- 技能库 ----------
+  //
+  // 这个面板只做一件事:让用户在一条技能进入提示词索引**之前**读清它。
+  //
+  // 为什么必须人工过一遍:抽取模型写出「知乎相关操作」这种描述时,这条技能
+  // 等于不存在 —— 模型永远不会选它,而没有任何自动信号能发现这件事。
+  // 更糟的是描述写得响亮但轨迹是错的:它会被选中,然后误导模型。
+  // 两种坏结果都只有人读一眼才能发现,所以审批不能省、也不能做成
+  // 消息流里随手点过的卡片。
+
+  const skillDrawer = $('skill-drawer');
+  const skillMask = $('skill-mask');
+  const skillBody = $('skill-body');
+  const skillBadge = $('skill-badge');
+
+  /** 上一次拉到的列表。开抽屉时先画它,避免面板空一下再跳出内容 */
+  let skillCache = [];
+
+  const openSkills = () => {
+    skillDrawer.hidden = false;
+    skillMask.hidden = false;
+    void refreshSkills();   // 开的时候拉一次:后台可能刚沉淀了新的
+  };
+  const closeSkills = () => {
+    skillDrawer.hidden = true;
+    skillMask.hidden = true;
+    // 生效提示只属于「刚审批完」这个时刻。留着的话下次打开抽屉它还挂在那儿,
+    // 而那时你什么都没审 —— 一条不对应任何动作的提示比没有更让人疑惑
+    $('skill-apply-hint').hidden = true;
+  };
+
+  $('btn-skills').addEventListener('click', openSkills);
+  $('btn-close-skills').addEventListener('click', closeSkills);
+  skillMask.addEventListener('click', closeSkills);
+
+  /**
+   * 角标 = **待审批**条数,不是总条数
+   *
+   * 显示总数的话已启用的技能会让角标永远亮着,而角标的唯一意义是
+   * 「有东西等你处理」—— 常亮就等于没有。
+   */
+  function syncSkillBadge() {
+    const n = skillCache.filter(s => s.pending).length;
+    skillBadge.hidden = n === 0;
+    skillBadge.textContent = String(n);
+  }
+
+  /** 一行灰字。技能库没启用、拉不到、空库都走它 —— 空面板会让人以为界面坏了 */
+  function skillEmpty(text) {
+    const p = document.createElement('div');
+    p.className = 'empty';
+    p.textContent = text;
+    return p;
+  }
+
+  function renderSkillCard(s) {
+    const card = document.createElement('div');
+    card.className = 'skill-card' + (s.pending ? ' pending' : '');
+
+    const name = document.createElement('div');
+    name.className = 'skill-name';
+    name.textContent = s.name;
+
+    // 新增 / 更新 必须分得出来。
+    //
+    // 不标的话待审列表里「在已有轨迹上改出来的」和「全新的」长得一模一样,
+    // 于是看到相似的两条只能猜、然后干脆都不批(实测就是这样:
+    // 用户以为只有新建机制,把一条更新当成了重复条目)。
+    //
+    // createdAt !== updatedAt 即更新:新条目这两个值由 mergeSkillExtraction
+    // 用同一个 now 写入,而更新分支只动 updatedAt、保留原本的 createdAt
+    const isUpdate = s.createdAt !== s.updatedAt;
+    const tag = document.createElement('span');
+    tag.className = 'skill-tag ' + (isUpdate ? 'upd' : 'new');
+    tag.textContent = isUpdate ? '更新' : '新增';
+    tag.title = isUpdate
+      ? '在已有轨迹上改写,原条目的取用次数已保留'
+      : '这是一条新轨迹';
+    name.appendChild(tag);
+
+    card.appendChild(name);
+
+    const desc = document.createElement('div');
+    desc.className = 'skill-desc';
+    desc.textContent = s.description;
+    card.appendChild(desc);
+
+    // 步骤:goal 与 how 分层显示。
+    // 混成一段的话审批时读不出「这一步要达成什么」和「当时怎么做的」——
+    // 而 how 会过期、goal 不会,失效时模型正是据 goal 重新找路。
+    // 所以 goal 写得含糊就是这条技能报废的信号,必须一眼能看出来。
+    if (s.steps && s.steps.length) {
+      const ol = document.createElement('ol');
+      ol.className = 'skill-steps';
+      for (const step of s.steps) {
+        const li = document.createElement('li');
+        li.textContent = step.goal;
+        if (step.how) {
+          const how = document.createElement('span');
+          how.className = 'how';
+          how.textContent = step.how;
+          li.appendChild(how);
+        }
+        ol.appendChild(li);
+      }
+      card.appendChild(ol);
+    }
+
+    // 坑往往比正确路径值钱,所以不折叠
+    if (s.pitfalls && s.pitfalls.length) {
+      const ul = document.createElement('ul');
+      ul.className = 'skill-pit';
+      for (const p of s.pitfalls) {
+        const li = document.createElement('li');
+        li.textContent = p;
+        ul.appendChild(li);
+      }
+      card.appendChild(ul);
+    }
+
+    if (s.note) {
+      const note = document.createElement('div');
+      note.className = 'skill-note';
+      note.textContent = s.note;
+      card.appendChild(note);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'skill-meta';
+    // hits 对**待审的更新条目**尤其要显示 —— 原先只给已启用的显示,
+    // 而那恰好漏掉了最需要它的那一类:一条被取用过 12 次的轨迹改了内容,
+    // 「12 次」正是你该不该批的主要依据(它证明模型真在用这条路)。
+    //
+    // 已启用条目的 hits 则是另一个信号:0 次且沉淀很久 = 描述没能让模型选中它,
+    // 这是判断「该不该改描述」唯一的可见线索
+    const parts = [];
+    if (isUpdate) parts.push(`更新于 ${fmtTime(s.updatedAt)}`);
+    parts.push(`沉淀于 ${fmtTime(s.createdAt)}`);
+    if (!s.pending || isUpdate) parts.unshift(`已取用 ${s.hits} 次`);
+    meta.textContent = parts.join(' · ');
+    card.appendChild(meta);
+
+    if (s.pending) card.appendChild(skillActions(s.name));
+    return card;
+  }
+
+  /**
+   * 通过 / 丢弃
+   *
+   * 「丢弃」用 danger 样式且写「丢弃」不写「删除」:reject 是把这条从库里
+   * 抹掉、不可撤销(没有回收站),而它旁边就是「通过」—— 手滑的代价不对称。
+   */
+  function skillActions(name) {
+    const acts = document.createElement('div');
+    acts.className = 'skill-acts';
+
+    const ok = document.createElement('button');
+    ok.className = 'btn primary';
+    ok.textContent = '通过';
+
+    const no = document.createElement('button');
+    no.className = 'btn danger';
+    no.textContent = '丢弃';
+
+    // 两个按钮一起禁用:approve 会重画整个列表,期间再点另一个
+    // 会对着一个即将被替换掉的 DOM 节点发第二次 IPC
+    const run = async (fn, verb) => {
+      ok.disabled = no.disabled = true;
+      try {
+        const r = await fn(name);
+        if (r && r.ok === false) {
+          streamNote(`技能${verb}失败: ${r.error}`, true);
+          return;
+        }
+        // changed:false = 名字对不上或它本来就不是待审状态。
+        // 不说出来的话用户只看到列表刷新了却什么都没变,以为点了没反应
+        if (r && r.changed === false) {
+          streamNote(`技能「${name}」状态已变,未做改动。`);
+        }
+        // 通过之后必须说清「什么时候才真的生效」。
+        //
+        // 技能索引在会话装配时拼进 system 消息就冻住了,之后没有任何路径
+        // 会重算它 —— 而这是刻意的:system 消息是 prompt cache 前缀里最稳定的
+        // 部分(实测命中率 60~77%),为一次审批重写它会让整段缓存失效。
+        //
+        // 不说的话表现成「审批通过了、界面显示已启用,模型却完全不用它」——
+        // 而库里数据是对的、load_skill 也是通的,查起来会怀疑抽取、审批、
+        // 权限所有环节,唯独不会怀疑那个静态字符串。
+        //
+        // 只在**通过**时提示:丢弃不涉及「何时生效」
+        if (fn === window.AgentSkills.approve) {
+          $('skill-apply-hint').hidden = false;
+        }
+
+        // 审批接口把新列表当返回值带回来了,直接用,省一次往返
+        if (r && r.skills) applySkills(r.skills);
+        else await refreshSkills();
+      } catch (e) {
+        streamNote(`技能${verb}失败: ${e && e.message ? e.message : String(e)}`, true);
+      } finally {
+        // 列表重画后这两个节点可能已经不在文档里了,解禁是给「没重画」那条路兜底
+        ok.disabled = no.disabled = false;
+      }
+    };
+
+    ok.addEventListener('click', () => void run(window.AgentSkills.approve, '通过'));
+    no.addEventListener('click', () => void run(window.AgentSkills.reject, '丢弃'));
+
+    acts.append(ok, no);
+    return acts;
+  }
+
+  /** 把一份列表画进抽屉并同步角标 */
+  function applySkills(list) {
+    skillCache = list || [];
+    syncSkillBadge();
+
+    skillBody.textContent = '';
+    if (skillCache.length === 0) {
+      skillBody.appendChild(skillEmpty(
+        '还没有技能。完成一个用了较多工具调用(或中途出过错)的任务后,会自动沉淀一条待审批的轨迹。',
+      ));
+      return;
+    }
+
+    // 待审批排在前面:那是唯一需要动作的一组
+    const groups = [
+      { title: '待审批', items: skillCache.filter(s => s.pending) },
+      { title: '已启用', items: skillCache.filter(s => !s.pending) },
+    ];
+
+    for (const g of groups) {
+      if (g.items.length === 0) continue;
+      const box = document.createElement('div');
+      box.className = 'skill-group';
+      const h = document.createElement('h3');
+      h.textContent = `${g.title} · ${g.items.length}`;
+      box.appendChild(h);
+      for (const s of g.items) box.appendChild(renderSkillCard(s));
+      skillBody.appendChild(box);
+    }
+  }
+
+  /** 拉一次技能列表。抽屉关着时也要拉 —— 角标得更新 */
+  async function refreshSkills() {
+    const api = window.AgentSkills;
+    if (!api) return;   // mock 环境:没有这个能力
+
+    let r;
+    try {
+      r = await api.list();
+    } catch (e) {
+      skillBadge.hidden = true;
+      if (!skillDrawer.hidden) {
+        skillBody.textContent = '';
+        skillBody.appendChild(skillEmpty(
+          `技能列表读取失败: ${e && e.message ? e.message : String(e)}`,
+        ));
+      }
+      return;
+    }
+
+    // ok:false 是**正常状态**(用户没开这个功能),不是故障 ——
+    // 所以呈现成一句说明,不走红色的错误样式
+    if (r && r.ok === false) {
+      skillBadge.hidden = true;
+      if (!skillDrawer.hidden) {
+        skillBody.textContent = '';
+        skillBody.appendChild(skillEmpty(r.error || '技能库未启用'));
+      }
+      return;
+    }
+
+    applySkills(r && r.skills);
+  }
+
   // ---------- 历史侧边栏 ----------
   let activeSessionId = null;
 
@@ -797,6 +1123,15 @@
 
     /** 一轮结束后刷新列表 —— 新会话的第一轮之后才会出现在里面 */
     refreshSidebar,
+
+    /**
+     * 刷新技能列表与角标
+     *
+     * 必须导出:bridge.js 收到 agent:skills-changed 推送时要调它,
+     * 而沉淀是异步的(run() 返回之后才结束)—— 没有这条推送,
+     * 刚沉淀的技能要等到下次开窗口才会出现在角标上。
+     */
+    refreshSkills,
   };
 
   clearStream();

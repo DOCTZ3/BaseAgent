@@ -45,6 +45,8 @@
 │    · sub-agent     一次性子 agent(独立上下文,只回传结论)  │
 │    · system-prompt 提示词组装(主/子 agent 环境约定同源)   │
 │    · memory        长期记忆:用户特征(6 维度,接 storage)   │
+│    · skill         技能库:轨迹存取/索引渲染/合并规则       │
+│    · skill-manager 沉淀驱动:触发判据 → 抽取 → 人工审批     │
 │    · token-counter Token 统计和阈值判断                   │
 │    职责:理解意图、决定调哪个工具、串联多步、错误恢复        │
 │    关键:只知道「有一批工具可用」,不知道任何工具的实现       │
@@ -60,6 +62,7 @@
 │    · browser\      screenshot / request_help               │
 │    · system\       read_file / search_files(自带返回量上限) │
 │                    run_command(外部程序,每次人工确认)      │
+│                    load_skill(取轨迹正文,索引在系统提示)   │
 │    职责:具体能力实现,申明 needs 依赖,runner 注入资源       │
 └───────────────────────────┬──────────────────────────────┘
                             │ needs: ['fs', 'python', 'browser', ...]
@@ -136,6 +139,27 @@ interface ToolResult {
 
 **关键设计**:工具通过 `needs` 声明依赖、不直接 import executor;
 所有错误包装为 `ToolResult{ok:false}`,不炸主循环。
+
+### SkillReader (技能只读边界)
+
+```typescript
+interface SkillReader {          // 经 ToolContext 注入,needs: ['skill']
+  load(name: string): SkillLookupResult;
+}
+
+interface SkillLookupResult {
+  ok: boolean;
+  body?: string;                 // 轨迹正文(目标/做法分层 + 坑)
+  error?: string;
+  available?: string[];          // 取不到时列出可用名字,免得模型反复猜
+}
+```
+
+**关键设计**:只有 `load`,**没有任何写方法** —— 模型改不了自己的技能库,
+这个边界是结构性的而不是靠权限检查。索引(名字+描述)进系统提示、
+正文按需取:系统提示是 prompt cache 前缀里最稳定的部分(实测命中率 60~77%),
+每轮注入不同正文会让整段前缀失效。子 agent 可读不可写(`skillReader` 在
+`InheritableRunnerConfig` 里)。
 
 ### LLMClient (Provider 中立接口)
 
@@ -1036,6 +1060,13 @@ interface TopicSummary {
   渲染。不依赖 LLM,可独立测试)
 - MemoryManager (抽取驱动:何时抽、给它看哪一段、结果怎么落盘。
   详见「长期记忆与压缩是两件事」那条决策)
+- skill (技能库的纯逻辑:轨迹存取、索引渲染、正文渲染、合并规则。
+  与 memory 共用同一个 SQLite 文件,只是 key 不同。不依赖 LLM,可独立测试)
+- SkillManager (沉淀驱动 + `SkillReader` 实现:单轮 ≥8 步工具调用或出现过
+  工具失败即抽一次,`stopReason` 必须是 `complete`。入库一律 `pending`,
+  **人工审批前不进索引、`load_skill` 取不到**。合并只增不删、保留
+  `hits`/`createdAt`(资历),名字比对先严格后归一化 ——
+  差一个空格就 push 新条目会让库里出现两条各带一半步骤的同名轨迹)
 
 **Interface 层**(两个壳共用 `core/session.ts` 一份装配):
 - CLI (REPL / 单发两种模式,斜杠命令 + 每轮可观测回显 —— **调试壳**,
@@ -1043,7 +1074,9 @@ interface TopicSummary {
 - Electron 客户端 (`electron/` + `src/interface/app/`):原生无边框窗口
   (自绘顶栏 + 窗口按钮)、流式正文与可折叠思考过程、工具调用标签、
   历史会话侧边栏(切换/新建)、Markdown 渲染、原生目录选择、配置面板、
-  危险工具确认(命令原样呈现)。**不显示** turn/token 这类调试信息。
+  危险工具确认(命令原样呈现)、技能审批抽屉(待审计数角标、步骤与坑分层
+  呈现、新增/更新标记 —— 不做成消息流里的卡片:错批一条含糊描述的代价
+  是它永久误导模型)。**不显示** turn/token 这类调试信息。
   agent 直接跑在主进程,无端口无 HTTP;渲染进程按不可信环境对待。
   详见「客户端用 Electron」「Markdown 渲染自己写」两条决策
 - `scripts/import-history.ts` (一次性脚本:把旧会话的对话从

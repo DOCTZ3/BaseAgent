@@ -305,7 +305,42 @@ export interface AgentConfig {
      * 差三倍多,于是「聊了 11k 还没触发」。按轮次计数虽粗但**可预测**。
      */
     turnsPerExtraction: number;
-    maxTokens: number;              // 抽取调用的输出上限(思维链计入此预算)
+    /**
+     * 抽取调用的输出上限。**留空即跟随主模型**(MAIN_MAX_TOKENS)
+     *
+     * 可选是刻意的:给了默认值就等于埋一个暗默预算 —— 配了主模型也管不到
+     * 这里,而思维链计入输出预算,不够时 content 直接是空的
+     */
+    maxTokens?: number;
+  };
+
+  /**
+   * 可复用任务轨迹(skill)
+   *
+   * 与记忆**共用同一个 SQLite 文件**(memory.dbPath),只是 key 不同 ——
+   * better-sqlite3 的 ABI 要跟着 Electron 重编,不必为此再引一个存储依赖。
+   * 所以这里没有独立的 dbPath。
+   *
+   * 索引(名字+描述)进系统提示,正文由 load_skill 工具按需取:
+   * 系统提示是 prompt cache 前缀里最稳定的部分(实测命中率 60~77%),
+   * 每轮注入不同的正文会让整段前缀失效。
+   */
+  skill: {
+    enabled: boolean;               // 关掉则不注册工具、不注入索引、不沉淀
+    /**
+     * 触发沉淀的工具步数门槛
+     *
+     * 判据是**单轮**的(这一轮跑了几步),不是「攒够 N 轮」——
+     * 一次做成的轨迹就已经完整可复用,攒十次只会让它晚十次才拿到。
+     * 而实测会话规模是 1~3 轮,轮数门槛会重复 CONTEXT_RECENT_TURNS=10
+     * 那个「配了但永远达不到」的错误。
+     *
+     * 门槛放松是有意的:严格性交给人工审批那一关 ——
+     * 触发便宜(一次不阻塞的调用),入库贵(含糊的描述会永久占索引预算)。
+     */
+    minToolSteps: number;
+    /** 抽取调用的输出上限。**留空即跟随主模型** —— 理由见 memory.maxTokens */
+    maxTokens?: number;
   };
 
   // 可观测:LLM 调用留痕(本地调试用)
@@ -512,9 +547,27 @@ export const defaultConfig: AgentConfig = {
     // 拆成两个数会让同一段对话被重复分析,同一条特征反复 hits+1、虚高稳定度
     turnsPerExtraction: process.env.MEMORY_TURNS_PER_EXTRACTION
       ? parseInt(process.env.MEMORY_TURNS_PER_EXTRACTION) : 3,
-    // 思维链计入输出预算,给小了正文会空(与压缩那边同一个坑)
+    // 不给默认值 —— 留空即**跟随主模型**(MAIN_MAX_TOKENS)。
+    //
+    // 原先兜底 2000。那个数字是个暗默值:配了 MAIN_MAX_TOKENS 也管不到这里,
+    // 而 2000 在开着思维链时根本不够 —— 实测抽取调用把整份答案都想完了、
+    // 预算用尽,content 一个字都没轮到,4 次重试全是空内容(白等 2 分 40 秒)。
+    // 失败原因是预算不够,重试不会让预算变多。
     maxTokens: process.env.MEMORY_MAX_TOKENS
-      ? parseInt(process.env.MEMORY_MAX_TOKENS) : 2000,
+      ? parseInt(process.env.MEMORY_MAX_TOKENS) : undefined,
+  },
+  skill: {
+    // 默认开启:不触发时零开销(索引为空则提示里什么都不加)。
+    // 与记忆共用 memory.dbPath 那个文件,只是 key 不同
+    enabled: process.env.SKILL_ENABLED !== 'false',
+    // 8:一次任务跑到八步说明它需要来回摸索,那才值得记轨迹。
+    // 不用轮数门槛 —— 见 AgentConfig.skill 上的注释
+    minToolSteps: process.env.SKILL_MIN_TOOL_STEPS
+      ? parseInt(process.env.SKILL_MIN_TOOL_STEPS) : 8,
+    // 同记忆:不给默认值,留空即跟随主模型。见上面那段说明 ——
+    // 这里正是那个 bug 被实测抓到的地方(traces/app-1788091462247)
+    maxTokens: process.env.SKILL_MAX_TOKENS
+      ? parseInt(process.env.SKILL_MAX_TOKENS) : undefined,
   },
   trace: {
     // 默认开启:本地调试的主要手段,开销只有一次同步写盘
@@ -596,6 +649,9 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     retry: { ...defaultConfig.retry, ...overrides.retry },
     subAgent: { ...defaultConfig.subAgent, ...overrides.subAgent },
     memory: { ...defaultConfig.memory, ...overrides.memory },
+    // 漏了这一行不报错,只表现成「整段 overrides 生效但默认值丢失」
+    // (或反之)—— models.vision 就是这么漏过一次的
+    skill: { ...defaultConfig.skill, ...overrides.skill },
     // 复用上面那个 trace —— fsGrants 的归档 ro 授权是按它的 dir 派生的,
     // 在这里重新合并一次会让两者有机会不一致
     trace,

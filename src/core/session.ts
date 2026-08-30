@@ -63,6 +63,7 @@ import {
   ScreenshotTool,
   RequestHelpTool,
   RunCommandTool,
+  LoadSkillTool,
 } from '../tools/builtin/index.js';
 import { ContextManager, type Turn } from './context.js';
 import { turnsFile, readTurns, appendTurn } from './session-store.js';
@@ -75,6 +76,7 @@ import {
 import { LocalSubAgentRunner } from './sub-agent.js';
 import { LocalVisionAnalyzer } from './vision-analyzer.js';
 import { MemoryManager } from './memory-manager.js';
+import { SkillManager } from './skill-manager.js';
 import { buildMainSystemPrompt, type EnvironmentOptions } from './system-prompt.js';
 
 /** 装配期的一条提示。壳自己决定用什么颜色、放在哪 */
@@ -100,6 +102,14 @@ export interface CreateSessionOptions {
    * 等于让这个边界在某些壳里静默消失。
    */
   onConfirm: (req: ConfirmRequest) => Promise<boolean>;
+  /**
+   * 技能库变动的通知 —— 壳用它刷新待审批角标
+   *
+   * 必须是推送而不是让壳轮询:沉淀在 run() 返回**之后**才完成
+   * (那一步是 void 调用的,要等一次 LLM),壳在轮末自己拉列表
+   * 一定拉不到刚沉淀的那条。
+   */
+  onSkillsChanged?: () => void;
   /** 会话 id 前缀,用于区分 trace 目录(如 'cli' / 'app') */
   idPrefix?: string;
   /** 覆盖配置(测试用)。不传则从环境变量加载 */
@@ -165,6 +175,13 @@ export interface AgentSession {
   readonly recorder: TraceRecorder;
   readonly context: ContextManager;
   readonly memory?: MemoryManager;
+  /**
+   * 技能库 —— 壳靠它做审批
+   *
+   * 沉淀出来的轨迹一律 pending,审批前不进索引、load_skill 也取不到。
+   * 没有这个出口的话功能等于不存在:沉淀会发生、会写进库,但用户看不到也批不了。
+   */
+  readonly skills?: SkillManager;
   readonly info: SessionInfo;
   /** 装配期的告警 —— 壳决定怎么呈现 */
   readonly notices: readonly SessionNotice[];
@@ -544,6 +561,84 @@ export async function createAgentSession(
       })
     : undefined;
 
+  // ---------- 持久化存储(记忆与技能共用一个文件)----------
+  //
+  // 必须建在 `inherited` **之前**:技能读取要作为 skillReader 进那个对象,
+  // 而 SkillManager 需要这个 store。三者的依赖顺序是
+  // Storage → SkillManager → inherited,不能反。
+  //
+  // 建不建看**两个开关的并集**,不是只看 memory:
+  // 只开 skill 不开 memory 时若跳过建库,技能会静默失效(不报错,
+  // 只是索引永远为空、沉淀永远不发生)。
+  //
+  // 起不来只告警不阻塞 —— 记忆和技能都是增强,不该让会话因为它们跑不了。
+  // 技能与记忆同库不同 key:better-sqlite3 的 ABI 要跟着 Electron 重编,
+  // 不必为此再引一个存储依赖。
+  let sharedStorage: Storage | undefined;
+  let memory: MemoryManager | undefined;
+  let skillManager: SkillManager | undefined;
+
+  if (config.memory.enabled || config.skill.enabled) {
+    try {
+      sharedStorage = new Storage(config.memory.dbPath, logger);
+    } catch (e) {
+      notices.push({
+        level: 'warn',
+        message: `持久化存储不可用,长期记忆与技能库均已停用: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      });
+    }
+  }
+
+  if (sharedStorage && config.memory.enabled) {
+    try {
+      memory = new MemoryManager({
+        store: sharedStorage,
+        llmClient,
+        logger,
+        turnsPerExtraction: config.memory.turnsPerExtraction,
+        maxTokens: config.memory.maxTokens,
+        retry: config.retry,
+      });
+    } catch (e) {
+      notices.push({
+        level: 'warn',
+        message: `长期记忆不可用: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+  }
+
+  if (sharedStorage && config.skill.enabled) {
+    try {
+      skillManager = new SkillManager({
+        store: sharedStorage,
+        llmClient,
+        logger,
+        minToolSteps: config.skill.minToolSteps,
+        maxTokens: config.skill.maxTokens,
+        retry: config.retry,
+        onChanged: options.onSkillsChanged,
+      });
+    } catch (e) {
+      notices.push({
+        level: 'warn',
+        message: `技能库不可用: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+  }
+
+  // load_skill 在**这里**注册,不在上面那一批里 —— 它要等 skillManager 建好。
+  //
+  // 只有真装配起来了才注册:注册一个必然返回 ok:false 的工具会让模型
+  // 白花一步去试(与视觉插件「没配 VISION_MODEL 就不注册」同一条判断)。
+  //
+  // **不受 converged 影响**,两种模式下都注册。收敛针对的是「能力重复」——
+  // 工具与等价代码两条路,而实测两条都开时模型一律选工具。
+  // 但技能库从沙箱不可达,execute_python 里没有任何办法拿到轨迹,
+  // 不存在第二条路,收敛的前提不成立。
+  if (skillManager) registry.register(new LoadSkillTool());
+
   // ---------- 资源与安全边界(主 agent 与子 agent 共用同一份)----------
   // 抽成一个对象而不是两处各写一遍:逐字段转发实测漏过两次 ——
   // 先漏 visionAnalyzer,又漏 pythonExecutor,后者让子 agent 每次
@@ -561,6 +656,10 @@ export async function createAgentSession(
       ? new BrowserOps(pythonExecutor, browserManager.cdpUrl)
       : undefined,
     visionAnalyzer,
+    // 子 agent **能读**轨迹(它干的活同样需要流程指引),但拿不到写入能力 ——
+    // SkillReader 接口只有 load(),沉淀是主 agent 的轮末动作。
+    // 与「子 agent 拿不到 spawn」同一条原则:能力从结构上不给
+    skillReader: skillManager,
   };
 
   // ---------- 运行环境(主/子 agent 提示词同源)----------
@@ -612,39 +711,29 @@ export async function createAgentSession(
     getSignal,
   });
 
-  // ---------- 长期记忆 ----------
-  // 起不来只告警不阻塞:记忆是增强,不该让会话因为它跑不了
-  let memoryStorage: Storage | undefined;
-  let memory: MemoryManager | undefined;
-  if (config.memory.enabled) {
-    try {
-      memoryStorage = new Storage(config.memory.dbPath, logger);
-      memory = new MemoryManager({
-        store: memoryStorage,
-        llmClient,
-        logger,
-        turnsPerExtraction: config.memory.turnsPerExtraction,
-        maxTokens: config.memory.maxTokens,
-        retry: config.retry,
-      });
-    } catch (e) {
-      notices.push({
-        level: 'warn',
-        message: `长期记忆不可用: ${e instanceof Error ? e.message : String(e)}`,
-      });
-    }
-  }
+  // 记忆与技能的装配已移到 `inherited` 之前 ——
+  // skillReader 要进那个对象,而它依赖 sharedStorage(见那一段的注释)
 
   // 系统提示只在会话开始时加一次。后续每轮只传 user 消息,
   // 让 ContextManager 接到同一个 Turn 序列上(压缩才能真正生效)。
   //
   // 记忆拼在环境约定**之后**:它是「关于这位用户」的观察而非环境事实,
   // 混在一段里模型分不清哪些是硬约束
+  // 技能索引拼在**最后**:它是「以前怎么做成的」,而记忆是「关于这位用户」,
+  // 环境约定才是硬约束。三段的确定性递减,顺序照此排。
+  //
+  // 只拼**索引**(名字 + 一行描述),正文由 load_skill 按需取 ——
+  // 系统提示是 prompt cache 前缀里最稳定的部分(实测命中率 60~77%),
+  // 每轮注入不同的正文会让整段前缀失效,那个代价比多一次工具调用大得多。
+  const skillIndex = skillManager?.prompt() ?? '';
+
   context.addSystemMessage(
     buildMainSystemPrompt({
       ...environment,
       subAgentEnabled: config.subAgent.enabled,
-    }) + (memory?.prompt() ? '\n\n' + memory.prompt() : ''),
+    })
+    + (memory?.prompt() ? '\n\n' + memory.prompt() : '')
+    + (skillIndex ? '\n\n' + skillIndex : ''),
   );
 
   // ---------- 历史轮次(续接会话)----------
@@ -734,6 +823,7 @@ export async function createAgentSession(
     recorder,
     context,
     memory,
+    skills: skillManager,
     info,
     notices,
 
@@ -774,6 +864,22 @@ export async function createAgentSession(
       // 挡在这里会让用户干等一个与本轮无关的调用。
       // onTurnEnd 内部不抛异常(记忆是增强不是必需品)
       if (memory) void memory.onTurnEnd(context.peekTurns());
+
+      // 技能沉淀:同样**不 await**、同样不抛异常。
+      //
+      // 时机必须在这里,不能更晚:两个计数器会在下一次 addUserMessage()
+      // 清零(那是轮边界),挪到 run() 之外读就永远是 0。
+      //
+      // 轨迹取 peekTurns() 的最后一项 —— 刚结束那轮此刻还挂在 currentTurn 上,
+      // 而 peekTurns 会把它算进去(这正是它存在的理由)。
+      if (skillManager) {
+        const turns = context.peekTurns();
+        void skillManager.onTurnEnd(
+          turns[turns.length - 1],
+          context.getStats().currentTurn,
+          result.stopReason,
+        );
+      }
       return result;
     },
 
@@ -792,8 +898,9 @@ export async function createAgentSession(
 
     async dispose() {
       context.dispose();
-      // SQLite 句柄不关会留下 -wal/-shm 文件
-      memoryStorage?.close();
+      // SQLite 句柄不关会留下 -wal/-shm 文件。
+      // 记忆与技能共用这一个实例,所以只关一次
+      sharedStorage?.close();
       // 常驻浏览器是 detached 的,不随本进程退出。留下来会一直锁着
       // profile 目录,导致下次启动失败。
       // **只关自己创建的那个**:外部注入的由调用方负责(谁创建谁关闭)——

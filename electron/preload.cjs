@@ -94,6 +94,28 @@ contextBridge.exposeInMainWorld('AgentBridge', {
   openHistory: sessionId => ipcRenderer.invoke('history:open', sessionId),
   newSession: () => ipcRenderer.invoke('history:new'),
 
+  /**
+   * 技能审批
+   *
+   * 沉淀出来的轨迹一律待审批 —— 审批前不进索引、load_skill 也取不到。
+   * 三个方法都返回 { ok, changed?, skills } :审批完顺带把新列表带回来,
+   * 省一次往返(否则每次点完都要再拉一遍)。
+   */
+  listSkills: () => ipcRenderer.invoke('skills:list'),
+  approveSkill: name => ipcRenderer.invoke('skills:approve', name),
+  rejectSkill: name => ipcRenderer.invoke('skills:reject', name),
+
+  /**
+   * 技能库变动的推送
+   *
+   * 必须是推送而不是让渲染层在轮末自己拉一次:沉淀在 run() 返回**之后**
+   * 才完成(那一步是 void 调用的,要等一次 LLM),轮末拉一定拉不到
+   * 刚沉淀的那条 —— 表现成「跑完任务角标不动,重开窗口才冒出来」。
+   */
+  onSkillsChanged(cb) {
+    ipcRenderer.on('agent:skills-changed', () => cb());
+  },
+
   /** 会话重建(改了 workspace 这类需要重启的项之后) */
   restart: () => ipcRenderer.invoke('agent:restart'),
   onSessionChanged(cb) {

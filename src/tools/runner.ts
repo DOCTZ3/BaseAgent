@@ -10,6 +10,7 @@ import {
   ConfirmRequest,
   SubAgentRunner,
   VisionAnalyzer,
+  SkillReader,
 } from './contract.js';
 import { ToolRegistry } from './registry.js';
 import { Logger, ValidationError, SecurityError, ToolExecutionError, SecurityGuard, type FsGrant } from '../platform/index.js';
@@ -55,6 +56,9 @@ export interface RunnerConfig {
   // 视觉插件(实现在 core 层,由入口注入)。
   // 未提供 = 未配 VISION_MODEL,入口那边根本不会注册看图类工具
   visionAnalyzer?: VisionAnalyzer;
+  // skill 轨迹读取(实现在 core 层,由入口注入)。**只读接口**——
+  // 未提供 = skill 功能未启用,load_skill 返回 ok:false 说明原因
+  skillReader?: SkillReader;
 }
 
 /**
@@ -81,6 +85,9 @@ export type InheritableRunnerConfig = Pick<
   | 'shellExecutor'
   | 'browserOps'
   | 'visionAnalyzer'
+  // 子 agent **能读**轨迹:它干的活同样需要流程指引。
+  // 但拿不到写入能力 —— 沉淀是主 agent 的轮末动作,而接口本身只有 load()
+  | 'skillReader'
 >;
 
 export class ToolRunner {
@@ -186,6 +193,10 @@ export class ToolRunner {
         // 视觉插件由入口注入（实现在 core 层，要用 LLMClient）。
         // 未配 VISION_MODEL 时入口根本不注册看图类工具，所以这里通常不会是 undefined
         executors.vision = this.config.visionAnalyzer;
+      } else if (need === 'skill') {
+        // 轨迹读取由入口注入(实现在 core 层,要用 Storage)。
+        // 未启用时保持 undefined,工具自己返回 ok:false
+        executors.skill = this.config.skillReader;
       }
     }
 

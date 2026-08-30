@@ -152,8 +152,27 @@ export function pendingSkills(skills: readonly Skill[]): Skill[] {
   return skills.filter(s => s.pending);
 }
 
+/**
+ * 名字归一化 —— **只用于比对**,存储和展示一律用原样的名字
+ *
+ * 严格字符串相等在这里不够用,而且失败得很难看:抽取模型两次写出的名字
+ * 只要差一个空格、一个全角/半角标点,或者刚好在 MAX_NAME_LEN 处截断位置不同,
+ * 就会被当成两条不同的轨迹 push 进库 —— 界面上是两个**看起来一模一样**的名字,
+ * 而且各自带一半步骤,谁也不完整(实测踩到)。
+ *
+ * 去掉所有空白 + 转小写就够:中文名不受大小写影响,而空白是模型最常见的抖动。
+ * 不做更激进的归一(如去标点):那会把「导出-CSV」和「导出CSV」并成一条,
+ * 而它们可能真是两件事。
+ */
+function normalizeName(name: string): string {
+  return name.replace(/\s+/g, '').toLowerCase();
+}
+
 export function findSkill(skills: readonly Skill[], name: string): Skill | undefined {
-  return skills.find(s => s.name === name);
+  const target = normalizeName(name);
+  // 先试严格相等:模型照着索引原样抄名字时这是常态,一次命中不必扫两遍
+  return skills.find(s => s.name === name)
+    ?? skills.find(s => normalizeName(s.name) === target);
 }
 
 // ---------- 渲染 ----------
@@ -300,7 +319,16 @@ export function mergeSkillExtraction(
   }
 
   const skills = [...existing];
-  const idx = skills.findIndex(s => s.name === name);
+  // 归一化比对 —— **这一行正是重名 bug 的来源**。
+  //
+  // 原先是 `s.name === name`。抽取模型两次写出的名字差一个空格、一个全角标点,
+  // 或在 MAX_NAME_LEN 处截断位置不同,就配不上 → 走下面的 push 新建一条,
+  // 于是库里出现两个看起来一模一样的名字,各带一半步骤(实测踩到)。
+  //
+  // 命中之后写入用的仍是**老条目的名字**(见下面的 ...old),不用新抽出来的:
+  // 抽取提示词明确要求「不要改名已有的轨迹」,而名字是 load_skill 的调用参数 ——
+  // 悄悄改掉会让模型按索引里读到的名字去取,却取不到。
+  const idx = skills.findIndex(s => normalizeName(s.name) === normalizeName(name));
 
   if (idx >= 0) {
     const old = skills[idx];
@@ -314,7 +342,9 @@ export function mergeSkillExtraction(
       pending: true,
       updatedAt: now,
     };
-    return { skills, changed: 'updated', name };
+    // 回报**库里那个名字**,不是这次抽出来的。两者可能只差一个空格,
+    // 而日志里打新名字会让人以为库里存的是新的那个,查起来对不上
+    return { skills, changed: 'updated', name: old.name };
   }
 
   skills.push({

@@ -85,6 +85,22 @@
     newSession: () => bridge.newSession(),
   };
 
+  // 技能审批。
+  //
+  // 与配置保存不同,这里**不把 ok:false 翻成异常** —— 主进程的
+  // `{ok:false, error:'技能库未启用'}` 是一个正常状态(用户没开这个功能),
+  // 不是故障。翻成异常的话抽屉里会显示成红色的「执行失败」,
+  // 而正确的呈现是一句说明为什么列表是空的。
+  window.AgentSkills = {
+    list: () => bridge.listSkills(),
+    approve: name => bridge.approveSkill(name),
+    reject: name => bridge.rejectSkill(name),
+  };
+
+  // 沉淀完了刷角标。必须靠推送:抽取在 run() 返回**之后**才结束,
+  // 渲染层在轮末自己拉一次一定拉不到刚入库那条
+  bridge.onSkillsChanged(() => { void window.AgentApp.refreshSkills(); });
+
   // 窗口控制**不在这里包一层**:app.js 直接用 AgentBridge。
   // 包装过的话 app.js 就得等 bridge.js 执行完才能判断,而脚本顺序是
   // app.js 在前 —— 实测的后果是窗口按钮被整组隐藏、压根不出现。
@@ -95,6 +111,9 @@
     try {
       window.AgentApp.hydrate(await bridge.info());
       window.AgentApp.notices(await bridge.notices());
+      // 角标要在**没开抽屉**的时候就是对的 —— 那是它全部的意义。
+      // 不 await:技能列表读不出来不该挡住会话就绪
+      void window.AgentApp.refreshSkills();
       // 会话就绪后载入它的历史 —— 切会话时 session-changed 也会走到这里,
       // 所以切换后对话区自然被重画成那个会话的内容
       await window.AgentApp.loadHistory();
