@@ -28,7 +28,7 @@
 // - **带 `--system-site-packages`**:干净 venv 会让预装库全丢,
 //   而代码里的 pip 已被禁(BLOCK_PIP_INSTALL),模型装不回来
 // - **失败不阻塞启动**:回落到基础解释器并告警。沙箱能用但没有隔离,
-//   比 CLI 起不来好 —— 后者用户完全没法干活
+//   比 app 起不来好 —— 后者用户完全没法干活
 // - 解释器子路径按平台推导(Scripts/python.exe vs bin/python),不进配置:
 //   写进 .env 就会跟着机器漂移,而它是可推导的
 //
@@ -90,7 +90,7 @@ export function venvInterpreterPath(venvDir: string): string {
  *
  * 幂等:已存在且可用就直接返回,不重复创建。
  * 任何失败都回落到基础解释器 + 告警,不抛异常 —— 沙箱没有隔离仍能干活,
- * 而 CLI 起不来的话用户什么都干不了。
+ * 而 app 起不来的话用户什么都干不了。
  */
 export async function ensureSandboxVenv(
   opts: EnsureVenvOptions,

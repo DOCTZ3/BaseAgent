@@ -19,7 +19,7 @@
 // 改成惰性之后:只有真的 `new Storage(...)` 才碰原生模块。
 // 测试不构造它 → 417 个测试在本机 Node 上照常跑;
 // 客户端构造它 → 在 Electron 里加载,ABI 对得上。
-// 记忆功能在 CLI 下不可用,由 session.ts 那里降级处理(记忆是增强不是必需品)。
+// 记忆功能在 SQLite 不可用时会降级,由 session.ts 处理(记忆是增强不是必需品)。
 //
 // 用 createRequire 而不是 `await import()`:后者会把整条链变成异步,
 // Storage 的构造函数得跟着变 async —— 那会传染到所有调用方。

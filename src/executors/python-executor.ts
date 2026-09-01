@@ -72,6 +72,13 @@ export interface PythonExecutorConfig {
   /** 注入子进程的环境变量(如 BROWSER_PROFILE_DIR) */
   env?: Record<string, string>;
   /**
+   * 每次执行前动态追加的环境变量
+   *
+   * 常驻浏览器可能被用户手动关掉并自动重启,CDP 端口会随之变化。
+   * 构造期写死 BROWSER_CDP_URL 会让后续代码继续连旧端口。
+   */
+  beforeRun?: () => Promise<Record<string, string> | undefined> | Record<string, string> | undefined;
+  /**
    * 从父进程继承的环境变量白名单(键名精确匹配)
    *
    * 默认只继承 PATH 一类运行必需项。父进程的 env 里有 DEEPSEEK_API_KEY ——
@@ -185,7 +192,9 @@ export class PythonExecutor {
     await fs.writeFile(scriptPath, guardPrelude + bridgePrelude + code, 'utf-8');
 
     try {
+      const dynamicEnv = await this.config.beforeRun?.();
       const result = await this.spawnScript(scriptPath, timeout, startedAt, {
+        ...dynamicEnv,
         ...(useBridge ? { ...bridge!.env, BASEAGENT_RUN_ID: runId } : {}),
         ...options.env,
       });

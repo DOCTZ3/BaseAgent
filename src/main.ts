@@ -5,7 +5,7 @@
 // 装配全部在 core/session.ts。这里只演示「建会话 → 跑一轮 → 收尾」。
 //
 // 原先这个文件自己建了一份 PythonExecutor / ToolRunner / ContextManager /
-// Orchestrator —— 那是**第二份装配**,和 cli.ts 那份必然漂移。
+// Orchestrator —— 那会变成**第二份装配**,和 app 会话装配必然漂移。
 // 这个项目已经在「同一份事实写两处」上栽过四次(visionAnalyzer、
 // pythonExecutor、models.vision、fsDeniedPaths),所以这里改成消费 session。
 //

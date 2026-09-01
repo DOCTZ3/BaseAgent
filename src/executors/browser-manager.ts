@@ -75,7 +75,7 @@ export class BrowserManager {
   /**
    * 启动常驻浏览器
    *
-   * 幂等:已经在跑就直接返回。失败不抛异常 —— 浏览器起不来不该让整个 CLI 挂掉,
+   * 幂等:已经在跑就直接返回。失败不抛异常 —— 浏览器起不来不该让整个 app 挂掉,
    * 模型调用浏览器相关代码时自己会收到连接错误并改道。
    */
   async start(): Promise<boolean> {
@@ -314,7 +314,7 @@ export class BrowserManager {
     }
   }
 
-  // ---- lock 文件:CLI 被 Ctrl+C / 崩溃时 finally 可能来不及跑,
+  // ---- lock 文件:进程崩溃时 finally 可能来不及跑,
   //      于是把 pid+port 落盘,下次启动前主动清理
 
   private get lockPath(): string {

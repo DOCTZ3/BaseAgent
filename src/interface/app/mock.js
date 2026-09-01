@@ -84,7 +84,7 @@
         emit({ type: 'step', step: 4, maxSteps: 20 });
         const allowed = await window.AgentConfirm.ask({
           toolName: 'run_command',
-          // 反斜杠必须原样显示。被双写就等于骗了用户 —— CLI 那边有专门的测试锁这一点
+          // 反斜杠必须原样显示。被双写就等于骗了用户
           args: { command: 'python C:\\Users\\me\\scripts\\build.py --out D:\\tmp\\a.txt' },
         });
         emit({ type: 'tool_start', id: 't3', name: 'run_command', args: {} });
@@ -127,6 +127,7 @@
     baseURL: 'https://api.deepseek.com',
     visionModel: '',
     workspace: 'C:\\Users\\me\\work\\demo',
+    userDataDir: 'C:\\Users\\me\\AppData\\Roaming\\BaseAgent',
     pythonEnabled: true,
     allowDangerousTools: false,
     shellEnabled: true,

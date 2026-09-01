@@ -9,20 +9,7 @@
 
 * { box-sizing: border-box; }
 
-/*
-  hidden 属性必须真的能隐藏 —— 这一条不是保险,是修一个实际的 bug
-
-  浏览器默认样式表里 `[hidden] { display: none }` 的特异度是 (0,1,0),
-  而 `.modal-mask { display: flex }` / `.drawer { display: flex }` 同样是 (0,1,0)。
-  平手时**作者样式表赢过默认样式表**,于是这两个元素带着 hidden 也照样显示。
-
-  实测后果:确认框(z-index 20)铺满全屏拦掉所有点击,而它的按钮事件只在
-  ask() 里绑定、从未被调用 —— 表现成「界面卡在确认框上,点哪儿都没反应」,
-  而 DOM 里 hidden 属性明明是对的,所以从 JS 那边完全查不出问题。
-
-  用 !important 而不是给每个 mask 单独写 `&[hidden]`:后者要求每次新加
-  带 display 的可隐藏元素时都记得补一条,漏了又是同一个静默故障。
-*/
+/* 必须压过 .modal-mask/.drawer 的 display 规则;事故复盘见 pitfalls.md。 */
 [hidden] { display: none !important; }
 
 :root {
@@ -307,15 +294,7 @@ body {
 }
 .to-bottom:hover { background: var(--bg-hover); color: var(--fg); }
 
-/*
-  flex-shrink: 0 是这里的关键,不是保险
-
-  .stream 是 flex 容器(column),而 flex 项**默认 flex-shrink: 1** ——
-  内容超出容器高度时,每个 .msg 会被压扁、里面的文字被裁掉,
-  而容器的 scrollHeight 等于**压扁后**的高度之和。
-  于是表现成:最下面的内容看不见、滚轮到底也没用、窗口缩小时更严重。
-  这三个现象是同一个原因(实测踩到)。
-*/
+/* .stream 是 column flex 容器,.msg 不能随内容溢出被压扁。 */
 .msg { max-width: 780px; width: 100%; margin: 0 auto; flex-shrink: 0; }
 
 .msg.user {
@@ -428,12 +407,7 @@ body {
 @keyframes blink { to { visibility: hidden; } }
 
 /* ---------- 思考过程(按步分块) ----------
-   每步一个块,紧挨着它引发的那次工具调用。不聚合成一个总块 ——
-   那样第 4 步的推理会显示在第 2 步的工具调用上面(见 app.js 的注释)。
-
-   两种形态由字数决定:短的(≤80 字)平铺成一行灰字,长的给折叠块。
-   实测后续步骤的推理常常只有一句,给它套折叠块点开点关比读它还费劲。
-*/
+   短推理平铺,长推理折叠;按步分块的原因见 pitfalls.md。 */
 .think {
   margin-bottom: 8px;
   font-size: 13px;

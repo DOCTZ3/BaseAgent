@@ -274,7 +274,7 @@ describe('存储', () => {
     expect(loadMemory(makeStore())).toEqual([]);
   });
 
-  it('坏数据返回空数组而不是抛错 —— 记忆是增强,不该让 CLI 起不来', () => {
+  it('坏数据返回空数组而不是抛错 —— 记忆是增强,不该让 app 起不来', () => {
     const store = makeStore();
     store.set(MEMORY_KEY, '{ 这不是 JSON');
     expect(loadMemory(store)).toEqual([]);

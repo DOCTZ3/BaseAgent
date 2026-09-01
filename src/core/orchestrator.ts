@@ -34,7 +34,7 @@ export interface OrchestratorConfig {
   // 这样同一份 trace 里能区分调用来源、按子 agent 归因 token 与步数
   traceLabelPrefix?: string;
   /**
-   * 过程事件回调 —— 客户端/CLI 用它做实时展示
+   * 过程事件回调 —— 客户端用它做实时展示
    *
    * 只在**主循环**上给流式:压缩、摘要、记忆抽取那些单发调用的产物是
    * 给机器解析的 JSON,吐给用户没有意义(见 llm-client.ts 的 onDelta 注释)。
@@ -178,7 +178,7 @@ export class Orchestrator {
    * 「没人听就不付流式成本」的判断就永久为真了。
    *
    * 代价:同一个实例不可并发跑两轮(后者会覆盖前者的 sink)。
-   * 现有调用方都是串行的(CLI 排队、子 agent 各自新建实例),
+   * 现有调用方都是串行的(app 每轮锁输入、子 agent 各自新建实例),
    * 真要并发就该各建一个实例 —— 它本来也没有跨轮状态。
    */
   private sink?: AgentEventSink;

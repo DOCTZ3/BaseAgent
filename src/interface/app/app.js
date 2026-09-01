@@ -6,10 +6,7 @@
 // 一个能吐 AgentEvent 的传输。原型阶段由 mock.js 提供假事件流(file:// 双击可看),
 // 接上 server 之后换成 SSE —— 下面的渲染代码一行不改。
 //
-// 与 CLI 渲染器的区别不是「换了套颜色」:
-// - CLI 的 reset 要靠 ANSI 往上回退擦除(算终端行数),这里只是清空一个 DOM 节点
-// - CLI 每步结束要手动收掉未闭合的样式,这里没有这个概念
-// 所以两边不共用代码 —— 共用只会让两套逻辑互相将就。
+// app 渲染只处理 DOM,不承接终端式擦除/样式复位逻辑。
 //
 // 刻意**不显示** turn / token / 压缩次数 / trace 路径:那些是调试壳的东西。
 // ============================================
@@ -36,106 +33,90 @@
   };
 
   // ---------- 滚动 ----------
-  //
-  // 这三个函数**只有一份**,不各处直接写 scrollTop = scrollHeight。
-  // 原先是后者:六处散落的赋值,而「贴底判定」只存在于 newTurn 的闭包里 ——
-  // 于是新增一个滚动点就会漏掉按钮状态的同步,表现成「已经到底了按钮还亮着」。
 
   /** 距底 80px 以内算「贴着底部」。给余量是因为流式期间高度一直在变 */
   const BOTTOM_SLACK = 80;
+  const THINK_SLACK = 24;
+  let activeThinkBox = null;
 
-  const atBottom = () =>
-    els.stream.scrollHeight - els.stream.scrollTop - els.stream.clientHeight
-      <= BOTTOM_SLACK;
+  const onNextFrame = fn => {
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fn);
+    else setTimeout(fn, 0);
+  };
+
+  const atScrollEnd = (node, slack) =>
+    node.scrollHeight - node.scrollTop - node.clientHeight <= slack;
+
+  const atBottom = () => atScrollEnd(els.stream, BOTTOM_SLACK);
+
+  function currentThinkBox() {
+    if (activeThinkBox && !activeThinkBox.isConnected) activeThinkBox = null;
+    return activeThinkBox;
+  }
+
+  function scrollElementToBottom(node) {
+    node.scrollTop = node.scrollHeight;
+    onNextFrame(() => {
+      node.scrollTop = node.scrollHeight;
+    });
+  }
+
+  function scrollStreamToBottom() {
+    scrollElementToBottom(els.stream);
+    syncToBottomBtn();
+    onNextFrame(syncToBottomBtn);
+  }
 
   /** 无条件滚到底,并同步按钮 */
   function scrollToBottom() {
-    els.stream.scrollTop = els.stream.scrollHeight;
-    syncToBottomBtn();
+    const box = currentThinkBox();
+    if (box) scrollElementToBottom(box);
+    scrollStreamToBottom();
   }
 
-  /**
-   * 只在用户本来就贴着底部时才跟随
-   *
-   * 无条件跟随会让用户往上翻看历史时被一直拽回来 —— 而多步任务里
-   * 流式输出持续几十秒,那期间根本没法读前面的内容
-   */
-  function follow() {
-    if (atBottom()) els.stream.scrollTop = els.stream.scrollHeight;
-    syncToBottomBtn();
+  /** 只在用户本来就贴着底部时才跟随。调用方要传入 DOM 更新前的快照。 */
+  function follow(wasAtBottom = atBottom()) {
+    if (wasAtBottom) scrollStreamToBottom();
+    else syncToBottomBtn();
+  }
+
+  function activeThinkBehind() {
+    const box = currentThinkBox();
+    return !!box && !atScrollEnd(box, THINK_SLACK);
   }
 
   /** 按钮只在往上翻走之后出现:贴底时它没用,常驻会挡住右下角的正文 */
   function syncToBottomBtn() {
-    if (els.toBottom) els.toBottom.hidden = atBottom();
+    if (els.toBottom) els.toBottom.hidden = atBottom() && !activeThinkBehind();
   }
 
-  /**
-   * 推理块**自己**的跟随 —— 这不是锦上添花,是修一个实际的 bug
-   *
-   * .think-text 有 max-height: 300px + overflow-y: auto。长推理填满之后,
-   * 后续增量进的是**这个盒子自己的**滚动区,而 follow() 滚的是外层 .stream ——
-   * 它从来不碰这个盒子。于是外层早就到底、滚不动了,文字还在 300px 窗口
-   * 下面继续长(第一步的推理常有几百字)。
-   * 表现成「还在跑,但页面滚不下去了,下面明明还有内容」——
-   * 而从外层看一切正常:scrollHeight 没变,因为盒子高度是固定的。
-   *
-   * 余量比外层的 80 小:那是给整页留的,放在 300px 的窗口里太宽松 ——
-   * 差 80px 时就判定「不算贴底」而停止跟随,等于差三行就不跟了。
-   */
-  const THINK_SLACK = 24;
-
-  function followThink(box) {
-    if (box.scrollHeight - box.scrollTop - box.clientHeight <= THINK_SLACK) {
-      box.scrollTop = box.scrollHeight;
-    }
+  /** 推理块自己也是滚动区,不能只滚外层 .stream。详见 pitfalls.md。 */
+  function followThink(box, wasAtBottom = atScrollEnd(box, THINK_SLACK)) {
+    if (wasAtBottom) scrollElementToBottom(box);
   }
 
   els.stream.addEventListener('scroll', syncToBottomBtn);
   els.toBottom?.addEventListener('click', () => {
-    els.stream.scrollTo({ top: els.stream.scrollHeight, behavior: 'smooth' });
-    // 平滑滚动是异步的,scroll 事件会在滚动过程中把按钮点掉,不必手动同步
+    scrollToBottom();
   });
 
   // ---------- 一轮的渲染状态 ----------
-  //
-  // 每轮新建。**不能提到模块作用域** —— 上一轮的 answer 节点留着,
-  // 下一轮的正文就会续写到上一轮的气泡里(CLI 那边我刚踩过同类的坑:
-  // streamed 标志泄漏导致回答整段消失)。
   function newTurn() {
     const wrap = document.createElement('div');
     wrap.className = 'msg';
     els.stream.appendChild(wrap);
 
-    // 推理**按步分块**,不聚合成一个总的「思考过程」。
-    //
-    // 聚合的问题不是审美而是**顺序错了**:块的位置在第一次推理到达时就定下,
-    // 于是第 4 步的推理在视觉上出现在第 2 步的工具调用**上面** ——
-    // 而「这段推理导致了那次工具调用」正是这个界面最该表达的东西。
-    // ChatGPT 那种「Thought for 8s」能聚合,是因为推理是不可分割的前置阶段、
-    // 中间没有别的东西交错;一旦工具调用夹在推理之间,聚合必然破坏因果关系。
-    let think = null;      // 当前步的推理块 { el, body, text, touched }
+    // 一轮一份状态;推理按步分块,否则会错置推理与工具调用的因果顺序。
+    let think = null;      // 当前步的推理块 { el, sum, body, node, text }
     let answer = null;     // 正文节点
+    let answerText = null; // 流式期间只追加文本节点,避免长回答反复重写整段 DOM
     let buf = '';          // 正文原文。done 时用它做一次性 Markdown 渲染
     const tools = new Map();   // id → 标签节点
-
-    // atBottom / follow 用模块级那一份(见文件顶部的「滚动」段)。
-    // 这里原先有一份同名的闭包实现 —— 两份并存时「回到底部」按钮的状态
-    // 同步只发生在其中一份里,表现成「已经到底了按钮还亮着」
 
     /** 短推理的字数上限 —— 到此为止不给折叠块 */
     const THINK_FLAT = 80;
 
-    /**
-     * 收掉当前推理块 —— 工具开始、正文开始、进入下一步、本轮结束时都要调
-     *
-     * 长度决定形态,这是从 trace 里看出来的:第一步的推理通常几百字(在规划),
-     * 后续常常只有一句 —— 实测有一步只是「我的代码有个语法错误,反斜杠转义了
-     * 引号,让我修复」。给这种一句话套个折叠块,点开点关比读它还费劲。
-     *
-     * 折叠时 summary 带一段预览而不只写「思考」:否则用户无法判断值不值得点开,
-     * 而多步任务里会有四五个这种块。
-     */
+    /** 收掉当前推理块:工具开始、正文开始、进入下一步、本轮结束时都要调。 */
     function closeThink() {
       if (!think) return;
       const text = think.text.trim();
@@ -152,11 +133,14 @@
         think.sum.textContent = `思考 · ${preview}…`;
         think.sum.title = `${text.length} 字,点击展开`;
       }
+      if (activeThinkBox === think.body) activeThinkBox = null;
       think = null;   // 置空是关键:下一段推理会新建块,于是顺序天然对上
     }
 
     return {
       reasoning(text) {
+        const wasStreamAtBottom = atBottom();
+        let wasThinkAtBottom = true;
         if (!think) {
           // 用 <details> 而不是 div,是为了收尾时能原地折起来 ——
           // 换元素类型要做 DOM 手术,而流式中途换节点会让已渲染的文字闪一下
@@ -167,24 +151,33 @@
           sum.textContent = '思考';
           const body = document.createElement('div');
           body.className = 'think-text';
+          body.addEventListener('scroll', syncToBottomBtn);
+          const node = document.createTextNode('');
+          body.appendChild(node);
           el.append(sum, body);
           wrap.appendChild(el);
-          think = { el, sum, body, text: '' };
+          think = { el, sum, body, node, text: '' };
+          activeThinkBox = body;
+        } else {
+          wasThinkAtBottom = atScrollEnd(think.body, THINK_SLACK);
         }
         think.text += text;
-        think.body.textContent = think.text;
+        think.node.appendData(text);
         // 两个滚动区都要跟:外层 .stream 和推理块**自己**那个 300px 的窗口。
         // 只跟外层就是「还在跑却滚不下去」那个 bug(见 followThink 的注释)
-        followThink(think.body);
-        follow();
+        followThink(think.body, wasThinkAtBottom);
+        follow(wasStreamAtBottom);
       },
 
       content(text) {
+        const wasStreamAtBottom = atBottom();
         if (!answer) {
           // 正文开始 = 本步推理结束,先把上面那块收掉
           closeThink();
           answer = document.createElement('div');
           answer.className = 'answer streaming';
+          answerText = document.createTextNode('');
+          answer.appendChild(answerText);
           wrap.appendChild(answer);
           buf = '';
         }
@@ -195,44 +188,58 @@
         // textContent 而非 innerHTML:模型输出是不可信文本,
         // 里面完全可能有 <script> 或从网页抓来的 HTML 片段
         buf += text;
-        answer.textContent = buf;
-        follow();
+        answerText.appendData(text);
+        follow(wasStreamAtBottom);
       },
 
       /** 重试:丢弃本步已收到的全部增量 */
       reset() {
+        const wasStreamAtBottom = atBottom();
         // 整块删掉而不是清空文本:重试会从头再说一遍,留着空块
         // 会在页面上攒下一串空壳
-        if (think) { think.el.remove(); think = null; }
+        if (think) {
+          if (activeThinkBox === think.body) activeThinkBox = null;
+          think.el.remove();
+          think = null;
+        }
         // buf 必须跟着清:不清的话重试后的正文会拼在上一次那半截后面,
         // 而 done 渲染的是 buf —— 用户看到同一段话说了两遍
         buf = '';
-        if (answer) { answer.remove(); answer = null; }
+        if (answer) { answer.remove(); answer = null; answerText = null; }
         const n = document.createElement('div');
         n.className = 'step-sep';
         n.textContent = '(重试,重新生成…)';
         wrap.appendChild(n);
-        follow();
+        follow(wasStreamAtBottom);
       },
 
       step(step, maxSteps) {
+        const wasStreamAtBottom = atBottom();
         // 新的一步开始 —— 上一步的推理块到此为止(哪怕没有工具调用)
         closeThink();
         // 第一步不报:刚点发送就跳「第 1 步」是噪音
-        if (step <= 1) return;
+        if (step <= 1) {
+          follow(wasStreamAtBottom);
+          return;
+        }
         const n = document.createElement('div');
         n.className = 'step-sep';
         n.textContent = `第 ${step} / ${maxSteps} 步`;
         wrap.appendChild(n);
-        follow();
+        follow(wasStreamAtBottom);
       },
 
       toolStart(id, name) {
+        const wasStreamAtBottom = atBottom();
         // 工具要跑了 —— 本步的推理和正文都到此结束。
         // **这一处是顺序正确的关键**:推理块在工具标签之前收口,
         // 于是「这段推理 → 这次工具调用」的先后关系在 DOM 里成立
         closeThink();
-        if (answer) { answer.classList.remove('streaming'); answer = null; }
+        if (answer) {
+          answer.classList.remove('streaming');
+          answer = null;
+          answerText = null;
+        }
 
         const tag = document.createElement('div');
         tag.className = 'tool running';
@@ -248,10 +255,11 @@
         tag.append(dot, nm, sm);
         wrap.appendChild(tag);
         tools.set(id, tag);
-        follow();
+        follow(wasStreamAtBottom);
       },
 
       toolEnd(id, ok, summary) {
+        const wasStreamAtBottom = atBottom();
         const tag = tools.get(id);
         if (!tag) return;   // 没配上就跳过,不要让展示层的意外影响别的渲染
         tag.className = `tool ${ok ? 'ok' : 'fail'}`;
@@ -259,7 +267,7 @@
         const sm = tag.querySelector('.sum');
         sm.textContent = summary || (ok ? '完成' : '失败');
         sm.title = summary || '';   // 截断了,悬停看全文
-        follow();
+        follow(wasStreamAtBottom);
       },
 
       /**
@@ -279,6 +287,7 @@
           // 渲染器只构造 DOM 节点、不碰 innerHTML,所以不需要额外消毒
           answer.classList.add('md');
           md.into(answer, buf);
+          answerText = null;
         }
 
         if (!answer && finalAnswer) {
@@ -310,6 +319,7 @@
 
       fail(message) {
         if (answer) answer.classList.remove('streaming');
+        answerText = null;
         note(wrap, message, true);
         scrollToBottom();
       },
@@ -618,6 +628,10 @@
     $('cfg-workspace').value = picked;
     applyWorkspace(picked);
     syncShellHint();
+  });
+
+  $('btn-open-data').addEventListener('click', async () => {
+    await window.AgentBridge?.openUserDataDir?.();
   });
 
   function applyWorkspace(p) {
@@ -1066,6 +1080,7 @@
       $('cfg-model').value = info.model || '';
       $('cfg-vision').value = info.visionModel || '';
       $('cfg-workspace').value = info.workspace || '';
+      $('cfg-data-dir').value = info.userDataDir || '';
       $('cfg-python').checked = !!info.pythonEnabled;
       $('cfg-danger').checked = !!info.allowDangerousTools;
       // 回填**用户勾的那个原始值**,不是合成后的生效值。
@@ -1090,7 +1105,7 @@
       syncShellHint();
     },
 
-    /** 装配期告警 —— 与 CLI 的 session.notices 同一份东西 */
+    /** 装配期告警 —— 来自 session.notices,壳只负责呈现 */
     notices(list) {
       for (const n of list || []) {
         const wrap = document.createElement('div');

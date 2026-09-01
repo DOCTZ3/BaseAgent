@@ -2,7 +2,7 @@
 <!--
   客户端界面(原型阶段:用 mock.js 的假事件流驱动)
 
-  刻意**不显示** turn / token / 压缩次数 / trace 路径 —— 那些是调试壳(CLI)的
+  刻意**不显示** turn / token / 压缩次数 / trace 路径 —— 那些是内部调试信息,
   东西。这里只呈现三样用户真正要看的:思考过程、工具调用、回答正文。
 
   用普通 <script> 而非 type="module":后者在 file:// 下受 CORS 限制打不开,
@@ -128,6 +128,14 @@
         <button class="btn" id="btn-pick">选择…</button>
       </div>
       <p class="warn" id="ws-warn" hidden>未选择工作区时,所有文件类工具与代码执行都会被拒绝。</p>
+    </section>
+
+    <section>
+      <h3>本机数据 <span class="hint">配置、历史、trace、记忆和浏览器登录态</span></h3>
+      <div class="path-row">
+        <input type="text" id="cfg-data-dir" readonly placeholder="(仅 Electron 客户端可见)">
+        <button class="btn" id="btn-open-data">打开</button>
+      </div>
     </section>
 
     <section>

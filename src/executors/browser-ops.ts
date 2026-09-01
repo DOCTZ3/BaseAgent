@@ -33,11 +33,11 @@ export interface ScreenshotResult {
 export class BrowserOps {
   constructor(
     private python: PythonExecutor,
-    private cdpUrl: string,
+    private getCdpUrl: () => string,
   ) {}
 
   get available(): boolean {
-    return !!this.cdpUrl;
+    return !!this.getCdpUrl();
   }
 
   /**
@@ -52,6 +52,11 @@ export class BrowserOps {
     selector?: string;
   } = {}): Promise<ScreenshotResult> {
     const out = path.join(os.tmpdir(), `baseagent-shot-${randomUUID()}.png`);
+    const cdpUrl = this.getCdpUrl();
+    if (!cdpUrl) {
+      return { ok: false, error: '浏览器未启动或 CDP 地址不可用' };
+    }
+
     const target = opts.selector
       ? `page.locator(${JSON.stringify(opts.selector)}).first`
       : 'page';
@@ -63,7 +68,7 @@ from playwright.sync_api import sync_playwright
 result = {"ok": False}
 try:
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(${JSON.stringify(this.cdpUrl)})
+        browser = p.chromium.connect_over_cdp(os.environ["BROWSER_CDP_URL"])
         ctx = browser.contexts[0]
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         ${target}.screenshot(path=${JSON.stringify(out)}${

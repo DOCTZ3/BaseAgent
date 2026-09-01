@@ -153,7 +153,7 @@ export class ToolBridge {
 
     return new Promise(resolve => {
       server.once('error', err => {
-        // 桥起不来不该拖垮 CLI:代码执行仍可用,只是少了这几个函数
+        // 桥起不来不该拖垮 app:代码执行仍可用,只是少了这几个函数
         this.config.logger.error('工具桥启动失败', { error: String(err) });
         resolve(false);
       });

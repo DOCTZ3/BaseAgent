@@ -68,6 +68,7 @@ contextBridge.exposeInMainWorld('AgentBridge', {
 
   /** 目录选择:原生对话框,返回真实绝对路径 */
   pickDirectory: () => ipcRenderer.invoke('dialog:pick-directory'),
+  openUserDataDir: () => ipcRenderer.invoke('app:open-user-data'),
 
   /** 注册确认处理器 */
   onConfirm(handler) { confirmHandler = handler; },

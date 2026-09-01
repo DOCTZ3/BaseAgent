@@ -282,7 +282,7 @@ const StoredSchema = z.object({
  * 读取记忆
  *
  * 解析失败返回空数组而不是抛错:记忆是**增强**,不是必需品。
- * 一条坏记录不该让 CLI 起不来 —— 那是用可用性换一个可有可无的功能。
+ * 一条坏记录不该让 app 起不来 —— 那是用可用性换一个可有可无的功能。
  */
 export function loadMemory(store: MemoryStore, logger?: Logger): MemoryEntry[] {
   const raw = store.get(MEMORY_KEY);

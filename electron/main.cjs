@@ -16,11 +16,18 @@
 //    而你改的是新代码。开发期直接吃源码更可靠。
 // ============================================
 
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
+const { pathToFileURL } = require('url');
+
+const appRoot = path.join(__dirname, '..');
 
 // .env 仍然读 —— 它是配置的**回落**,现有 .env 一个字不用改
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+require('dotenv').config({ path: path.join(appRoot, '.env') });
+
+// 与 config-store.ts 的 BaseAgent 目录保持一致;否则 userData 可能跟随
+// package name 变成 base-agent,配置和运行时产物分散到两个目录。
+app.setName('BaseAgent');
 
 let win = null;
 let session = null;          // AgentSession
@@ -39,18 +46,29 @@ let confirmSeq = 0;
  */
 let createSharedBrowser = null;
 
-async function loadAgentModule() {
-  if (createAgentSession) return createAgentSession;
+function moduleUrl(devRelativePath, packagedRelativePath) {
+  const relative = app.isPackaged ? packagedRelativePath : devRelativePath;
+  return pathToFileURL(path.join(appRoot, relative)).href;
+}
 
-  const tsxUrl = require('url').pathToFileURL(
-    require.resolve('tsx/esm/api', { paths: [path.join(__dirname, '..')] }),
+async function registerTsxForDevelopment() {
+  if (app.isPackaged) return;
+  const tsxUrl = pathToFileURL(
+    require.resolve('tsx/esm/api', { paths: [appRoot] }),
   ).href;
   const tsx = await import(tsxUrl);
   tsx.register();
+}
 
-  const sessionUrl = require('url').pathToFileURL(
-    path.join(__dirname, '..', 'src', 'core', 'session.ts'),
-  ).href;
+async function loadAgentModule() {
+  if (createAgentSession) return createAgentSession;
+
+  await registerTsxForDevelopment();
+
+  const sessionUrl = moduleUrl(
+    path.join('src', 'core', 'session.ts'),
+    path.join('dist', 'core', 'session.js'),
+  );
   const mod = await import(sessionUrl);
   createAgentSession = mod.createAgentSession;
   createSharedBrowser = mod.createSharedBrowser;
@@ -75,6 +93,105 @@ async function ensureBrowser(config) {
   // 启动失败不抛:没有浏览器仍能干别的活
   sharedBrowser = await createSharedBrowser(config, console);
   return sharedBrowser;
+}
+
+/**
+ * Electron app 的运行时数据目录
+ *
+ * 开发期从项目根启动时,`traces` / `.agent-memory.db` / `.sandbox-venv`
+ * 落在项目根目录很方便;但打包后 process.cwd() 不再是可靠边界,可能是
+ * 安装目录、快捷方式启动目录,甚至用户解压包的位置。
+ *
+ * app.getPath('userData') 是 Electron 为每个系统准备的可写用户目录:
+ * Windows: %APPDATA%/<AppName>
+ * macOS:   ~/Library/Application Support/<AppName>
+ * Linux:   ~/.config/<AppName>
+ */
+function appRuntimeOverrides() {
+  const dataDir = app.getPath('userData');
+  const out = {};
+
+  // 环境变量仍保留最高优先级,方便开发/排障时显式指定。
+  if (!process.env.TRACE_DIR) {
+    out.trace = { dir: path.join(dataDir, 'traces') };
+  }
+  if (!process.env.MEMORY_DB_PATH) {
+    out.memory = { dbPath: path.join(dataDir, 'agent-memory.db') };
+  }
+  if (!process.env.SANDBOX_VENV_DIR || !process.env.BROWSER_PROFILE_DIR) {
+    out.python = {};
+    if (!process.env.SANDBOX_VENV_DIR) {
+      out.python.venvDir = path.join(dataDir, 'sandbox-venv');
+    }
+    if (!process.env.BROWSER_PROFILE_DIR) {
+      out.python.browserProfileDir = path.join(dataDir, 'browser-profile');
+    }
+  }
+
+  return out;
+}
+
+function mergeConfigOverrides(...items) {
+  const merged = {};
+  const sectionKeys = new Set([
+    'execution',
+    'security',
+    'python',
+    'shell',
+    'retry',
+    'subAgent',
+    'memory',
+    'skill',
+    'trace',
+  ]);
+
+  for (const item of items) {
+    if (!item) continue;
+
+    for (const [key, value] of Object.entries(item)) {
+      if (value === undefined) continue;
+
+      if (key === 'models') {
+        merged.models = { ...(merged.models || {}) };
+        for (const [modelKey, modelValue] of Object.entries(value || {})) {
+          merged.models[modelKey] = {
+            ...(merged.models[modelKey] || {}),
+            ...(modelValue || {}),
+          };
+        }
+        continue;
+      }
+
+      if (key === 'context') {
+        merged.context = { ...(merged.context || {}), ...(value || {}) };
+        if (value?.compressionClip) {
+          merged.context.compressionClip = {
+            ...(merged.context.compressionClip || {}),
+            ...value.compressionClip,
+          };
+        }
+        continue;
+      }
+
+      if (sectionKeys.has(key) && value && typeof value === 'object') {
+        merged[key] = { ...(merged[key] || {}), ...value };
+        continue;
+      }
+
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+async function loadAppConfigOverrides() {
+  const { readConfigFile, toOverrides } = await loadConfigStore();
+  return mergeConfigOverrides(appRuntimeOverrides(), toOverrides(readConfigFile()));
+}
+
+async function loadEffectiveConfig() {
+  const { loadConfig } = await loadPlatformConfig();
+  return loadConfig(await loadAppConfigOverrides());
 }
 
 /**
@@ -138,14 +255,17 @@ async function createSession(resumeSessionId) {
   // 由**壳**读出来当 overrides 传进去,而不是让 session.ts 自己读文件 ——
   // 那样所有测试都会读到运行机器上的 config.json,于是同一份测试在
   // 你机器上过、在别的机器上挂,而且挂的原因不在代码里。
-  const { readConfigFile, toOverrides } = await loadConfigStore();
-  const configOverrides = toOverrides(readConfigFile());
+  const configOverrides = await loadAppConfigOverrides();
 
   // 浏览器要在建会话**之前**就位:会话装配时要拿它的 CDP 地址注入
   // 子进程环境变量(BROWSER_CDP_URL),晚了模型代码就连不上。
   // 用同一份 config 建 —— profile 路径的解析必须与会话里的读黑名单同源
   const { loadConfig } = await loadPlatformConfig();
-  const browser = await ensureBrowser(loadConfig(configOverrides));
+  const config = loadConfig(configOverrides);
+  if (!config.models.main.apiKey) {
+    throw new Error('未设置 DEEPSEEK_API_KEY,无法调用真实 API');
+  }
+  const browser = await ensureBrowser(config);
 
   session = await factory({
     idPrefix: 'app',
@@ -193,7 +313,7 @@ function createWindow() {
     },
   });
 
-  win.loadFile(path.join(__dirname, '..', 'src', 'interface', 'app', 'index.html'));
+  win.loadFile(path.join(appRoot, 'src', 'interface', 'app', 'index.html'));
   win.once('ready-to-show', () => win.show());
 
   // 页面里的外链走系统浏览器,不在应用窗口里导航 ——
@@ -282,12 +402,16 @@ ipcMain.on('agent:confirm-reply', (_e, reqId, ok) => {
 // pythonDir 曾经两处各算一份,而错位不报错、只表现成
 // 「venv 里装了、代码里 import 不到」
 ipcMain.handle('agent:info', async () => {
-  const s = await ensureSession();
-  const c = s.config;
+  const s = session;
+  const c = s ? s.config : await loadEffectiveConfig();
+  const main = c.models.main;
+  const shellEnabled =
+    s ? s.info.shellEnabled : c.shell.enabled && !!c.workspace && c.security.allowDangerousTools;
+
   return {
-    model: s.info.model,
-    baseURL: s.info.baseURL,
-    visionModel: s.info.visionModel || '',
+    model: s ? s.info.model : main.model,
+    baseURL: s ? s.info.baseURL : main.baseURL,
+    visionModel: s ? s.info.visionModel || '' : c.models.vision?.model || '',
     workspace: c.workspace || '',
     pythonEnabled: c.python.enabled,
     allowDangerousTools: c.security.allowDangerousTools,
@@ -296,7 +420,7 @@ ipcMain.handle('agent:info', async () => {
     // - shellConfigured 是用户勾的那个原始值
     // 只给合成值会静默丢配置:勾了 shell 但没勾「允许危险工具」时,
     // 面板回填成未勾选,用户下次保存就把自己存的 true 写成了 false
-    shellEnabled: s.info.shellEnabled,
+    shellEnabled,
     shellConfigured: c.shell.enabled,
     subAgentEnabled: c.subAgent.enabled,
     memoryEnabled: c.memory.enabled,
@@ -305,14 +429,30 @@ ipcMain.handle('agent:info', async () => {
     maxTokens: c.models.main.maxTokens,
     maxSteps: c.execution.maxSteps,
     enableThinking: c.models.main.enableThinking,
+    userDataDir: app.getPath('userData'),
     // 只给掩码。明文 key 不进渲染进程 —— 那里跑着不可信内容
-    apiKeyMasked: maskKey(c.models.main.apiKey),
+    apiKeyMasked: maskKey(main.apiKey),
   };
 });
 
 ipcMain.handle('agent:notices', async () => {
-  const s = await ensureSession();
-  return s.notices;
+  if (session) return session.notices;
+
+  const c = await loadEffectiveConfig();
+  const notices = [];
+  if (!c.models.main.apiKey) {
+    notices.push({
+      level: 'error',
+      message: 'DEEPSEEK_API_KEY 未配置,请先在配置面板填写 API key。',
+    });
+  }
+  if (!c.workspace) {
+    notices.push({
+      level: 'warn',
+      message: 'WORKSPACE 未配置,文件类工具与代码执行将全部被拒绝。',
+    });
+  }
+  return notices;
 });
 
 function maskKey(k) {
@@ -332,6 +472,11 @@ ipcMain.handle('dialog:pick-directory', async () => {
     properties: ['openDirectory', 'createDirectory'],
   });
   return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('app:open-user-data', async () => {
+  await shell.openPath(app.getPath('userData'));
+  return true;
 });
 
 // ---------- IPC:配置 ----------
@@ -374,11 +519,16 @@ ipcMain.handle('config:save', async (_e, patch) => {
 ipcMain.handle('history:list', async () => {
   const { listSessions } = await loadSessionStore();
   const { loadConfig } = await loadPlatformConfig();
-  return listSessions(loadConfig().trace.dir);
+  return listSessions(loadConfig(await loadAppConfigOverrides()).trace.dir);
 });
 
 /** 当前会话的完整原始对话 —— 前端渲染历史用 */
 ipcMain.handle('history:current', async () => {
+  // 启动时渲染层会调用它来恢复当前视图。这里不能顺手创建完整会话:
+  // 建会话会检查 venv、起浏览器、启动工具桥,直接把“打开窗口”拖慢。
+  // 真正需要会话的是发送消息或显式打开某段历史。
+  if (!session) return { sessionId: null, turns: [] };
+
   const s = await ensureSession();
   return { sessionId: s.sessionId, turns: s.history() };
 });
@@ -406,12 +556,18 @@ ipcMain.handle('history:new', async () => {
 
 /** 全部技能(含待审批)。渲染层自己按 pending 分组 */
 ipcMain.handle('skills:list', async () => {
+  // 启动时会刷新角标,但不能为了角标创建完整会话。技能库是增强能力,
+  // 首屏响应优先;会话建好后 onSessionChanged / onSkillsChanged 会再刷新。
+  if (!session) return { ok: false, error: '会话尚未启动' };
+
   const s = await ensureSession();
   if (!s.skills) return { ok: false, error: '技能库未启用' };
   return { ok: true, skills: s.skills.list() };
 });
 
 ipcMain.handle('skills:approve', async (_e, name) => {
+  if (!session) return { ok: false, error: '会话尚未启动' };
+
   const s = await ensureSession();
   if (!s.skills) return { ok: false, error: '技能库未启用' };
 
@@ -423,6 +579,8 @@ ipcMain.handle('skills:approve', async (_e, name) => {
 });
 
 ipcMain.handle('skills:reject', async (_e, name) => {
+  if (!session) return { ok: false, error: '会话尚未启动' };
+
   const s = await ensureSession();
   if (!s.skills) return { ok: false, error: '技能库未启用' };
 
@@ -432,16 +590,18 @@ ipcMain.handle('skills:reject', async (_e, name) => {
 
 async function loadSessionStore() {
   await loadAgentModule();
-  return import(require('url').pathToFileURL(
-    path.join(__dirname, '..', 'src', 'core', 'session-store.ts'),
-  ).href);
+  return import(moduleUrl(
+    path.join('src', 'core', 'session-store.ts'),
+    path.join('dist', 'core', 'session-store.js'),
+  ));
 }
 
 async function loadPlatformConfig() {
   await loadAgentModule();
-  return import(require('url').pathToFileURL(
-    path.join(__dirname, '..', 'src', 'platform', 'config.ts'),
-  ).href);
+  return import(moduleUrl(
+    path.join('src', 'platform', 'config.ts'),
+    path.join('dist', 'platform', 'config.js'),
+  ));
 }
 
 ipcMain.handle('agent:restart', async () => {
@@ -449,19 +609,30 @@ ipcMain.handle('agent:restart', async () => {
     // 装配中途点了保存。等它落地再关,不然会漏掉一个 chromium
     try { await sessionPromise; } catch { /* 装配本身失败,下面照常重建 */ }
   }
+
   const old = session;
   session = null;
   await old?.dispose();
+
+  const config = await loadEffectiveConfig();
+  // 如果本来就没有会话,保存配置只需要刷新界面事实,不必立刻装配 agent。
+  // 第一轮消息会按最新配置懒创建;这能避免“保存/启动就等 venv+浏览器”的卡顿。
+  if (!old || !config.models.main.apiKey) {
+    if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
+    return true;
+  }
+
   await ensureSession();
   if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
   return true;
 });
 
 async function loadConfigStore() {
-  const url = require('url').pathToFileURL(
-    path.join(__dirname, '..', 'src', 'platform', 'config-store.ts'),
-  ).href;
-  await loadAgentModule();   // 确保 tsx 注册器已装
+  await registerTsxForDevelopment();
+  const url = moduleUrl(
+    path.join('src', 'platform', 'config-store.ts'),
+    path.join('dist', 'platform', 'config-store.js'),
+  );
   return import(url);
 }
 

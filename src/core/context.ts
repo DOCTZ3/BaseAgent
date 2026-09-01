@@ -565,7 +565,7 @@ export class ContextManager {
    * 只读快照当前消息列表（观测用，不触发压缩）
    *
    * 与 preparePrompt() 的区别：后者会检查并执行 Mid-Turn 压缩。
-   * CLI 的 /context 命令必须用这个，否则「看一眼上下文」会改变上下文。
+   * 调试视图必须用这个,否则「看一眼上下文」会改变上下文。
    */
   peekMessages(): readonly Message[] {
     return this.messages;

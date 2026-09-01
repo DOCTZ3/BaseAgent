@@ -43,7 +43,7 @@ describe('ToolRegistry', () => {
   });
 
   it('describe() 不过滤隐藏项 —— 桥要用它取 schema', () => {
-    // 回归：CLI 早先用 getAllDescriptions() 构建桥的工具列表，
+    // 回归：早期入口曾用 getAllDescriptions() 构建桥的工具列表，
     // 隐藏之后那个列表会变空、桥根本不启动
     const registry = new ToolRegistry(logger);
     registry.register(fakeTool('screenshot'));

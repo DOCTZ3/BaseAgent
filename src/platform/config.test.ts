@@ -240,7 +240,7 @@ describe('workspace → fsGrants 派生', () => {
     expect(c.security.fsGrants[0].path).toBe(path.resolve('D:\\explicit'));
   });
 
-  it('不传 workspace 时沿用环境变量的派生结果 —— CLI 不受影响', async () => {
+  it('不传 workspace 时沿用环境变量的派生结果 —— 非客户端入口不受影响', async () => {
     const { loadConfig } = await freshConfig({ WORKSPACE: 'D:\\env-workspace' });
 
     const c = loadConfig();

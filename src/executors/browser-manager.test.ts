@@ -160,7 +160,7 @@ describe.skipIf(!hasChromium)('BrowserManager', () => {
 
   describe('残留清理（Ctrl+C / 崩溃后的孤儿）', () => {
     it('启动前自动清理上次遗留的实例', async () => {
-      // 场景：CLI 被 Ctrl+C，finally 没跑到，chromium 成了孤儿并锁着 profile。
+      // 场景：进程崩溃或被强退，finally 没跑到，chromium 成了孤儿并锁着 profile。
       // 不清理的话下次启动必然失败
       const first = makeManager('p8');
       await first.start();

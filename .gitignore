@@ -1,5 +1,6 @@
 node_modules/
 dist/
+release*/
 .env
 
 # Claude Code 相关文件（不上传到 GitHub）

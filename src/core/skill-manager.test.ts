@@ -388,7 +388,7 @@ describe('onChanged 通知', () => {
     expect(onChanged).not.toHaveBeenCalled();
   });
 
-  it('没传 onChanged 时照常沉淀 —— CLI 不需要这个通道', async () => {
+  it('没传 onChanged 时照常沉淀 —— 非客户端入口不需要这个通道', async () => {
     const store = makeStore();
     const { client } = jsonClient(extraction);
     await expect(

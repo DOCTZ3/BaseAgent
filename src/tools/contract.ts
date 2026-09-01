@@ -125,7 +125,7 @@ export interface SkillReader {
 // 只在这里定义接口,实现放 core/sub-agent.ts。
 // 原因:子 agent 需要创建 Orchestrator(core 层),而依赖方向是
 // core → tools → executors。把实现放 executors 会形成 executors → core 的反向依赖。
-// 于是 tools 只认接口、不认实现,由入口(cli.ts)注入 —— 与 fs 执行器同样的注入模式。
+// 于是 tools 只认接口、不认实现,由会话装配注入 —— 与 fs 执行器同样的注入模式。
 
 export interface SubAgentRequest {
   task: string;       // 交给子 agent 的任务描述(必须自包含:子 agent 看不到主对话历史)

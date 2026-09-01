@@ -3,14 +3,14 @@
 // ============================================
 //
 // 这个模块的存在是为了兑现架构文档第一条:「交互层(壳)可替换 ——
-// CLI / 语音 / GUI 只做输入→文本与结果→展示,零业务逻辑」。
+// Electron / 语音 / GUI 只做输入→文本与结果→展示,零业务逻辑」。
 //
-// 抽出来之前那条不成立:cli.ts 有 937 行、21 段接线(配置、留痕、工具注册、
+// 抽出来之前那条不成立:早期入口有 937 行、21 段接线(配置、留痕、工具注册、
 // LLM、视觉、venv、依赖检测、Python 沙箱、读黑名单、常驻浏览器、工具桥、
 // shell、安全边界、环境提示、上下文、长期记忆…),全是业务装配而非展示逻辑。
 // 照那样再写一个客户端只有两条路:整段复制(于是每次改动要同步两处 ——
 // 这个项目已经在「同一份事实写两处」上栽过四次:visionAnalyzer、
-// pythonExecutor、models.vision、fsDeniedPaths),或者把 CLI 当子进程调
+// pythonExecutor、models.vision、fsDeniedPaths),或者把旧命令行壳当子进程调
 // (那不是客户端,是终端模拟器)。
 //
 // 三条边界:
@@ -253,7 +253,7 @@ const BRIDGED = ['screenshot', 'view_image'];
  * - 依赖检测必须先于 environment(提示词里的「已预装」要是实况)
  * - 工具桥必须先于 execute_python 注册(它的 description 要带桥的函数签名)
  * - 子 agent runner 必须后于所有执行器(它整份继承 inherited)
- * 这些顺序在原来的 cli.ts 里靠注释维持,抽出来之后仍然如此 ——
+ * 这些顺序在早期入口里靠注释维持,抽出来之后仍然如此 ——
  * 靠 `sub-agent.test.ts` 那条「父 runner 能注入的子 agent 全拿得到」兜底。
  */
 export async function createAgentSession(
@@ -533,6 +533,19 @@ export async function createAgentSession(
             // 空串表示浏览器没起来,模型代码会拿到连接失败并改道
             BROWSER_CDP_URL: browserManager?.cdpUrl ?? '',
           },
+          beforeRun: async () => {
+            if (!browserManager) return undefined;
+            const before = browserManager.cdpUrl;
+            const ok = await browserManager.ensureAlive();
+            const after = ok ? browserManager.cdpUrl : '';
+            if (before && after && before !== after) {
+              logger.info('常驻浏览器已恢复,CDP 地址已刷新', {
+                before,
+                after,
+              });
+            }
+            return { BROWSER_CDP_URL: after };
+          },
           blockPipInstall: config.python.blockPipInstall,
           readDenyPaths,
           toolBridge,
@@ -653,7 +666,7 @@ export async function createAgentSession(
     // 浏览器操作复用 PythonExecutor 跑框架自己写的脚本 ——
     // TS 侧不再引一份 playwright,而 Python 侧本来就装着
     browserOps: pythonExecutor && browserManager?.cdpUrl
-      ? new BrowserOps(pythonExecutor, browserManager.cdpUrl)
+      ? new BrowserOps(pythonExecutor, () => browserManager.cdpUrl)
       : undefined,
     visionAnalyzer,
     // 子 agent **能读**轨迹(它干的活同样需要流程指引),但拿不到写入能力 ——

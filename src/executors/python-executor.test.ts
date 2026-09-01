@@ -39,6 +39,7 @@ function makeExecutor(overrides: Partial<{
   maxStderrBytes: number;
   env: Record<string, string>;
   pythonPath: string;
+  beforeRun: () => Promise<Record<string, string> | undefined> | Record<string, string> | undefined;
 }> = {}) {
   return new PythonExecutor({
     pythonPath: overrides.pythonPath ?? 'python',
@@ -47,6 +48,7 @@ function makeExecutor(overrides: Partial<{
     maxStdoutBytes: overrides.maxStdoutBytes ?? 50 * 1024,
     maxStderrBytes: overrides.maxStderrBytes ?? 8 * 1024,
     env: overrides.env,
+    beforeRun: overrides.beforeRun,
     logger: mockLogger,
   });
 }
@@ -170,6 +172,21 @@ describe.skipIf(!hasPython)('PythonExecutor', () => {
         .run('import os\nprint(os.environ["FOO"])', { env: { FOO: 'override' } });
 
       expect(r.stdout.trim()).toBe('override');
+    });
+
+    it('每次执行前可动态刷新环境变量', async () => {
+      let cdpUrl = 'http://127.0.0.1:1';
+      const py = makeExecutor({
+        env: { BROWSER_CDP_URL: 'stale' },
+        beforeRun: () => ({ BROWSER_CDP_URL: cdpUrl }),
+      });
+
+      const first = await py.run('import os\nprint(os.environ["BROWSER_CDP_URL"])');
+      cdpUrl = 'http://127.0.0.1:2';
+      const second = await py.run('import os\nprint(os.environ["BROWSER_CDP_URL"])');
+
+      expect(first.stdout.trim()).toBe('http://127.0.0.1:1');
+      expect(second.stdout.trim()).toBe('http://127.0.0.1:2');
     });
 
     it('不继承父进程的 API key', async () => {
