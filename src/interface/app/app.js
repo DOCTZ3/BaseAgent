@@ -31,6 +31,7 @@
     sideList: $('side-list'),
     toBottom: $('btn-to-bottom'),
   };
+  let bottomSentinel = null;
 
   // ---------- 滚动 ----------
 
@@ -38,6 +39,10 @@
   const BOTTOM_SLACK = 80;
   const THINK_SLACK = 24;
   let activeThinkBox = null;
+  let autoFollowBottom = true;
+  let pointerScrollingStream = false;
+  let stickToBottomUntil = 0;
+  let bottomScrollRaf = 0;
 
   const onNextFrame = fn => {
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fn);
@@ -49,9 +54,27 @@
 
   const atBottom = () => atScrollEnd(els.stream, BOTTOM_SLACK);
 
+  const shouldStickToBottom = () =>
+    Date.now() < stickToBottomUntil;
+
+  const shouldFollowBottom = () =>
+    autoFollowBottom || shouldStickToBottom();
+
   function currentThinkBox() {
     if (activeThinkBox && !activeThinkBox.isConnected) activeThinkBox = null;
     return activeThinkBox;
+  }
+
+  function ensureBottomSentinel() {
+    if (!bottomSentinel || !bottomSentinel.isConnected) {
+      bottomSentinel = document.createElement('div');
+      bottomSentinel.className = 'scroll-sentinel';
+    }
+    if (bottomSentinel.parentNode !== els.stream ||
+        bottomSentinel.nextSibling !== null) {
+      els.stream.appendChild(bottomSentinel);
+    }
+    return bottomSentinel;
   }
 
   function scrollElementToBottom(node) {
@@ -61,14 +84,54 @@
     });
   }
 
+  function scrollStreamElementToBottom() {
+    const target = ensureBottomSentinel();
+    target.scrollIntoView({ block: 'end' });
+    els.stream.scrollTop = Math.max(0, els.stream.scrollHeight - els.stream.clientHeight);
+    onNextFrame(() => {
+      ensureBottomSentinel().scrollIntoView({ block: 'end' });
+      els.stream.scrollTop = Math.max(0, els.stream.scrollHeight - els.stream.clientHeight);
+    });
+  }
+
+  function keepBottomFor(ms = 900) {
+    autoFollowBottom = true;
+    stickToBottomUntil = Math.max(stickToBottomUntil, Date.now() + ms);
+  }
+
+  function releaseBottomStick() {
+    if (!shouldStickToBottom()) return;
+    stickToBottomUntil = 0;
+  }
+
+  function chaseBottom() {
+    if (!shouldStickToBottom()) {
+      bottomScrollRaf = 0;
+      return;
+    }
+    scrollStreamToBottom();
+    bottomScrollRaf = requestAnimationFrame(chaseBottom);
+  }
+
+  function startBottomChase(ms = 900) {
+    keepBottomFor(ms);
+    if (!bottomScrollRaf) {
+      bottomScrollRaf = requestAnimationFrame(function tick() {
+        bottomScrollRaf = 0;
+        chaseBottom();
+      });
+    }
+  }
+
   function scrollStreamToBottom() {
-    scrollElementToBottom(els.stream);
+    scrollStreamElementToBottom();
     syncToBottomBtn();
     onNextFrame(syncToBottomBtn);
   }
 
   /** 无条件滚到底,并同步按钮 */
   function scrollToBottom() {
+    autoFollowBottom = true;
     const box = currentThinkBox();
     if (box) scrollElementToBottom(box);
     scrollStreamToBottom();
@@ -76,7 +139,8 @@
 
   /** 只在用户本来就贴着底部时才跟随。调用方要传入 DOM 更新前的快照。 */
   function follow(wasAtBottom = atBottom()) {
-    if (wasAtBottom) scrollStreamToBottom();
+    if (wasAtBottom) autoFollowBottom = true;
+    if (wasAtBottom || shouldFollowBottom()) scrollStreamToBottom();
     else syncToBottomBtn();
   }
 
@@ -95,8 +159,25 @@
     if (wasAtBottom) scrollElementToBottom(box);
   }
 
-  els.stream.addEventListener('scroll', syncToBottomBtn);
+  els.stream.addEventListener('scroll', () => {
+    if (atBottom()) autoFollowBottom = true;
+    else if (pointerScrollingStream && !shouldStickToBottom()) autoFollowBottom = false;
+    syncToBottomBtn();
+  });
+  els.stream.addEventListener('pointerdown', () => {
+    pointerScrollingStream = true;
+  });
+  window.addEventListener('pointerup', () => {
+    pointerScrollingStream = false;
+  });
+  els.stream.addEventListener('wheel', e => {
+    if (e.deltaY < 0) {
+      autoFollowBottom = false;
+      releaseBottomStick();
+    }
+  }, { passive: true });
   els.toBottom?.addEventListener('click', () => {
+    startBottomChase();
     scrollToBottom();
   });
 
@@ -313,7 +394,10 @@
           // 标红会让人以为「停止」这个动作出了错
           note(wrap, '已停止。');
         }
-        // 收尾无条件滚到底:这里是本轮的结论,即使用户翻上去了也该带他回来
+        // 收尾无条件滚到底:这里是本轮的结论,即使用户翻上去了也该带他回来。
+        // Markdown 收尾渲染会让内容高度再变一次,所以短暂追底,防止浏览器
+        // 用旧锚点把视口拉回“差一点到底”的位置。
+        startBottomChase(1200);
         scrollToBottom();
       },
 
@@ -321,6 +405,7 @@
         if (answer) answer.classList.remove('streaming');
         answerText = null;
         note(wrap, message, true);
+        startBottomChase(900);
         scrollToBottom();
       },
     };
@@ -482,6 +567,7 @@
     // 用 follow 的话:用户翻上去看旧内容、然后直接在输入框打字发送,
     // 视口会停在原处 —— 自己刚发的那条在屏幕外,看起来像「发送没反应」。
     // 主动发消息就是明确表达了「我要看接下来发生什么」,这时拽回底部不算打扰。
+    startBottomChase(900);
     scrollToBottom();
 
     els.input.value = '';
@@ -977,6 +1063,7 @@
   /** 清空对话区,回到「空会话」的样子 */
   function clearStream() {
     els.stream.textContent = '';
+    bottomSentinel = null;
     const hint = document.createElement('div');
     hint.className = 'empty';
     hint.textContent = '描述你要做的事,agent 会自己决定用什么工具。';
@@ -991,6 +1078,7 @@
   function showHistory(sessionId, turns) {
     activeSessionId = sessionId;
     els.stream.textContent = '';
+    bottomSentinel = null;
     if (!turns || turns.length === 0) {
       clearStream();
     } else {

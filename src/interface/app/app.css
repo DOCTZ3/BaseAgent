@@ -38,6 +38,7 @@ html, body {
 body {
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 /* ---------- 顶栏 ---------- */
@@ -260,10 +261,18 @@ body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 20px 16px 12px;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  padding: 20px 16px 28px;
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.scroll-sentinel {
+  flex: 0 0 1px;
+  width: 100%;
+  pointer-events: none;
 }
 
 /*
@@ -446,6 +455,7 @@ body {
   white-space: pre-wrap;
   max-height: 300px;
   overflow-y: auto;
+  overflow-anchor: none;
   color: var(--fg-dim);
 }
 
