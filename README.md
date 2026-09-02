@@ -8,6 +8,10 @@ Node.js、Python 与 Playwright/CDP 构建。它为多步任务执行提供统�
 运行框架：模型负责规划和决策，框架负责上下文、工具、执行器、权限边界、
 运行状态和桌面端交互。
 
+## 演示
+
+![BaseAgent 演示](./docs/assets/baseagent-demo.gif)
+
 ## 项目亮点
 
 - 本地优先的 Electron 桌面客户端，支持历史会话、配置面板、危险命令确认、
