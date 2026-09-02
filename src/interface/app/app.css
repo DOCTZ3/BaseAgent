@@ -264,13 +264,12 @@ body {
   overflow-anchor: none;
   overscroll-behavior: contain;
   padding: 20px 16px 28px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+  display: block;
 }
 
 .scroll-sentinel {
-  flex: 0 0 1px;
+  display: block;
+  height: 1px;
   width: 100%;
   pointer-events: none;
 }
@@ -303,11 +302,14 @@ body {
 }
 .to-bottom:hover { background: var(--bg-hover); color: var(--fg); }
 
-/* .stream 是 column flex 容器,.msg 不能随内容溢出被压扁。 */
-.msg { max-width: 780px; width: 100%; margin: 0 auto; flex-shrink: 0; }
+/* 普通文档流比 flex column 更适合滚动容器:scrollHeight 与真实内容高度一致。 */
+.msg {
+  max-width: 780px;
+  width: 100%;
+  margin: 0 auto 14px;
+}
 
 .msg.user {
-  align-self: center;
   background: var(--bg-soft);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -745,6 +747,6 @@ body {
 .empty {
   color: var(--fg-faint);
   text-align: center;
-  margin: auto;
+  margin: 30vh auto 0;
   font-size: 13px;
 }

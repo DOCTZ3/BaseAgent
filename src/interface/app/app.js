@@ -85,12 +85,11 @@
   }
 
   function scrollStreamElementToBottom() {
-    const target = ensureBottomSentinel();
-    target.scrollIntoView({ block: 'end' });
-    els.stream.scrollTop = Math.max(0, els.stream.scrollHeight - els.stream.clientHeight);
+    ensureBottomSentinel();
+    els.stream.scrollTop = els.stream.scrollHeight;
     onNextFrame(() => {
-      ensureBottomSentinel().scrollIntoView({ block: 'end' });
-      els.stream.scrollTop = Math.max(0, els.stream.scrollHeight - els.stream.clientHeight);
+      ensureBottomSentinel();
+      els.stream.scrollTop = els.stream.scrollHeight;
     });
   }
 
