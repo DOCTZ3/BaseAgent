@@ -105,8 +105,10 @@ export interface SubAgentConfig {
  *   子 agent 的推理过程用户看不到,确认框会凭空冒出来 ——
  *   用户不知道这条 `pip install` 从哪来、为什么需要,只能盲点。
  *   而装包是对**整台机器**的副作用,这个决定该由主 agent 拿着上下文来做。
+ * - `manage_agent_config`:它会改全局配置,影响后续会话。这个决定也必须由
+ *   主 agent 在完整对话语境里发起。
  */
-const NO_SUBAGENT_TOOLS = new Set(['request_help', 'run_command']);
+const NO_SUBAGENT_TOOLS = new Set(['request_help', 'run_command', 'manage_agent_config']);
 
 
 export class LocalSubAgentRunner implements SubAgentRunner {

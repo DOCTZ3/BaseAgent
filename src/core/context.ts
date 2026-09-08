@@ -331,6 +331,18 @@ export class ContextManager {
   }
 
   /**
+   * 替换主系统消息。
+   *
+   * 用于 MCP/Secret 这类可热刷新的环境事实。历史 Turn 不含 system 消息,
+   * 所以这里只改 prompt 前缀,不会改写用户看到的对话历史。
+   */
+  replaceSystemMessage(content: string) {
+    const idx = this.messages.findIndex(m => m.role === 'system');
+    if (idx >= 0) this.messages[idx] = { role: 'system', content };
+    else this.addSystemMessage(content);
+  }
+
+  /**
    * 添加用户消息（开启新 Turn）
    */
   async addUserMessage(content: string | ContentPart[]) {

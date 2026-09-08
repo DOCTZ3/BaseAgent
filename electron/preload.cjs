@@ -65,6 +65,8 @@ contextBridge.exposeInMainWorld('AgentBridge', {
 
   getConfig: () => ipcRenderer.invoke('config:get'),
   saveConfig: patch => ipcRenderer.invoke('config:save', patch),
+  testMcpConfig: payload => ipcRenderer.invoke('config:test-mcp', payload),
+  describeMcpConfig: payload => ipcRenderer.invoke('config:describe-mcp', payload),
 
   /** 目录选择:原生对话框,返回真实绝对路径 */
   pickDirectory: () => ipcRenderer.invoke('dialog:pick-directory'),
@@ -105,6 +107,9 @@ contextBridge.exposeInMainWorld('AgentBridge', {
   listSkills: () => ipcRenderer.invoke('skills:list'),
   approveSkill: name => ipcRenderer.invoke('skills:approve', name),
   rejectSkill: name => ipcRenderer.invoke('skills:reject', name),
+  setSkillEnabled: (name, enabled) => ipcRenderer.invoke('skills:set-enabled', name, enabled),
+  extractSkillFromTurns: payload => ipcRenderer.invoke('skills:extract-from-turns', payload),
+  extractMemoryFromTurns: payload => ipcRenderer.invoke('memory:extract-from-turns', payload),
 
   /**
    * 技能库变动的推送

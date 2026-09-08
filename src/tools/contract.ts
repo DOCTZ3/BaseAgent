@@ -205,6 +205,8 @@ export interface Tool {
   name: string;
   description: string;
   parameters: ToolParameters;
+  /** Optional raw JSON Schema. Dynamic tools such as MCP proxies already receive one. */
+  parameterSchema?: Record<string, unknown>;
   needs: readonly ResourceType[];  // 声明需要的资源类型(只读数组)
   danger: boolean;        // 是否需要用户确认
 

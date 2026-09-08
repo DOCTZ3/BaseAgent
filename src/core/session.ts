@@ -31,6 +31,7 @@ import {
   loadConfig,
   TraceRecorder,
   Storage,
+  secretNames,
   type AgentConfig,
   type Logger,
 } from '../platform/index.js';
@@ -64,6 +65,7 @@ import {
   RequestHelpTool,
   RunCommandTool,
   LoadSkillTool,
+  ManageAgentConfigTool,
 } from '../tools/builtin/index.js';
 import { ContextManager, type Turn } from './context.js';
 import { turnsFile, readTurns, appendTurn } from './session-store.js';
@@ -78,6 +80,7 @@ import { LocalVisionAnalyzer } from './vision-analyzer.js';
 import { MemoryManager } from './memory-manager.js';
 import { SkillManager } from './skill-manager.js';
 import { buildMainSystemPrompt, type EnvironmentOptions } from './system-prompt.js';
+import { McpRuntime, LoadMcpTool, McpCallTool } from '../mcp/index.js';
 
 /** 装配期的一条提示。壳自己决定用什么颜色、放在哪 */
 export interface SessionNotice {
@@ -110,6 +113,13 @@ export interface CreateSessionOptions {
    * 一定拉不到刚沉淀的那条。
    */
   onSkillsChanged?: () => void;
+  /**
+   * 配置被会话内工具改写后的刷新来源。
+   *
+   * Electron 壳有配置文件位置、userData 路径和覆盖优先级的完整知识;
+   * core 不直接猜这些规则,只接收壳重新算出的 overrides。
+   */
+  onConfigChanged?: () => Promise<Partial<AgentConfig>> | Partial<AgentConfig>;
   /** 会话 id 前缀,用于区分 trace 目录(如 'cli' / 'app') */
   idPrefix?: string;
   /** 覆盖配置(测试用)。不传则从环境变量加载 */
@@ -165,6 +175,8 @@ export interface SessionInfo {
   logFile?: string;
   /** 只在代码里可调、不出现在工具清单里的那些 */
   bridgedTools: string[];
+  secretNames: string[];
+  mcpTools: Array<{ serverId: string; serverName: string; toolName: string; localName: string }>;
   compression: { budget: number; source: '显式配置' | '跟随主模型' | '内置兜底' };
 }
 
@@ -203,6 +215,13 @@ export interface AgentSession {
   history(): Turn[];
   /** 中断当前轮次 */
   abort(): void;
+  /**
+   * 热刷新配置里能安全替换的部分。
+   *
+   * 目前只承诺 MCP/Secret:它们不改变文件边界、Python cwd、模型客户端或
+   * 浏览器 profile,所以不需要拆掉整个会话。
+   */
+  refreshConfig(configOverrides: Partial<AgentConfig>): Promise<SessionInfo>;
   /**
    * 收尾 —— **必须调**
    *
@@ -300,6 +319,7 @@ export async function createAgentSession(
     logger,
     baseDir: config.trace.dir,
     enabled: config.trace.enabled,
+    redactValues: config.secrets.items.map(s => s.value).filter(Boolean),
   });
 
   // ---------- 工具注册 ----------
@@ -331,6 +351,16 @@ export async function createAgentSession(
 
   // request_help 无条件注册:它不碰浏览器、不需要执行器,只是「暂停交回用户」
   registry.register(new RequestHelpTool());
+  let refreshConfigFromShell: (() => Promise<void>) | undefined;
+  registry.register(new ManageAgentConfigTool(
+    options.onConfigChanged
+      ? {
+          onChanged: async () => {
+            await refreshConfigFromShell?.();
+          },
+        }
+      : undefined,
+  ));
 
   // run_command 要两个开关都满足:没有工作区 cwd 会解析成整个项目目录;
   // ALLOW_DANGEROUS_TOOLS=false 时调用会被 runner 直接拒,注册它只让模型白花一步
@@ -342,6 +372,24 @@ export async function createAgentSession(
     );
   }
   if (config.subAgent.enabled) registry.register(new SpawnSubAgentTool());
+
+  const mcpRuntime = new McpRuntime({
+    servers: config.mcp.servers,
+    secrets: config.secrets.items,
+    logger,
+  });
+  const mcpViaCode = config.python.enabled;
+  if (mcpRuntime.hasServers && !config.python.enabled) {
+    notices.push({
+      level: 'warn',
+      message: 'MCP Server 已配置,但 Python 代码执行未启用;CodeAct 版 MCP 暂不可用。',
+    });
+  }
+  if (mcpViaCode) {
+    registry.register(new McpCallTool(mcpRuntime));
+    // mcp_call 只允许经工具桥在 Python 代码里调用,不作为顶层 tool 暴露。
+    registry.hide(['mcp_call']);
+  }
 
   /**
    * 中断控制器 —— **每轮一个**,不是整个会话一个
@@ -484,8 +532,12 @@ export async function createAgentSession(
   // ---------- 工具桥(CodeAct)----------
   // 用 describe() 而不是 getAllDescriptions():后者会过滤掉隐藏的工具,
   // 而下面正要隐藏它们 —— 那样桥就拿不到 schema、直接不启动了
+  const bridgeToolNames = [
+    ...BRIDGED,
+    ...(config.python.enabled ? ['mcp_call'] : []),
+  ];
   const bridgeTools = registry.describe(
-    registry.all().filter(t => BRIDGED.includes(t.name)),
+    registry.all().filter(t => bridgeToolNames.includes(t.name)),
   );
 
   // 三者构成一个环:桥 → runner → pythonExecutor → 桥。运行时不成问题 ——
@@ -506,8 +558,12 @@ export async function createAgentSession(
     // 否则模型两条路都没有了(工具清单里没有、代码里的函数也连不上)。
     // 实测:两条路都开时模型一律直接发 tool_call,代码那条根本走不到,
     // 所以隐藏是无条件的、不留开关。工具仍留在注册表:桥的 invoke 要按名字查
-    registry.hide(BRIDGED);
-    bridgedActive = [...BRIDGED];
+    registry.hide(bridgeToolNames);
+    bridgedActive = [...bridgeToolNames];
+  }
+
+  if (config.python.enabled && toolBridge?.isRunning) {
+    registry.register(new LoadMcpTool(mcpRuntime));
   }
 
   // execute_python 特意在这里注册:它的 description 要带上桥暴露的函数签名,
@@ -683,6 +739,11 @@ export async function createAgentSession(
     shellEnabled,
     // 提示里的「已预装」必须是实况,与启动检测同源
     missingPackages: deps?.missing ?? [],
+    mcpServers: mcpRuntime.listServers().map(s => ({
+      id: s.id,
+      name: s.name,
+      description: s.description,
+    })),
   };
 
   // 必须建在所有执行器之后:它整份继承 inherited
@@ -738,16 +799,17 @@ export async function createAgentSession(
   // 只拼**索引**(名字 + 一行描述),正文由 load_skill 按需取 ——
   // 系统提示是 prompt cache 前缀里最稳定的部分(实测命中率 60~77%),
   // 每轮注入不同的正文会让整段前缀失效,那个代价比多一次工具调用大得多。
-  const skillIndex = skillManager?.prompt() ?? '';
-
-  context.addSystemMessage(
-    buildMainSystemPrompt({
+  function buildCurrentSystemMessage(): string {
+    const currentSkillIndex = skillManager?.prompt() ?? '';
+    return buildMainSystemPrompt({
       ...environment,
       subAgentEnabled: config.subAgent.enabled,
     })
     + (memory?.prompt() ? '\n\n' + memory.prompt() : '')
-    + (skillIndex ? '\n\n' + skillIndex : ''),
-  );
+    + (currentSkillIndex ? '\n\n' + currentSkillIndex : '');
+  }
+
+  context.addSystemMessage(buildCurrentSystemMessage());
 
   // ---------- 历史轮次(续接会话)----------
   // 必须在 addSystemMessage() **之后**:system 消息要留在 messages[0],
@@ -792,7 +854,7 @@ export async function createAgentSession(
       if (turn.turn_id <= lastPersistedTurnId) continue;
       // 写失败不抛也不重试:历史是增强,不能让存不下来变成任务失败。
       // 但要留痕,否则「历史怎么少了几轮」无从查起
-      if (appendTurn(historyFile, turn)) {
+      if (appendTurn(historyFile, turn, config.secrets.items.map(s => s.value).filter(Boolean))) {
         lastPersistedTurnId = turn.turn_id;
       } else {
         logger.warn('历史轮次写盘失败', { turn_id: turn.turn_id, file: historyFile });
@@ -821,12 +883,43 @@ export async function createAgentSession(
     readDenyCount: readDenyPaths.length,
     logFile: logger.filePath,
     bridgedTools: bridgedActive,
+    secretNames: secretNames(config.secrets.items),
+    mcpTools: [],
     compression: {
       budget: compBudget,
       source: config.context.compressionMaxTokens
         ? '显式配置'
         : modelConfig.maxTokens ? '跟随主模型' : '内置兜底',
     },
+  };
+
+  async function refreshConfig(configOverrides: Partial<AgentConfig>): Promise<SessionInfo> {
+    const next = loadConfig(configOverrides);
+
+    config.secrets.items = next.secrets.items;
+    config.mcp.servers = next.mcp.servers;
+
+    await mcpRuntime.refresh(next.mcp.servers, next.secrets.items);
+
+    environment.mcpServers = mcpRuntime.listServers().map(s => ({
+      id: s.id,
+      name: s.name,
+      description: s.description,
+    }));
+    context.replaceSystemMessage(buildCurrentSystemMessage());
+
+    info.secretNames = secretNames(next.secrets.items);
+    info.mcpTools = [];
+    logger.info('会话配置已热刷新', {
+      scope: 'mcp',
+      mcpServers: environment.mcpServers.map(s => s.id),
+    });
+    return info;
+  }
+
+  refreshConfigFromShell = async () => {
+    if (!options.onConfigChanged) return;
+    await refreshConfig(await options.onConfigChanged());
   };
 
   return {
@@ -909,11 +1002,14 @@ export async function createAgentSession(
       runAbort.abort();
     },
 
+    refreshConfig,
+
     async dispose() {
       context.dispose();
       // SQLite 句柄不关会留下 -wal/-shm 文件。
       // 记忆与技能共用这一个实例,所以只关一次
       sharedStorage?.close();
+      await mcpRuntime.close();
       // 常驻浏览器是 detached 的,不随本进程退出。留下来会一直锁着
       // profile 目录,导致下次启动失败。
       // **只关自己创建的那个**:外部注入的由调用方负责(谁创建谁关闭)——

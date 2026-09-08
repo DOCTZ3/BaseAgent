@@ -302,4 +302,54 @@ describe('对外接口', () => {
     expect(m.prompt()).toBe('');
     expect(loadMemory(store)).toEqual([]);
   });
+
+  it('extractFromTurns 可手动压缩选中轮次,不受自动 N 轮门槛限制', async () => {
+    const store = makeStore();
+    const { client, seen } = makeLLM({
+      candidates: [{ dimension: 'language', text: '用中文应答' }],
+      contradicts: [],
+    });
+    const m = new MemoryManager({
+      store, llmClient: client, logger,
+      turnsPerExtraction: 99, retry: NO_RETRY,
+    });
+
+    const result = await m.extractFromTurns([turn(1, '以后都用中文回答')], '用户手动选择');
+
+    expect(result.ok).toBe(true);
+    expect(result.changed).toBe(true);
+    expect(result.before).toBe(0);
+    expect(result.after).toBe(1);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('用户手动选择');
+    expect(loadMemory(store).map(e => e.text)).toEqual(['用中文应答']);
+  });
+
+  it('extractFromTurns 空选择直接返回错误,不调 LLM', async () => {
+    const { client, seen } = makeLLM({ candidates: [], contradicts: [] });
+    const m = new MemoryManager({
+      store: makeStore(), llmClient: client, logger,
+      turnsPerExtraction: 1, retry: NO_RETRY,
+    });
+
+    const result = await m.extractFromTurns([]);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('没有可压缩');
+    expect(seen).toHaveLength(0);
+  });
+
+  it('extractFromTurns 无稳定记忆时返回 changed:false', async () => {
+    const { client } = makeLLM({ candidates: [], contradicts: [] });
+    const m = new MemoryManager({
+      store: makeStore(), llmClient: client, logger,
+      turnsPerExtraction: 1, retry: NO_RETRY,
+    });
+
+    const result = await m.extractFromTurns([turn(1, '随口问一句')]);
+
+    expect(result.ok).toBe(true);
+    expect(result.changed).toBe(false);
+    expect(result.reason).toContain('没有稳定');
+  });
 });

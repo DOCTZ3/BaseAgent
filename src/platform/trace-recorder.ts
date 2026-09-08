@@ -24,6 +24,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { redactValues } from './secrets.js';
 
 // 只依赖四个日志方法，避免与 Logger 形成循环导入（同 RetryHandler 的做法）
 interface TraceLogger {
@@ -38,6 +39,7 @@ export interface TraceRecorderConfig {
   logger: TraceLogger;
   baseDir?: string;     // 默认 traces/（项目根下的可见目录）
   enabled?: boolean;    // 默认 true；false 时所有方法变空操作
+  redactValues?: string[];
 }
 
 export interface TraceSummary {
@@ -160,10 +162,10 @@ export class TraceRecorder {
           duration_ms: event.durationMs,
           attempts: event.attempts,
           // 剥掉 base64 图片：不剥的话单文件几 MB，trace 就翻不动了
-          wire_request: stripImageData(event.wireRequest),
-          wire_response: stripImageData(event.wireResponse),
-          parsed: event.parsed,
-          error: event.error,
+          wire_request: this.scrub(stripImageData(event.wireRequest)),
+          wire_response: this.scrub(stripImageData(event.wireResponse)),
+          parsed: this.scrub(event.parsed),
+          error: this.scrub(event.error),
         }, null, 2)
       );
 
@@ -204,5 +206,9 @@ export class TraceRecorder {
 
   get isEnabled(): boolean {
     return this.enabled;
+  }
+
+  private scrub(value: unknown): unknown {
+    return redactValues(value, this.config.redactValues ?? []);
   }
 }

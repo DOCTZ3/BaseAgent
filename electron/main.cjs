@@ -288,6 +288,7 @@ async function createSession(resumeSessionId) {
     onSkillsChanged: () => {
       if (win && !win.isDestroyed()) win.webContents.send('agent:skills-changed');
     },
+    onConfigChanged: () => loadAppConfigOverrides(),
   });
 
   return session;
@@ -432,6 +433,13 @@ ipcMain.handle('agent:info', async () => {
     userDataDir: app.getPath('userData'),
     // 只给掩码。明文 key 不进渲染进程 —— 那里跑着不可信内容
     apiKeyMasked: maskKey(main.apiKey),
+    secrets: (c.secrets?.items || []).map(s => ({
+      name: s.name,
+      description: s.description || '',
+      hasValue: !!s.value,
+    })),
+    mcpServers: c.mcp?.servers || [],
+    mcpTools: s ? s.info.mcpTools : [],
   };
 });
 
@@ -482,11 +490,20 @@ ipcMain.handle('app:open-user-data', async () => {
 // ---------- IPC:配置 ----------
 ipcMain.handle('config:get', async () => {
   const { readConfigFile } = await loadConfigStore();
-  return readConfigFile();
+  const cfg = readConfigFile();
+  return {
+    ...cfg,
+    secrets: (cfg.secrets || []).map(s => ({
+      name: s.name,
+      description: s.description || '',
+      hasValue: !!s.value,
+    })),
+  };
 });
 
 ipcMain.handle('config:save', async (_e, patch) => {
   const { writeConfigFile } = await loadConfigStore();
+  const before = session ? await loadEffectiveConfig() : null;
 
   // 校验失败要**当成正常返回值**回去,不能让异常穿过 IPC:
   // Electron 会把抛出的 Error 包成
@@ -498,9 +515,248 @@ ipcMain.handle('config:save', async (_e, patch) => {
     return { ok: false, error: err && err.message ? err.message : String(err) };
   }
 
-  // 不假装热更新:改完要重建会话才生效(见 config-store 顶部说明)
+  if (session && before) {
+    const after = await loadEffectiveConfig();
+    if (!requiresFullSessionRestart(before, after)) {
+      try {
+        await session.refreshConfig(await loadAppConfigOverrides());
+        if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
+        return { ok: true, needsRestart: false, hotReloaded: true };
+      } catch (err) {
+        console.error('MCP 配置热刷新失败', err);
+        return {
+          ok: true,
+          needsRestart: true,
+          hotReloaded: false,
+          warning: err && err.message ? err.message : String(err),
+        };
+      }
+    }
+  }
+
+  // 工作区、模型、Python 开关等仍必须重建会话:这些会派生执行器和安全边界。
   return { ok: true, needsRestart: true };
 });
+
+function requiresFullSessionRestart(before, after) {
+  return JSON.stringify(restartRelevantConfig(before)) !==
+    JSON.stringify(restartRelevantConfig(after));
+}
+
+function restartRelevantConfig(c) {
+  const main = c.models.main || {};
+  const vision = c.models.vision || null;
+  return {
+    main: {
+      apiKey: main.apiKey || '',
+      baseURL: main.baseURL || '',
+      model: main.model || '',
+      maxTokens: main.maxTokens ?? null,
+      enableThinking: main.enableThinking !== false,
+    },
+    vision: vision
+      ? {
+          apiKey: vision.apiKey || '',
+          baseURL: vision.baseURL || '',
+          model: vision.model || '',
+        }
+      : null,
+    workspace: c.workspace || '',
+    pythonEnabled: !!c.python.enabled,
+    allowDangerousTools: !!c.security.allowDangerousTools,
+    shellEnabled: !!c.shell.enabled,
+    subAgentEnabled: !!c.subAgent.enabled,
+    memoryEnabled: !!c.memory.enabled,
+    maxSteps: c.execution.maxSteps,
+  };
+}
+
+ipcMain.handle('config:test-mcp', async (_e, payload) => {
+  const { readConfigFile, validateStored } = await loadConfigStore();
+  const { mergeSecretPatches, normalizeSecretName } = await loadPlatformSecrets();
+  const { McpRuntime } = await loadMcpModule();
+
+  try {
+    const server = normalizeMcpServerForTest(payload?.server, normalizeSecretName);
+    const secretPatches = Array.isArray(payload?.secrets) ? payload.secrets : [];
+
+    const errors = validateStored({ mcpServers: [server], secrets: secretPatches });
+    if (errors.length > 0) return { ok: false, error: errors.join(';') };
+
+    const stored = readConfigFile();
+    const secrets = mergeSecretPatches(stored.secrets || [], secretPatches);
+    const loaded = await loadMcpToolsForConfigTest(McpRuntime, server, secrets);
+    if (!loaded.ok) return { ok: false, error: loaded.error || 'MCP 测试失败' };
+
+    const data = loaded.data || {};
+    const tools = Array.isArray(data.tools) ? data.tools : [];
+    return {
+      ok: true,
+      server: data.server || { id: server.id, name: server.name },
+      toolCount: tools.length,
+      tools: tools.slice(0, 50).map(t => ({
+        name: String(t.name || ''),
+        description: String(t.description || ''),
+        inputSchema: t.inputSchema,
+      })),
+      truncated: tools.length > 50,
+    };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('config:describe-mcp', async (_e, payload) => {
+  const { readConfigFile, validateStored } = await loadConfigStore();
+  const { mergeSecretPatches, normalizeSecretName } = await loadPlatformSecrets();
+  const { McpRuntime } = await loadMcpModule();
+
+  try {
+    const server = normalizeMcpServerForTest(payload?.server, normalizeSecretName);
+    const secretPatches = Array.isArray(payload?.secrets) ? payload.secrets : [];
+
+    const errors = validateStored({ mcpServers: [server], secrets: secretPatches });
+    if (errors.length > 0) return { ok: false, error: errors.join(';') };
+
+    const stored = readConfigFile();
+    const secrets = mergeSecretPatches(stored.secrets || [], secretPatches);
+    const loaded = await loadMcpToolsForConfigTest(McpRuntime, server, secrets);
+    if (!loaded.ok) return { ok: false, error: loaded.error || 'MCP Server 加载失败' };
+
+    const config = await loadEffectiveConfig();
+    const main = config.models.main;
+    if (!main.apiKey) {
+      return { ok: false, error: '主模型 API key 未配置,无法生成 MCP 用途说明' };
+    }
+
+    const { DeepSeekAdapter } = await loadDeepSeekModule();
+    const llm = new DeepSeekAdapter({
+      apiKey: main.apiKey,
+      baseURL: main.baseURL,
+      model: main.model,
+      enableThinking: !!main.enableThinking,
+      maxTokens: Math.min(main.maxTokens || 700, 700),
+      temperature: 0.2,
+      retry: config.retry,
+      logger: console,
+    });
+
+    const tools = Array.isArray(loaded.data?.tools) ? loaded.data.tools : [];
+    const response = await llm.complete({
+      responseFormat: 'json_object',
+      traceLabel: 'config:mcp-description',
+      messages: [
+        {
+          role: 'system',
+          content: [
+            '你负责为 BaseAgent 配置页生成 MCP Server 的用途说明。',
+            '只输出 JSON,格式为 {"description":"..."}。',
+            'description 用中文,80 到 120 字左右,说明这个 MCP 适合什么任务、主要能力和使用边界。',
+            '不要提 token、密钥、认证、HTTP、SSE、实现细节,不要编造工具列表以外的能力。',
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: JSON.stringify({
+            server: {
+              id: server.id,
+              name: server.name,
+              currentDescription: server.description || '',
+              endpoint: safeMcpEndpointLabel(server.url),
+            },
+            toolCount: tools.length,
+            tools: summarizeMcpToolsForPrompt(tools),
+            truncated: tools.length > 30,
+          }, null, 2),
+        },
+      ],
+    });
+
+    const parsed = JSON.parse(response.content || '{}');
+    const description = cleanGeneratedDescription(parsed.description);
+    if (!description) return { ok: false, error: '模型没有生成有效说明' };
+
+    return { ok: true, description };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+});
+
+async function loadMcpToolsForConfigTest(McpRuntime, server, secrets) {
+  const runtime = new McpRuntime({
+    servers: [{ ...server, enabled: true }],
+    secrets,
+    logger: console,
+  });
+
+  try {
+    return await runtime.load(server.id);
+  } finally {
+    await runtime.close();
+  }
+}
+
+function normalizeMcpServerForTest(raw, normalizeSecretName) {
+  if (!raw || typeof raw !== 'object') throw new Error('MCP Server 配置格式不正确');
+  const id = String(raw.id || '').trim();
+  const name = String(raw.name || id).trim();
+  const description = String(raw.description || '').trim();
+  const bearerSecret = raw.bearerSecret ? normalizeSecretName(String(raw.bearerSecret)) : undefined;
+  const headers = raw.headers && typeof raw.headers === 'object'
+    ? Object.fromEntries(
+        Object.entries(raw.headers)
+          .filter(([k, v]) => String(k).trim() && typeof v === 'string')
+          .map(([k, v]) => [String(k).trim(), v]),
+      )
+    : undefined;
+
+  return {
+    id,
+    name,
+    ...(description ? { description } : {}),
+    url: String(raw.url || '').trim(),
+    enabled: true,
+    ...(bearerSecret ? { bearerSecret } : {}),
+    ...(headers ? { headers } : {}),
+  };
+}
+
+function summarizeMcpToolsForPrompt(tools) {
+  return tools.slice(0, 30).map(tool => ({
+    name: String(tool.name || '').slice(0, 120),
+    description: clipForPrompt(tool.description || '', 320),
+    input: summarizeMcpInputSchema(tool.inputSchema),
+  }));
+}
+
+function summarizeMcpInputSchema(schema) {
+  if (!schema || typeof schema !== 'object') return {};
+  const properties = schema.properties && typeof schema.properties === 'object'
+    ? Object.keys(schema.properties).slice(0, 24)
+    : [];
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter(v => typeof v === 'string').slice(0, 24)
+    : [];
+  return { properties, required };
+}
+
+function clipForPrompt(value, max) {
+  return String(value || '').trim().replace(/\s+/g, ' ').slice(0, max);
+}
+
+function cleanGeneratedDescription(value) {
+  const text = clipForPrompt(value, 240);
+  return text.length >= 8 ? text : '';
+}
+
+function safeMcpEndpointLabel(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || ''));
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return '';
+  }
+}
 
 /**
  * 重建会话(改了 workspace 这类需要重启的项之后)
@@ -571,6 +827,10 @@ ipcMain.handle('skills:approve', async (_e, name) => {
   const s = await ensureSession();
   if (!s.skills) return { ok: false, error: '技能库未启用' };
 
+  if (enabledSkillCount(s.skills.list()) >= 20) {
+    return { ok: false, error: '最多只能启用 20 个技能。请先停用一个已启用技能。' };
+  }
+
   // approve 返回 false = 名字不存在或它本来就不是待审状态。
   // 两种都不算错误,但要让渲染层知道「没发生变化」,否则列表刷新后
   // 用户会以为自己点了却没反应
@@ -586,6 +846,84 @@ ipcMain.handle('skills:reject', async (_e, name) => {
 
   const changed = s.skills.reject(name);
   return { ok: true, changed, skills: s.skills.list() };
+});
+
+ipcMain.handle('skills:set-enabled', async (_e, name, enabled) => {
+  if (!session) return { ok: false, error: '会话尚未启动' };
+
+  const s = await ensureSession();
+  if (!s.skills) return { ok: false, error: '技能库未启用' };
+
+  if (enabled === true && enabledSkillCount(s.skills.list()) >= 20) {
+    return { ok: false, error: '最多只能启用 20 个技能。请先停用一个已启用技能。' };
+  }
+
+  const changed = s.skills.setEnabled(String(name || ''), enabled === true);
+  return { ok: true, changed, skills: s.skills.list() };
+});
+
+function enabledSkillCount(skills) {
+  return (skills || []).filter(s => !s.pending && s.enabled !== false).length;
+}
+
+ipcMain.handle('memory:extract-from-turns', async (_e, payload) => {
+  if (!session) return { ok: false, error: '会话尚未启动' };
+
+  const s = await ensureSession();
+  if (!s.memory) return { ok: false, error: '长期记忆未启用' };
+
+  try {
+    const ids = Array.isArray(payload?.turnIds)
+      ? payload.turnIds
+          .map(n => Number(n))
+          .filter(n => Number.isInteger(n) && n > 0)
+      : [];
+    if (ids.length === 0) return { ok: false, error: '请先选择要压缩进记忆的对话轮次' };
+
+    const selectedIds = new Set(ids);
+    const selectedTurns = s.history().filter(t => selectedIds.has(t.turn_id));
+    if (selectedTurns.length === 0) {
+      return { ok: false, error: '选中的轮次不在当前会话历史中' };
+    }
+
+    const result = await s.memory.extractFromTurns(selectedTurns, String(payload?.reason || ''));
+    return {
+      ...result,
+      memories: s.memory.list(),
+    };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('skills:extract-from-turns', async (_e, payload) => {
+  if (!session) return { ok: false, error: '会话尚未启动' };
+
+  const s = await ensureSession();
+  if (!s.skills) return { ok: false, error: '技能库未启用' };
+
+  try {
+    const ids = Array.isArray(payload?.turnIds)
+      ? payload.turnIds
+          .map(n => Number(n))
+          .filter(n => Number.isInteger(n) && n > 0)
+      : [];
+    if (ids.length === 0) return { ok: false, error: '请先选择要沉淀的对话轮次' };
+
+    const selectedIds = new Set(ids);
+    const selectedTurns = s.history().filter(t => selectedIds.has(t.turn_id));
+    if (selectedTurns.length === 0) {
+      return { ok: false, error: '选中的轮次不在当前会话历史中' };
+    }
+
+    const result = await s.skills.extractFromTurns(selectedTurns, String(payload?.reason || ''));
+    return {
+      ...result,
+      skills: s.skills.list(),
+    };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
 });
 
 async function loadSessionStore() {
@@ -604,6 +942,30 @@ async function loadPlatformConfig() {
   ));
 }
 
+async function loadPlatformSecrets() {
+  await registerTsxForDevelopment();
+  return import(moduleUrl(
+    path.join('src', 'platform', 'secrets.ts'),
+    path.join('dist', 'platform', 'secrets.js'),
+  ));
+}
+
+async function loadMcpModule() {
+  await registerTsxForDevelopment();
+  return import(moduleUrl(
+    path.join('src', 'mcp', 'index.ts'),
+    path.join('dist', 'mcp', 'index.js'),
+  ));
+}
+
+async function loadDeepSeekModule() {
+  await registerTsxForDevelopment();
+  return import(moduleUrl(
+    path.join('src', 'core', 'deepseek-adapter.ts'),
+    path.join('dist', 'core', 'deepseek-adapter.js'),
+  ));
+}
+
 ipcMain.handle('agent:restart', async () => {
   if (sessionPromise) {
     // 装配中途点了保存。等它落地再关,不然会漏掉一个 chromium
@@ -611,6 +973,7 @@ ipcMain.handle('agent:restart', async () => {
   }
 
   const old = session;
+  const resumeSessionId = old?.sessionId;
   session = null;
   await old?.dispose();
 
@@ -622,7 +985,7 @@ ipcMain.handle('agent:restart', async () => {
     return true;
   }
 
-  await ensureSession();
+  await ensureSession(resumeSessionId);
   if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
   return true;
 });

@@ -29,6 +29,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { AgentConfig } from './config.js';
+import {
+  mergeSecretPatches,
+  normalizeSecretName,
+  validateSecretName,
+  type SecretPatch,
+  type StoredSecret,
+} from './secrets.js';
 
 /**
  * 客户端可配置的项
@@ -63,6 +70,16 @@ export interface StoredConfig {
   enableThinking?: boolean;
   /** 单轮最大工具调用轮数。给小了复杂任务会在半途停下 */
   maxSteps?: number | null;
+  secrets?: Array<StoredSecret | SecretPatch>;
+  mcpServers?: Array<{
+    id: string;
+    name?: string;
+    description?: string;
+    url: string;
+    enabled?: boolean;
+    bearerSecret?: string;
+    headers?: Record<string, string>;
+  }>;
 }
 
 /**
@@ -101,6 +118,55 @@ export function validateStored(patch: StoredConfig): string[] {
     }
     if (v < range.min || v > range.max) {
       errors.push(`${range.label}应在 ${range.min}~${range.max} 之间(当前 ${v})`);
+    }
+  }
+
+  if (patch.secrets) {
+    for (const item of patch.secrets) {
+      const name = normalizeSecretName(String(item.name ?? ''));
+      if (!validateSecretName(name)) {
+        errors.push(`Secret 名称只能使用大写字母、数字和下划线: ${item.name ?? ''}`);
+      }
+      const description = (item as { description?: unknown }).description;
+      if (description !== undefined && typeof description !== 'string') {
+        errors.push(`Secret ${item.name ?? ''} 的用途说明必须是字符串`);
+      }
+      if (typeof description === 'string' && description.length > 200) {
+        errors.push(`Secret ${item.name ?? ''} 的用途说明不能超过 200 字符`);
+      }
+    }
+  }
+
+  if (patch.mcpServers) {
+    for (const server of patch.mcpServers) {
+      if (!server || typeof server !== 'object') {
+        errors.push('MCP Server 配置格式不正确');
+        continue;
+      }
+      if (!/^[A-Za-z][A-Za-z0-9_-]{1,47}$/.test(String(server.id ?? ''))) {
+        errors.push(`MCP Server id 只能使用字母、数字、下划线和短横线: ${server.id ?? ''}`);
+      }
+      const description = (server as { description?: unknown }).description;
+      if (description !== undefined && typeof description !== 'string') {
+        errors.push(`MCP Server ${server.id ?? ''} 的用途说明必须是字符串`);
+      }
+      if (typeof description === 'string' && description.length > 240) {
+        errors.push(`MCP Server ${server.id ?? ''} 的用途说明不能超过 240 字符`);
+      }
+      try {
+        const u = new URL(String(server.url ?? ''));
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+          errors.push(`MCP Server URL 必须是 http/https: ${server.url ?? ''}`);
+        }
+      } catch {
+        errors.push(`MCP Server URL 不合法: ${server.url ?? ''}`);
+      }
+      if (server.bearerSecret) {
+        const name = normalizeSecretName(server.bearerSecret);
+        if (!validateSecretName(name)) {
+          errors.push(`MCP Server 引用的 Secret 名称不合法: ${server.bearerSecret}`);
+        }
+      }
     }
   }
 
@@ -178,6 +244,19 @@ export function writeConfigFile(patch: StoredConfig): StoredConfig {
       continue;
     }
 
+    if (k === 'secrets' && Array.isArray(v)) {
+      merged.secrets = mergeSecretPatches(
+        current.secrets as StoredSecret[] | undefined,
+        v as SecretPatch[],
+      );
+      continue;
+    }
+
+    if (k === 'mcpServers' && Array.isArray(v)) {
+      merged.mcpServers = normalizeMcpServers(v as StoredConfig['mcpServers']);
+      continue;
+    }
+
     (merged as Record<string, unknown>)[k] = v;
   }
 
@@ -245,6 +324,38 @@ export function toOverrides(stored: StoredConfig): Partial<AgentConfig> {
   if (stored.memoryEnabled !== undefined) {
     out.memory = { enabled: stored.memoryEnabled };
   }
+  if (Array.isArray(stored.secrets)) {
+    out.secrets = { items: stored.secrets as StoredSecret[] };
+  }
+  if (Array.isArray(stored.mcpServers)) {
+    out.mcp = { servers: normalizeMcpServers(stored.mcpServers) };
+  }
 
   return out as Partial<AgentConfig>;
+}
+
+function normalizeMcpServers(servers: StoredConfig['mcpServers']): AgentConfig['mcp']['servers'] {
+  return (servers ?? []).map(server => ({
+    id: String(server.id).trim(),
+    name: String(server.name || server.id).trim(),
+    description: cleanDescription(server.description),
+    url: String(server.url).trim(),
+    enabled: server.enabled !== false,
+    bearerSecret: server.bearerSecret
+      ? normalizeSecretName(server.bearerSecret)
+      : undefined,
+    headers: server.headers && typeof server.headers === 'object'
+      ? Object.fromEntries(
+          Object.entries(server.headers)
+            .filter(([k, v]) => k.trim() && typeof v === 'string')
+            .map(([k, v]) => [k.trim(), v]),
+        )
+      : undefined,
+  }));
+}
+
+function cleanDescription(description: unknown): string | undefined {
+  if (typeof description !== 'string') return undefined;
+  const cleaned = description.trim().replace(/\s+/g, ' ');
+  return cleaned || undefined;
 }

@@ -186,6 +186,27 @@ describe('子 agent 资源继承', () => {
     expect(result.answer).toBeDefined();
   });
 
+  it('manage_agent_config 不下放 —— 全局配置只能由主 agent 修改', async () => {
+    const configTool: Tool = {
+      name: 'manage_agent_config',
+      description: '修改 agent 配置',
+      parameters: z.object({}),
+      needs: [],
+      danger: false,
+      run: async () => ({ ok: true }),
+    };
+    const { tool } = probeTool(['fs']);
+    const registry = new ToolRegistry(logger);
+    registry.register(tool);
+    registry.register(configTool);
+
+    const result = await makeRunner(registry, FULL_INHERITED, scriptedClient('manage_agent_config'))
+      .run({ task: '试图改配置' });
+
+    expect(result.ok).toBe(true);
+    expect(result.answer).toBeDefined();
+  });
+
   it('结构上无递归：needs 含 agent 的工具不进子 agent 的工具集', async () => {
     const spawnLike: Tool = {
       name: 'spawn_subagent',

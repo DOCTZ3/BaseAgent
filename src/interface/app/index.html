@@ -29,6 +29,7 @@
     <button class="icon-btn" id="btn-skills" title="技能库">
       ✦<span class="badge" id="skill-badge" hidden></span>
     </button>
+    <button class="icon-btn restart-session" id="btn-restart-session" title="重启当前会话">↻</button>
     <button class="icon-btn" id="btn-config" title="配置">⚙</button>
     <!--
       窗口按钮:顶栏是自绘的(titleBarStyle: 'hidden'),系统按钮不存在。
@@ -78,6 +79,15 @@
     -->
     <div class="stream-box" id="stream-box">
       <main id="stream" class="stream"></main>
+      <div class="turn-select-bar" id="turn-select-bar" hidden>
+        <span id="turn-select-count">已选择 0 轮</span>
+        <button class="btn" id="btn-clear-turn-selection">清空</button>
+        <button class="btn primary" id="btn-turn-actions">操作</button>
+        <div class="turn-action-popover" id="turn-action-popover" hidden>
+          <button class="btn primary" id="btn-extract-skill">沉淀为技能</button>
+          <button class="btn" id="btn-compress-memory">压缩进记忆</button>
+        </div>
+      </div>
 
       <!--
         回到底部。只在用户往上翻走之后出现 —— 常驻会挡住右下角的正文,
@@ -94,6 +104,8 @@
   </div>
 
 </div>
+
+<div class="toast" id="app-toast" hidden></div>
 
 <!-- 配置抽屉 -->
 <div class="drawer-mask" id="drawer-mask" hidden></div>
@@ -139,6 +151,18 @@
     </section>
 
     <section>
+      <h3>Secret Store <span class="hint">MCP 和第三方凭证使用</span></h3>
+      <div class="config-list" id="secret-list"></div>
+      <button class="btn" id="btn-add-secret">添加 Secret</button>
+    </section>
+
+    <section>
+      <h3>MCP Servers <span class="hint">工具 schema 按需加载</span></h3>
+      <div class="config-list" id="mcp-list"></div>
+      <button class="btn" id="btn-add-mcp">添加 MCP Server</button>
+    </section>
+
+    <section>
       <h3>能力</h3>
       <label class="row"><input type="checkbox" id="cfg-python"> 代码执行(Python 沙箱)</label>
       <label class="row"><input type="checkbox" id="cfg-danger"> 允许危险工具</label>
@@ -176,13 +200,14 @@
   </div>
 
   <div class="drawer-foot">
-    <span class="hint" id="restart-hint" hidden>这些改动需要重建会话才生效</span>
+    <span class="hint" id="restart-hint" hidden>保存后应用配置；MCP/Secret 可热刷新，运行配置会重建会话</span>
+    <span class="config-error" id="cfg-error" hidden></span>
     <!--
       保存会重建会话(dispose 掉当前这个),而进行中的那一轮跑在旧实例上 ——
       工具桥和 DB 句柄被关掉之后它会开始报一串莫名的工具失败。
       所以执行期间禁用保存,并说清为什么。
     -->
-    <span class="hint" id="save-busy-hint" hidden>执行中不能保存(保存会重建会话)</span>
+    <span class="hint" id="save-busy-hint" hidden>执行中不能保存配置</span>
     <button class="btn primary" id="btn-save">保存</button>
   </div>
 </aside>
@@ -212,13 +237,14 @@
 
   <div class="drawer-foot">
     <span class="hint">通过审批后才会进入提示词索引,模型才可能用到它。</span>
+    <span class="hint skill-manual-hint" id="skill-manual-hint" hidden></span>
     <!--
       审批**不影响当前对话** —— 技能索引在会话装配时拼进 system 消息就冻住了,
       之后没有任何路径会重算它。这不是懒,是刻意的:system 消息是 prompt cache
       前缀里最稳定的部分(实测命中率 60~77%),为一次审批重写它会让整段缓存失效。
       所以说清「下次新对话生效」,与配置面板那个 restart-hint 同一个模式。
     -->
-    <span class="hint" id="skill-apply-hint" hidden>已审批的技能在<strong>下次新对话</strong>生效。</span>
+    <span class="hint" id="skill-apply-hint" hidden>技能索引变更在<strong>下次新对话</strong>生效。</span>
   </div>
 </aside>
 
@@ -226,7 +252,7 @@
 <div class="modal-mask" id="confirm-mask" hidden>
   <div class="modal">
     <h3 id="confirm-title">需要确认</h3>
-    <pre id="confirm-body" class="verbatim"></pre>
+    <div id="confirm-body" class="confirm-body"></div>
     <p class="hint">请读清楚要执行的内容。这一步没有其他机制拦得住它。</p>
     <div class="modal-foot">
       <button class="btn" id="btn-deny">拒绝</button>

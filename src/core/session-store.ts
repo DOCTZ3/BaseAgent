@@ -25,6 +25,7 @@ import fs from 'fs';
 import path from 'path';
 import { type Turn, turnUserMessage } from './context.js';
 import { messageToText } from './llm-client.js';
+import { redactSensitive } from '../platform/secrets.js';
 
 /** 侧边栏一条 —— 只放列表要显示的,不读全部轮次 */
 export interface SessionSummary {
@@ -52,11 +53,11 @@ export function turnsFile(baseDir: string, sessionId: string): string {
  * **写盘失败绝不抛异常**:历史记录是增强,不能让「存不下来」变成
  * 「这一轮任务失败」(同 TraceRecorder 与 FileLogger 的处理)。
  */
-export function appendTurn(file: string, turn: Turn): boolean {
+export function appendTurn(file: string, turn: Turn, redactValues: readonly string[] = []): boolean {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     // 一行一个 JSON,行内不能有裸换行 —— JSON.stringify 会把 \n 转义掉,天然满足
-    fs.appendFileSync(file, JSON.stringify(turn) + '\n');
+    fs.appendFileSync(file, JSON.stringify(redactSensitive(turn, redactValues)) + '\n');
     return true;
   } catch {
     return false;

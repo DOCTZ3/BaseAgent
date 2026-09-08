@@ -81,6 +81,10 @@ export interface Skill {
    * 所以早期一律人工过一遍。
    */
   pending: boolean;
+  /** 待审批变更来源。只在 pending=true 时有意义,审批后清掉,避免 UI 标签永久挂着 */
+  pendingChange?: 'added' | 'updated';
+  /** 是否进入技能索引并允许 load_skill 加载。旧数据缺省视为启用 */
+  enabled: boolean;
   /** 被 load_skill 取用的次数 —— 淘汰依据 */
   hits: number;
   /** 最后一次取用之后任务成功的时间。腐烂的 skill 靠它暴露 */
@@ -102,6 +106,8 @@ const StoredSchema = z.object({
       steps: z.array(z.object({ goal: z.string(), how: z.string().optional() })),
       pitfalls: z.array(z.string()).optional(),
       pending: z.boolean(),
+      pendingChange: z.enum(['added', 'updated']).optional(),
+      enabled: z.boolean().default(true),
       hits: z.number(),
       lastOkAt: z.number().optional(),
       createdAt: z.number(),
@@ -142,9 +148,9 @@ export function clearSkills(store: SkillStore): void {
   store.delete(SKILL_KEY);
 }
 
-/** 已生效的(审批过的)。索引和加载都只看这些 */
+/** 已生效的(审批过且启用的)。索引和加载都只看这些 */
 export function activeSkills(skills: readonly Skill[]): Skill[] {
-  return skills.filter(s => !s.pending);
+  return skills.filter(s => !s.pending && s.enabled !== false);
 }
 
 /** 待审批的 —— 审批 UI 用 */
@@ -340,6 +346,7 @@ export function mergeSkillExtraction(
       note: extraction.note ?? old.note,
       // 资历保留,审批状态重置 —— 内容变了就该再看一眼
       pending: true,
+      pendingChange: 'updated',
       updatedAt: now,
     };
     // 回报**库里那个名字**,不是这次抽出来的。两者可能只差一个空格,
@@ -354,6 +361,8 @@ export function mergeSkillExtraction(
     pitfalls: extraction.pitfalls,
     note: extraction.note,
     pending: true,
+    pendingChange: 'added',
+    enabled: true,
     hits: 0,
     createdAt: now,
     updatedAt: now,

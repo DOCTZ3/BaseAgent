@@ -144,6 +144,7 @@ function summarizeToolData(data: unknown): string {
       const v = o[key];
       if (typeof v === 'string' && v.trim()) return clip(v);
     }
+    if (o.needs_restart === true) return '配置已保存,需新建会话后生效';
     // 列表类结果报个数就够(search_files / list_files)
     for (const key of ['files', 'matches', 'items', 'results']) {
       const v = o[key];

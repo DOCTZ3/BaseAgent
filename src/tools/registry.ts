@@ -56,7 +56,7 @@ export class ToolRegistry {
     return tools.map(tool => ({
       name: tool.name,
       description: tool.description,
-      parameters: zodToJsonSchema(tool.parameters) as Record<string, unknown>,
+      parameters: tool.parameterSchema ?? zodToJsonSchema(tool.parameters) as Record<string, unknown>,
     }));
   }
 

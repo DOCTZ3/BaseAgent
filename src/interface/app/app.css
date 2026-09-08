@@ -85,6 +85,17 @@ body {
   border-radius: 6px;
 }
 .icon-btn:hover { background: var(--bg-hover); color: var(--fg); }
+.icon-btn:disabled {
+  cursor: default;
+  opacity: .55;
+}
+.icon-btn:disabled:hover { background: none; color: var(--fg-dim); }
+.restart-session.spinning {
+  animation: spin-refresh .8s linear infinite;
+}
+@keyframes spin-refresh {
+  to { transform: rotate(360deg); }
+}
 
 /*
   待审批计数角标
@@ -317,6 +328,69 @@ body {
   white-space: pre-wrap;
 }
 
+.history-user {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.turn-check {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+}
+
+.turn-check input { margin: 0; }
+
+.turn-text {
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.turn-select-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(22, 23, 26, .94);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .25);
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+
+.turn-select-bar .btn {
+  padding: 4px 9px;
+  font-size: 12px;
+}
+
+.turn-action-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  display: grid;
+  gap: 6px;
+  min-width: 132px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(22, 23, 26, .98);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .35);
+}
+
+.turn-action-popover .btn {
+  width: 100%;
+  text-align: left;
+}
+
 /* 流式期间是纯文本,靠 pre-wrap 保住换行 */
 .answer { white-space: pre-wrap; }
 
@@ -461,6 +535,11 @@ body {
   color: var(--fg-dim);
 }
 
+.think.live .think-text {
+  max-height: none;
+  overflow-y: visible;
+}
+
 /* 短推理:去掉三角与交互暗示,读起来就是一行注释 */
 .think.flat > summary {
   display: none;
@@ -512,6 +591,26 @@ body {
   padding-left: 10px;
 }
 .notice.error { color: var(--err); border-color: var(--err); }
+
+.toast {
+  position: fixed;
+  right: 24px;
+  bottom: 86px;
+  z-index: 30;
+  max-width: min(360px, calc(100vw - 48px));
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #202328;
+  color: var(--fg);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .35);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.toast.error {
+  border-color: #6e3535;
+  color: var(--err);
+}
 
 /* ---------- 输入区 ---------- */
 .composer {
@@ -576,8 +675,34 @@ body {
   padding: 12px 16px;
   border-bottom: 1px solid var(--line);
 }
-.drawer-foot { border-bottom: 0; border-top: 1px solid var(--line); gap: 10px; }
+.drawer-foot {
+  border-bottom: 0;
+  border-top: 1px solid var(--line);
+  gap: 10px;
+  flex-wrap: wrap;
+}
 .drawer-head h2 { font-size: 15px; margin: 0; }
+
+.drawer-foot .hint,
+.drawer-foot .config-error {
+  flex: 1;
+  min-width: 0;
+}
+
+.drawer-foot .skill-manual-hint {
+  flex-basis: 100%;
+  color: var(--fg-dim);
+}
+
+.drawer-foot .skill-manual-hint.error {
+  color: var(--err);
+}
+
+.config-error {
+  color: var(--err);
+  font-size: 12px;
+  line-height: 1.45;
+}
 
 .drawer-body { flex: 1; overflow-y: auto; padding: 4px 16px 16px; }
 .drawer-body section { padding: 14px 0; border-bottom: 1px solid var(--line); }
@@ -599,7 +724,8 @@ body {
 }
 
 .drawer-body input[type=text],
-.drawer-body input[type=password] {
+.drawer-body input[type=password],
+.drawer-body select {
   width: 100%;
   margin-top: 5px;
   background: var(--bg-soft);
@@ -610,7 +736,8 @@ body {
   font: inherit;
   outline: none;
 }
-.drawer-body input:focus { border-color: #3d4652; }
+.drawer-body input:focus,
+.drawer-body select:focus { border-color: #3d4652; }
 .drawer-body input[readonly] { color: var(--fg-dim); }
 
 .hint { color: var(--fg-faint); font-size: 12px; font-weight: 400; }
@@ -630,8 +757,142 @@ body {
   white-space: nowrap;
 }
 .btn:hover { background: var(--bg-hover); }
+.btn:disabled { opacity: .5; cursor: default; }
 .btn.primary { background: var(--accent); color: #0d1117; border-color: transparent; font-weight: 600; }
 .btn.danger { background: #5c2b2b; border-color: #6e3535; }
+
+.config-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.config-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: 10px;
+}
+
+.config-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.config-row-head input[type=text] {
+  margin-top: 0;
+}
+
+.config-row-head .btn {
+  padding: 6px 10px;
+}
+
+.config-status {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--fg-faint);
+  background: #111317;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.config-status.ok {
+  color: var(--ok);
+  border-color: #284939;
+  background: #121a16;
+}
+
+.config-status.warn {
+  color: var(--warn);
+  border-color: #4d3d21;
+  background: #1c1810;
+}
+
+.config-status.err {
+  color: var(--err);
+  border-color: #5a3036;
+  background: #211417;
+}
+
+.config-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.config-grid label {
+  margin-bottom: 0;
+}
+
+.config-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+}
+
+.config-inline select {
+  min-width: 0;
+  flex: 1;
+  margin-top: 0;
+}
+
+.config-inline .btn {
+  padding: 7px 10px;
+}
+
+.config-test {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--ok);
+  background: #151917;
+  color: var(--fg-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.config-test.error {
+  border-color: var(--err);
+  background: #1d1517;
+  color: var(--err);
+}
+
+.config-test-tools {
+  margin-top: 8px;
+}
+
+.config-test-tools details {
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+}
+
+.config-test-tools summary {
+  cursor: pointer;
+  color: var(--fg);
+}
+
+.config-test-tools pre {
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0f1013;
+  color: var(--fg-dim);
+  font: 11px/1.5 ui-monospace, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* ---------- 技能卡片 ---------- */
 
@@ -649,14 +910,21 @@ body {
   font-weight: 600;
 }
 
-.skill-card {
-  background: var(--bg-soft);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 12px 14px;
-  margin-bottom: 10px;
+  .skill-card {
+    background: var(--bg-soft);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+  .skill-card.pending { border-left: 2px solid var(--accent); }
+  .skill-card.disabled { opacity: .72; }
+
+.skill-limit {
+  color: var(--fg-faint);
+  font-size: 12px;
+  margin: 0 0 10px;
 }
-.skill-card.pending { border-left: 2px solid var(--accent); }
 
 .skill-name {
   font: 13px/1.5 ui-monospace, Consolas, monospace;
@@ -682,10 +950,12 @@ body {
   font: 400 11px/18px system-ui, sans-serif;
   vertical-align: middle;
 }
-.skill-tag.new { background: #23303f; color: var(--accent); }
-.skill-tag.upd { background: #3a2f1c; color: var(--warn); }
+  .skill-tag.new { background: #23303f; color: var(--accent); }
+  .skill-tag.upd { background: #3a2f1c; color: var(--warn); }
+  .skill-tag.off { background: #2b2f35; color: var(--fg-muted); }
 
 .skill-desc { font-size: 13px; margin: 4px 0 8px; }
+.skill-detail { margin-top: 8px; }
 
 /*
   步骤列表
@@ -730,13 +1000,53 @@ body {
 .modal h3 { margin: 0 0 12px; font-size: 15px; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 
+.confirm-body {
+  margin: 0 0 10px;
+}
+
+.confirm-draft {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0f1013;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.confirm-draft-title {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.confirm-draft-row {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.confirm-draft-row .k {
+  color: var(--fg-faint);
+}
+
+.confirm-draft-row .v {
+  color: var(--fg);
+  min-width: 0;
+  word-break: break-word;
+}
+
 /* 原样呈现:不换行折叠、不转义、等宽。反斜杠被显示成双写就等于骗了用户 */
 .verbatim {
   background: #0f1013;
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 12px;
-  margin: 0 0 10px;
+  margin: 0;
   font: 13px/1.6 ui-monospace, Consolas, monospace;
   white-space: pre-wrap;
   word-break: break-all;

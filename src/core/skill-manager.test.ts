@@ -15,7 +15,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { SkillManager, type TurnActivity } from './skill-manager.js';
-import { saveSkills, loadSkills, type Skill, type SkillStore } from './skill.js';
+import { saveSkills, loadSkills, MAX_ACTIVE_SKILLS, type Skill, type SkillStore } from './skill.js';
 import type { Turn } from './context.js';
 import type { LLMClient, LLMResponse } from './llm-client.js';
 import { ConsoleLogger, LogLevel } from '../platform/index.js';
@@ -39,6 +39,7 @@ function skill(over: Partial<Skill> = {}): Skill {
     description: '搜索知乎热搜榜并返回条目标题',
     steps: [{ goal: '进入知乎', how: 'page.goto(...)' }],
     pending: false,
+    enabled: true,
     hits: 0,
     createdAt: T0,
     updatedAt: T0,
@@ -100,13 +101,25 @@ describe('load —— 只读边界与 pending 闸门', () => {
 
   it('**取不到待审批的** —— 它根本不在索引里,模型不该能拿到', () => {
     const store = makeStore();
-    saveSkills(store, [skill({ pending: true })]);
+    saveSkills(store, [skill({ pending: true, pendingChange: 'added' })]);
     const m = manager(store, jsonClient({ worth: false }).client);
 
     const r = m.load('zhihu-hot');
     expect(r.ok).toBe(false);
     // 也不该出现在可用名单里
     expect(r.available).toEqual([]);
+  });
+
+  it('取不到已停用的,且可用名单也不包含它', () => {
+    const store = makeStore();
+    saveSkills(store, [skill({ name: 'live' }), skill({ name: 'off', enabled: false })]);
+    const m = manager(store, jsonClient({ worth: false }).client);
+
+    const r = m.load('off');
+    expect(r.ok).toBe(false);
+    expect(r.available).toEqual(['live']);
+    expect(m.prompt()).toContain('live');
+    expect(m.prompt()).not.toContain('off');
   });
 
   it('取错名字时给出可用名单 —— 省一轮试错', () => {
@@ -143,7 +156,7 @@ describe('load —— 只读边界与 pending 闸门', () => {
 describe('审批', () => {
   it('approve 之后才进索引、才可加载', () => {
     const store = makeStore();
-    saveSkills(store, [skill({ pending: true })]);
+    saveSkills(store, [skill({ pending: true, pendingChange: 'added' })]);
     const m = manager(store, jsonClient({ worth: false }).client);
 
     expect(m.load('zhihu-hot').ok).toBe(false);
@@ -153,6 +166,54 @@ describe('审批', () => {
     expect(m.prompt()).toContain('zhihu-hot');
     // 落盘了才算,否则重启就退回待审
     expect(loadSkills(store)[0].pending).toBe(false);
+    expect(loadSkills(store)[0].pendingChange).toBeUndefined();
+    expect(loadSkills(store)[0].enabled).toBe(true);
+  });
+
+  it('setEnabled 只停用索引与加载,不删除技能', () => {
+    const store = makeStore();
+    saveSkills(store, [skill({ name: 'zhihu-hot', hits: 2 })]);
+    const m = manager(store, jsonClient({ worth: false }).client);
+
+    expect(m.setEnabled('zhihu-hot', false)).toBe(true);
+    expect(loadSkills(store)).toHaveLength(1);
+    expect(loadSkills(store)[0].enabled).toBe(false);
+    expect(m.load('zhihu-hot').ok).toBe(false);
+    expect(m.prompt()).not.toContain('zhihu-hot');
+
+    expect(m.setEnabled('zhihu-hot', true)).toBe(true);
+    expect(m.load('zhihu-hot').ok).toBe(true);
+  });
+
+  it('setEnabled 不处理待审批技能', () => {
+    const store = makeStore();
+    saveSkills(store, [skill({ pending: true, pendingChange: 'added' })]);
+    const m = manager(store, jsonClient({ worth: false }).client);
+
+    expect(m.setEnabled('zhihu-hot', false)).toBe(false);
+    expect(loadSkills(store)[0].enabled).toBe(true);
+  });
+
+  it(`已启用达到 ${MAX_ACTIVE_SKILLS} 个后不能再审批新技能`, () => {
+    const store = makeStore();
+    const full = Array.from({ length: MAX_ACTIVE_SKILLS }, (_, i) => skill({ name: `s${i}` }));
+    saveSkills(store, [...full, skill({ name: 'pending-one', pending: true, pendingChange: 'added' })]);
+    const m = manager(store, jsonClient({ worth: false }).client);
+
+    expect(m.approve('pending-one')).toBe(false);
+    const pending = loadSkills(store).find(s => s.name === 'pending-one');
+    expect(pending?.pending).toBe(true);
+  });
+
+  it(`已启用达到 ${MAX_ACTIVE_SKILLS} 个后不能再启用停用技能`, () => {
+    const store = makeStore();
+    const full = Array.from({ length: MAX_ACTIVE_SKILLS }, (_, i) => skill({ name: `s${i}` }));
+    saveSkills(store, [...full, skill({ name: 'off', enabled: false })]);
+    const m = manager(store, jsonClient({ worth: false }).client);
+
+    expect(m.setEnabled('off', true)).toBe(false);
+    const off = loadSkills(store).find(s => s.name === 'off');
+    expect(off?.enabled).toBe(false);
   });
 
   it('reject 删掉条目并落盘', () => {
@@ -261,6 +322,73 @@ describe('onTurnEnd —— 触发判据', () => {
     expect(saved[0].description).toBe('更精确的描述');
     expect(saved[0].hits).toBe(12);
     expect(saved[0].pending).toBe(true);   // 内容变了要再看一眼
+  });
+});
+
+describe('extractFromTurns —— 手动沉淀', () => {
+  const extraction = {
+    worth: true,
+    name: 'manual-flow',
+    description: '从用户选中的多轮历史里沉淀可复用流程',
+    steps: [{ goal: '归纳跨轮流程', how: '读取用户选择的 turns' }],
+  };
+
+  it('不受自动触发门槛限制,用户选中轮次就会尝试抽取', async () => {
+    const store = makeStore();
+    const { client, calls } = jsonClient(extraction);
+    const result = await manager(store, client).extractFromTurns([busyTurn()], '用户手动选择');
+
+    expect(calls).toEqual(['skill:extraction']);
+    expect(result.ok).toBe(true);
+    expect(result.changed).toBe('added');
+    expect(result.name).toBe('manual-flow');
+    expect(loadSkills(store)[0].pending).toBe(true);
+    expect(loadSkills(store)[0].pendingChange).toBe('added');
+  });
+
+  it('会把多个轮次放进同一次抽取,用于跨轮任务归纳', async () => {
+    let userPrompt = '';
+    const client: LLMClient = {
+      async complete(req): Promise<LLMResponse> {
+        userPrompt = String(req.messages[1].content);
+        return {
+          content: JSON.stringify(extraction),
+          reasoning: null,
+          toolCalls: [],
+          finishReason: 'stop',
+        };
+      },
+    };
+
+    await manager(makeStore(), client).extractFromTurns([
+      { ...busyTurn(), turn_id: 1 },
+      { ...busyTurn(), turn_id: 2 },
+    ]);
+
+    expect(userPrompt).toContain('用户手动选择了 2 轮');
+    expect(userPrompt).toContain('--- turn 1 ---');
+    expect(userPrompt).toContain('--- turn 2 ---');
+    expect(userPrompt).toContain('跨轮任务');
+  });
+
+  it('worth:false 时返回原因,不写入库', async () => {
+    const store = makeStore();
+    const { client } = jsonClient({ worth: false, reason: '只是一次性问答' });
+    const result = await manager(store, client).extractFromTurns([busyTurn()]);
+
+    expect(result.ok).toBe(true);
+    expect(result.changed).toBe('none');
+    expect(result.reason).toContain('一次性问答');
+    expect(loadSkills(store)).toEqual([]);
+  });
+
+  it('空选择直接返回错误,不调 LLM', async () => {
+    const { client, calls } = jsonClient(extraction);
+    const result = await manager(makeStore(), client).extractFromTurns([]);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('没有可沉淀');
+    expect(calls).toEqual([]);
   });
 });
 

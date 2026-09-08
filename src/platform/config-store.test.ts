@@ -26,6 +26,7 @@ import {
   validateStored,
 } from './config-store.js';
 import { loadConfig } from './config.js';
+import { buildSecretEnv, redactSensitive, type StoredSecret } from './secrets.js';
 
 let tmpDir: string;
 const saved: Record<string, string | undefined> = {};
@@ -131,6 +132,109 @@ describe('写盘', () => {
   });
 });
 
+describe('Secret and MCP config', () => {
+  it('merges secret patches without resending existing values', () => {
+    writeConfigFile({
+      secrets: [{
+        name: 'LUCKIN_TOKEN',
+        value: 'secret-1',
+        description: 'Luckin MCP token',
+      }],
+    });
+    writeConfigFile({ model: 'next-model' });
+
+    expect(readConfigFile().secrets).toEqual([
+      {
+        name: 'LUCKIN_TOKEN',
+        value: 'secret-1',
+        description: 'Luckin MCP token',
+      },
+    ]);
+
+    writeConfigFile({
+      secrets: [{ name: 'LUCKIN_TOKEN', description: 'Updated Luckin token' }],
+    });
+    expect(readConfigFile().secrets).toEqual([
+      {
+        name: 'LUCKIN_TOKEN',
+        value: 'secret-1',
+        description: 'Updated Luckin token',
+      },
+    ]);
+
+    writeConfigFile({ secrets: [{ name: 'LUCKIN_TOKEN', delete: true }] });
+    expect(readConfigFile().secrets).toEqual([]);
+  });
+
+  it('allows secret placeholders so the model can prepare config while the user fills value later', () => {
+    writeConfigFile({
+      secrets: [{ name: 'MCP_TOKEN', description: 'MCP bearer token' }],
+    });
+
+    expect(readConfigFile().secrets).toEqual([{
+      name: 'MCP_TOKEN',
+      value: '',
+      description: 'MCP bearer token',
+    }]);
+  });
+
+  it('stores MCP servers and normalizes bearer secret names', () => {
+    writeConfigFile({
+      mcpServers: [{
+        id: 'luckin',
+        name: 'Luckin',
+        description: 'Luckin ordering MCP',
+        url: 'https://example.com/mcp',
+        enabled: true,
+        bearerSecret: 'luckin_token',
+      }],
+    });
+
+    expect(readConfigFile().mcpServers?.[0]).toMatchObject({
+      id: 'luckin',
+      name: 'Luckin',
+      description: 'Luckin ordering MCP',
+      url: 'https://example.com/mcp',
+      enabled: true,
+      bearerSecret: 'LUCKIN_TOKEN',
+    });
+  });
+
+  it('does not expose stored secrets to Python env', () => {
+    writeConfigFile({
+      secrets: [
+        {
+          name: 'MCP_TOKEN',
+          value: 'mcp-secret',
+          description: 'MCP bearer token',
+        },
+      ],
+    });
+
+    expect(buildSecretEnv(readConfigFile().secrets as StoredSecret[])).toEqual({});
+  });
+
+  it('redacts sensitive fields by key even when the value is newly introduced', () => {
+    expect(redactSensitive({
+      tool: 'manage_agent_config',
+      args: {
+        secret: {
+          name: 'TOKEN',
+          secret_value: 'fresh-value-not-yet-in-config',
+        },
+      },
+    })).toEqual({
+      tool: 'manage_agent_config',
+      args: {
+        secret: {
+          name: 'TOKEN',
+          secret_value: '<secret:field-redacted>',
+        },
+      },
+    });
+  });
+});
+
 describe('toOverrides 翻译', () => {
   it('maxTokens / enableThinking 落在 models.main', () => {
     const o = toOverrides({ maxTokens: 8000, enableThinking: false });
@@ -167,5 +271,33 @@ describe('toOverrides 翻译', () => {
     expect(c.models.main.enableThinking).toBe(false);
     // 没配的段仍是默认值,没被这次覆盖带歪
     expect(c.execution.timeout).toBe(loadConfig().execution.timeout);
+  });
+
+  it('passes stored secrets and MCP servers into loadConfig overrides', () => {
+    const o = toOverrides({
+      secrets: [{ name: 'TOKEN', value: 'secret-value', description: 'demo token' }],
+      mcpServers: [{
+        id: 'demo',
+        name: 'Demo',
+        description: 'Demo MCP server',
+        url: 'https://example.com/mcp',
+        enabled: false,
+        bearerSecret: 'token',
+      }],
+    });
+    const c = loadConfig(o);
+
+    expect(c.secrets.items).toEqual([
+      { name: 'TOKEN', value: 'secret-value', description: 'demo token' },
+    ]);
+    expect(c.mcp.servers).toEqual([{
+      id: 'demo',
+      name: 'Demo',
+      description: 'Demo MCP server',
+      url: 'https://example.com/mcp',
+      enabled: false,
+      bearerSecret: 'TOKEN',
+      headers: undefined,
+    }]);
   });
 });

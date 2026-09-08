@@ -48,6 +48,7 @@
   };
 
   window.AgentConfigApi = {
+    get: () => bridge.getConfig(),
     async save(patch) {
       const r = await bridge.saveConfig(patch);
 
@@ -70,6 +71,12 @@
       }
       return r;
     },
+    testMcp: payload => bridge.testMcpConfig(payload),
+    describeMcp: payload => bridge.describeMcpConfig(payload),
+  };
+
+  window.AgentRuntime = {
+    restart: () => bridge.restart(),
   };
 
   // 危险工具确认:主进程问 → 页面弹窗 → 答案回去。
@@ -95,6 +102,12 @@
     list: () => bridge.listSkills(),
     approve: name => bridge.approveSkill(name),
     reject: name => bridge.rejectSkill(name),
+    setEnabled: (name, enabled) => bridge.setSkillEnabled(name, enabled),
+    extractFromTurns: payload => bridge.extractSkillFromTurns(payload),
+  };
+
+  window.AgentMemory = {
+    extractFromTurns: payload => bridge.extractMemoryFromTurns(payload),
   };
 
   // 沉淀完了刷角标。必须靠推送:抽取在 run() 返回**之后**才结束,

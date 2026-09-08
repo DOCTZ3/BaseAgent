@@ -4,6 +4,17 @@
 
 import path from 'path';
 import type { FsGrant } from './security.js';
+import type { StoredSecret } from './secrets.js';
+
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  description?: string;
+  url: string;
+  enabled: boolean;
+  bearerSecret?: string;
+  headers?: Record<string, string>;
+}
 
 /**
  * 解析工作区路径
@@ -343,6 +354,14 @@ export interface AgentConfig {
     maxTokens?: number;
   };
 
+  secrets: {
+    items: StoredSecret[];
+  };
+
+  mcp: {
+    servers: McpServerConfig[];
+  };
+
   // 可观测:LLM 调用留痕(本地调试用)
   trace: {
     enabled: boolean;    // 是否把每次调用的线格式请求/响应写盘
@@ -569,6 +588,12 @@ export const defaultConfig: AgentConfig = {
     maxTokens: process.env.SKILL_MAX_TOKENS
       ? parseInt(process.env.SKILL_MAX_TOKENS) : undefined,
   },
+  secrets: {
+    items: [],
+  },
+  mcp: {
+    servers: [],
+  },
   trace: {
     // 默认开启:本地调试的主要手段,开销只有一次同步写盘
     enabled: process.env.TRACE_ENABLED !== 'false',
@@ -652,6 +677,8 @@ export function loadConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     // 漏了这一行不报错,只表现成「整段 overrides 生效但默认值丢失」
     // (或反之)—— models.vision 就是这么漏过一次的
     skill: { ...defaultConfig.skill, ...overrides.skill },
+    secrets: { ...defaultConfig.secrets, ...overrides.secrets },
+    mcp: { ...defaultConfig.mcp, ...overrides.mcp },
     // 复用上面那个 trace —— fsGrants 的归档 ro 授权是按它的 dir 派生的,
     // 在这里重新合并一次会让两者有机会不一致
     trace,

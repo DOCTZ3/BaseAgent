@@ -41,6 +41,7 @@ import {
   findSkill,
   renderSkillIndex,
   renderSkillBody,
+  MAX_ACTIVE_SKILLS,
   type Skill,
   type SkillStore,
 } from './skill.js';
@@ -93,6 +94,15 @@ export interface TurnActivity {
   toolFails: number;
 }
 
+export interface ManualSkillExtractionResult {
+  ok: boolean;
+  changed?: 'added' | 'updated' | 'none';
+  name?: string;
+  reason?: string;
+  error?: string;
+  skills?: readonly Skill[];
+}
+
 export class SkillManager implements SkillReader {
   private skills: Skill[];
   private retryHandler: RetryHandler;
@@ -111,6 +121,7 @@ export class SkillManager implements SkillReader {
       config.logger.debug('技能库已加载', {
         active: activeSkills(this.skills).length,
         pending: pendingSkills(this.skills).length,
+        disabled: this.skills.filter(s => !s.pending && s.enabled === false).length,
       });
     }
   }
@@ -170,11 +181,26 @@ export class SkillManager implements SkillReader {
   approve(name: string): boolean {
     const hit = findSkill(this.skills, name);
     if (!hit || !hit.pending) return false;
+    if (activeSkills(this.skills).length >= MAX_ACTIVE_SKILLS) return false;
 
     hit.pending = false;
-    hit.updatedAt = Date.now();
+    hit.enabled = true;
+    delete hit.pendingChange;
     saveSkills(this.config.store, this.skills);
     this.config.logger.info('技能已通过审批', { skill: name });
+    return true;
+  }
+
+  /** 启用 / 停用 —— 不删除落盘数据,只影响索引与 load_skill 可见性 */
+  setEnabled(name: string, enabled: boolean): boolean {
+    const hit = findSkill(this.skills, name);
+    if (!hit || hit.pending || hit.enabled === enabled) return false;
+    if (enabled && activeSkills(this.skills).length >= MAX_ACTIVE_SKILLS) return false;
+
+    hit.enabled = enabled;
+    hit.updatedAt = Date.now();
+    saveSkills(this.config.store, this.skills);
+    this.config.logger.info(enabled ? '技能已启用' : '技能已停用', { skill: name });
     return true;
   }
 
@@ -229,7 +255,18 @@ export class SkillManager implements SkillReader {
 
     this.extracting = true;
     try {
-      await this.extract(turn, activity);
+      const trajectory = this.renderTrajectory(turn);
+      if (!trajectory.trim()) return;
+
+      const result = await this.extractFromTrajectory(
+        [
+          `本次任务(${activity.toolSteps} 步工具调用,${activity.toolFails} 次失败):`,
+          trajectory,
+        ].join('\n'),
+      );
+      if (!result.ok) {
+        this.config.logger.warn('技能抽取失败,库保持原样', { error: result.error });
+      }
     } catch (e) {
       // 失败不影响任何东西 —— 库保持原样,下次够格再试
       this.config.logger.warn('技能抽取失败,库保持原样', {
@@ -240,19 +277,54 @@ export class SkillManager implements SkillReader {
     }
   }
 
-  private async extract(turn: Turn, activity: TurnActivity): Promise<void> {
-    const trajectory = this.renderTrajectory(turn);
-    if (!trajectory.trim()) return;
+  async extractFromTurns(
+    turns: readonly Turn[],
+    reason?: string,
+  ): Promise<ManualSkillExtractionResult> {
+    const selected = turns.filter(t => t && Array.isArray(t.messages));
+    if (selected.length === 0) return { ok: false, error: '没有可沉淀的轮次' };
 
-    // 现有列表必须给 —— 不给的话每次成功都新建一条,
-    // 很快就是五十条「搜知乎热搜」。待审批的也要列(否则待审列表里也会堆)
+    if (this.extracting) {
+      return { ok: false, error: '技能抽取正在进行,请稍后再试' };
+    }
+
+    const chunks = selected
+      .map(turn => {
+        const trajectory = this.renderTrajectory(turn);
+        return trajectory.trim()
+          ? [`--- turn ${turn.turn_id} ---`, trajectory].join('\n')
+          : '';
+      })
+      .filter(Boolean);
+    if (chunks.length === 0) return { ok: false, error: '选中的轮次没有可归纳的内容' };
+
+    this.extracting = true;
+    try {
+      return await this.extractFromTrajectory(
+        [
+          `用户手动选择了 ${selected.length} 轮对话用于沉淀。`,
+          reason ? `用户意图: ${reason}` : '用户意图: 从这些轮次中提炼可复用工作轨迹。',
+          '这些轮次可能共同构成一个跨轮任务,请优先总结整体流程,不要机械按轮次拆成多个技能。',
+          '',
+          ...chunks,
+        ].join('\n'),
+      );
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      this.config.logger.warn('手动技能沉淀失败,库保持原样', { error });
+      return { ok: false, error };
+    } finally {
+      this.extracting = false;
+    }
+  }
+
+  private async extractFromTrajectory(trajectory: string): Promise<ManualSkillExtractionResult> {
     const existing = renderExistingSkillsForExtractor(this.skills);
 
     const extraction = await this.completeJSON(
       [
         `已记录的轨迹:\n${existing}`,
         '',
-        `本次任务(${activity.toolSteps} 步工具调用,${activity.toolFails} 次失败):`,
         trajectory,
       ].join('\n'),
     );
@@ -261,7 +333,12 @@ export class SkillManager implements SkillReader {
       this.config.logger.debug('技能抽取:本次不值得沉淀', {
         reason: extraction.reason,
       });
-      return;
+      return {
+        ok: true,
+        changed: 'none',
+        reason: extraction.reason || '抽取模型判断这次没有可复用轨迹',
+        skills: this.skills,
+      };
     }
 
     const before = this.skills.length;
@@ -270,7 +347,12 @@ export class SkillManager implements SkillReader {
 
     if (merged.changed === 'none') {
       this.config.logger.debug('技能抽取:结果不完整,未入库');
-      return;
+      return {
+        ok: true,
+        changed: 'none',
+        reason: '抽取结果缺少名称、描述或步骤,未入库',
+        skills: this.skills,
+      };
     }
 
     this.skills = merged.skills;
@@ -298,6 +380,13 @@ export class SkillManager implements SkillReader {
         error: e instanceof Error ? e.message : String(e),
       });
     }
+
+    return {
+      ok: true,
+      changed: merged.changed,
+      name: merged.name,
+      skills: this.skills,
+    };
   }
 
   /**

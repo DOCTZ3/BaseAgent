@@ -119,6 +119,35 @@
       console.log('[mock] 保存配置', patch);
       await sleep(200);
     },
+    async testMcp(payload) {
+      console.log('[mock] 测试 MCP', payload);
+      await sleep(500);
+      return {
+        ok: true,
+        server: { id: payload?.server?.id || 'demo', name: payload?.server?.name || 'Demo MCP' },
+        toolCount: 2,
+        tools: [
+          {
+            name: 'list_menu',
+            description: '列出菜单',
+            inputSchema: { type: 'object', properties: { city: { type: 'string' } } },
+          },
+          {
+            name: 'create_order',
+            description: '创建订单草稿',
+            inputSchema: { type: 'object', properties: { sku: { type: 'string' } } },
+          },
+        ],
+      };
+    },
+    async describeMcp(payload) {
+      console.log('[mock] 生成 MCP 说明', payload);
+      await sleep(500);
+      return {
+        ok: true,
+        description: '用于演示菜单查询、门店检索和订单草稿创建的 MCP 服务,适合在代码执行中按需加载工具 schema 后完成点单相关自动化操作。',
+      };
+    },
   };
 
   // 假的会话信息,形状与将来 server 要给的一致

@@ -48,6 +48,8 @@ export interface EnvironmentOptions {
   availablePackages?: string[];
   /** 检测到缺失的基线库(安装名)。有值时提示里明确点名「没有」 */
   missingPackages?: string[];
+  /** 已配置并启用的 MCP Server。只列 server,工具 schema 由 load_mcp 按需披露 */
+  mcpServers?: Array<{ id: string; name: string; description?: string }>;
 }
 
 /**
@@ -78,8 +80,34 @@ export function buildEnvironmentPrompt(opts: EnvironmentOptions): string {
   // 拦截发生在两处(audit hook 与 SecurityGuard),没有代码执行时
   // 模型照样能调 read_file 撞上拒绝 —— 那时它更需要知道原因
   return parts
-    .concat(codeActPart(opts), packagesPart(opts), visionPart(opts), secretsPart())
+    .concat(codeActPart(opts), packagesPart(opts), visionPart(opts), mcpPart(opts), secretsPart())
     .join('');
+}
+
+/**
+ * MCP Server 清单
+ *
+ * 只写 server_id/name,不把 tools/list 的 schema 预灌进系统提示:
+ * schema 可能很大,而且未必本轮要用。模型只需要知道“先调哪个 server 的
+ * load_mcp”,具体工具再按需展开。
+ */
+function mcpPart(opts: EnvironmentOptions): string {
+  if (!opts.pythonEnabled || !opts.mcpServers?.length) return '';
+
+  const rows = opts.mcpServers
+    .map(s => {
+      const label = `${s.id}${s.name && s.name !== s.id ? ` (${s.name})` : ''}`;
+      return `- ${label}${s.description ? `: ${s.description}` : ''}`;
+    })
+    .join('\n');
+
+  return (
+    '\n已配置 MCP Servers:\n' +
+    rows +
+    '\n需要使用 MCP 时,先调用 load_mcp(server_id) 获取该 server 的工具 schema;' +
+    '再在 execute_python 里调用 mcp_call(server_id, tool_name, arguments)。' +
+    '不要猜 MCP 工具参数,以 load_mcp 返回的 inputSchema 为准。\n'
+  );
 }
 
 /**
@@ -174,7 +202,10 @@ function codeActPart(opts: EnvironmentOptions): string {
     '之后所有轮次都接不上了。需要新标签页时用 browser.contexts[0].new_page()，' +
     '用完 page.close() 可以。' +
     '因为浏览器跨轮次存活，上一轮打开的页面这一轮可以直接接着操作。' +
-    '绝不要在代码里填写账号密码 —— 那会把明文凭证写进对话记录。'
+    '绝不要在代码里填写账号密码 —— 那会把明文凭证写进对话记录。' +
+    '遇到登录页、验证码、滑块、人机检测、OAuth 授权、扫码或二次验证时,' +
+    '不要继续用 goto、requests、cookie 文件或脚本绕过;这些需要人接管。' +
+    '连续两次因为 401/403/登录跳转/验证码拿不到目标内容时,也不要继续重试同一路径。'
   );
 }
 
@@ -204,7 +235,7 @@ function secretsPart(): string {
     '**这不是路径写错，也不是权限没配好，换写法、换工具、换进程都一样** —— ' +
     '这类内容一旦读出就会进入对话记录、随请求发送出去并落进日志，事后无法撤回。' +
     '所以不要尝试绕过，也不要把读取失败当成需要排查的故障。' +
-    '任务确实需要某个凭证时，说明用途、请用户以环境变量方式提供；' +
+    '任务确实需要第三方 token/API key 时，说明用途、通过配置页 Secret 槽位让用户填写；' +
     '需要登录某个站点时用常驻浏览器的登录态，不要去翻凭证文件。'
   );
 }
@@ -261,7 +292,10 @@ export function buildMainSystemPrompt(
         '只能把情况写进回答交回给你。收到这类回答时由你来处理 ——' +
         '用 request_help 请用户操作，完成后再把剩下的活下放一次。' +
         '所以下放前最好先确认目标站点是否已登录。'
-      : '')
+      : '') +
+    '需要用户完成登录、验证码、扫码、二次验证、OAuth 授权、人机检测或页面内确认时,' +
+    '先把浏览器导航到需要用户操作的页面,然后调用 request_help。' +
+    '不要把“绕过登录/验证码”当成任务的一部分;用户完成后再用 screenshot 或页面快照确认状态。'
   );
 }
 
@@ -283,7 +317,7 @@ export function buildSubAgentSystemPrompt(opts: EnvironmentOptions): string {
     // 这条必须显式说:否则它会写「请用户登录后重试」然后卡住等一个不会来的回复
     '你**无法与用户交互**，也没有请求用户帮助的工具，也不能执行外部命令（装库等）。' +
     '遇到需要登录、验证码、人机检测、缺少第三方库、或任何必须由人操作/确认的情况，' +
-    '不要尝试绕过、也不要等待 —— 把「卡在哪一步、需要人做什么」写进你的回答，' +
+    '不要尝试绕过、也不要等待 —— 把「卡在哪一步、需要人做什么、用户完成后应从哪个页面继续」写进你的回答，' +
     '交回主 agent 由它去请用户处理。\n' +
     // shellEnabled 强制为 false:run_command 不下放给子 agent(见 sub-agent.ts
     // 的 NO_SUBAGENT_TOOLS)。不覆盖的话提示里会让它去用一个自己没有的工具 ——

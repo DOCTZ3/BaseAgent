@@ -28,6 +28,7 @@
 │  interface/  交互层(壳,可替换)                            │
 │    · app/         已实现:Electron 客户端(流式、历史侧边栏) │
 │                   含自写 Markdown 渲染(只建 DOM,不碰 HTML) │
+│                   配置/Secret/MCP/技能/记忆均经 IPC 窄接口 │
 │    · voice        预留:ASR 语音转文字 / TTS 播报            │
 │    职责:只做 输入→文本 / 结构化结果→展示,零业务逻辑        │
 │    关键:壳共用 core/session.ts 一份装配,壳不重算事实       │
@@ -66,6 +67,15 @@
 └───────────────────────────┬──────────────────────────────┘
                             │ needs: ['fs', 'python', 'browser', ...]
 ┌───────────────────────────┴──────────────────────────────┐
+│  mcp/  外部工具协议适配层                                  │
+│    · client        Streamable HTTP/SSE MCP 客户端           │
+│    · tool-adapter  动态加载 server 工具 schema              │
+│                    load_mcp / mcp_call 暴露给代码侧调用     │
+│    职责:把 MCP Server 的远端工具转成框架内可调用能力        │
+│    关键:Secret 只在主进程解析,明文不进提示词和渲染进程      │
+└───────────────────────────┬──────────────────────────────┘
+                            │ 调用外部 MCP Server
+┌───────────────────────────┴──────────────────────────────┐
 │  executors/  执行器 / 资源层                              │
 │    · fs-driver     文件系统封装,集成 security 白名单       │
 │    · python-executor  子进程执行代码 + 写边界(audit hook)   │
@@ -84,6 +94,7 @@
 │    · logger        分级日志输出                           │
 │    · config        .env 配置加载                          │
 │    · config-store  客户端配置持久化(JSON,.env 作回落)      │
+│    · secrets       Secret 名称归一/合并/掩码显示           │
 │    · storage       SQLite 持久化(记忆/session 索引)       │
 │    · security      SecurityGuard:白名单 + 凭证目录黑名单    │
 │    · errors        统一错误类型(Validation/Security/...)  │
@@ -300,6 +311,7 @@ interface AgentSession {
   readonly info: SessionInfo;              // 装配算出的事实,壳不重算
   readonly notices: readonly SessionNotice[];   // 装配期告警,壳决定怎么呈现
   run(input: string, onEvent?: AgentEventSink): Promise<AgentRunResult>;
+  refreshConfig?(): Promise<SessionInfo>;  // MCP/Secret 热刷新,不重建执行器边界
   dispose(): Promise<void>;                // **必须调**
 }
 ```
@@ -318,6 +330,10 @@ interface AgentSession {
   只表现成「venv 里装了、代码里 import 不到」
 - **`dispose()` 是必须的**:常驻 chromium 是 detached 的,不关会一直锁着
   profile 目录导致下次启动失败(实测)
+- **重启当前会话保留 `sessionId`。** 客户端顶部的重启按钮复用 `agent:restart`,
+  但会把旧 `sessionId` 传回 `createSession(resumeSessionId)`,重新装配 LLM、
+  工具、系统提示和执行器后再从 `turns.jsonl` 恢复历史。这样技能索引/长期记忆/
+  运行配置的变更可以显式生效,而不需要用户来回切历史或新建空会话。
 
 ### ContextManager (上下文管理)
 
@@ -467,9 +483,11 @@ interface TopicSummary {
 
 - **子 agent 的环境提示与主 agent 同源。** 浏览器是否常驻、能不能用 Python、工具是否收敛、视觉怎么调用,这些不是角色差异,必须由 `buildEnvironmentPrompt` 生成并嵌入两份提示。角色说明可以不同:主 agent 负责下放与向用户求助,子 agent 看不到主历史、不能请求用户帮助、也不能执行外部命令。
 
-- **长期记忆与上下文压缩分开。** 压缩解决“这次会话还能不能继续”,记忆解决“下次会话是否知道用户偏好”。记忆只存稳定用户特征,不存当前任务进展;抽取器只提出候选和矛盾,合并由代码做,结构上不能删除旧条目。错的长期记忆会每轮注入,所以用户必须能查看和清空。
+- **长期记忆与上下文压缩分开。** 压缩解决“这次会话还能不能继续”,记忆解决“下次会话是否知道用户偏好”。记忆只存稳定用户特征,不存当前任务进展;抽取器只提出候选和矛盾,合并由代码做,结构上不能删除旧条目。错的长期记忆会每轮注入,所以用户必须能查看和清空。客户端支持手动选择历史 turn 压缩进长期记忆,但仍只把 `messages[0]` 的用户发言喂给抽取器,不把工具观察和模型行为当用户特征。
 
-- **技能库记录可复用轨迹,但审批前不可用。** 技能沉淀看单轮工具活动:达到工具步数门槛或出现工具失败,且 `stopReason === 'complete'` 才异步抽取。入库一律 `pending`,人工审批前不进索引、`load_skill` 取不到。索引只放名字和描述,正文按需加载,以保住系统提示的 prompt cache 稳定性。
+- **技能库记录可复用轨迹,但审批前不可用。** 技能沉淀看单轮工具活动:达到工具步数门槛或出现工具失败,且 `stopReason === 'complete'` 才异步抽取;客户端也支持手动选择历史 turn 沉淀。入库一律 `pending`,人工审批前不进索引、`load_skill` 取不到。索引只放名字和描述,正文按需加载,以保住系统提示的 prompt cache 稳定性。
+
+- **技能库全量保存,启用集才进提示词。** `MAX_ACTIVE_SKILLS = 20` 是系统提示词索引预算,不是存储清理策略。超过上限的技能仍落盘并在前端技能栏可见,用户通过启用/停用按钮决定哪些进入后续会话。已审批技能默认折叠展示,待审批完整展示;启用数达到 20 时前端提示取舍,后端也兜底拒绝第 21 个启用项,避免“界面已启用但实际没进提示词”的错位。
 
 - **动作空间向 CodeAct 收敛。** Python 可用时,查时间、写文件、列目录等“代码一行能做”的工具从模型清单里移走,减少每次请求的 schema 成本,也避免工具和等价代码两条路让行为不可预测。`read_file` / `search_files` 仍保留,因为它们带返回量控制;`execute_python` 是动作空间入口。
 
@@ -485,7 +503,11 @@ interface TopicSummary {
 
 - **浏览器是代码里的库,不是一组浏览器工具。** 导航、定位、点击、DOM 提取都交给 Python + Playwright,让筛选发生在子进程内,不要把整页 HTML 灌进上下文。框架只兜住 stdout 上限、截图和视觉观察。替代方案是做 BrowserDriver 工具组,但长尾交互无穷,还会把大 DOM 变成工具返回。
 
-- **工具桥只暴露代码本身碰不到、且必须由框架投递的能力。** 当前桥只暴露 `screenshot` / `view_image`。`read_file` / `search_files` 在 Python 里有 `open` / `glob`,经桥调用只是冗余;`request_help` 在代码块中不能真正暂停;`spawn_subagent` 套在代码执行里收益不清且失败难查。桥启动成功后才隐藏对应工具,避免两条路都断。
+- **MCP 走代码侧按需加载,不是把所有远端工具直接塞给模型。** 配置页保存 MCP Server 和 Bearer Secret 关联,主进程只把 server 名称、描述和工具 schema 摘要放进上下文;明文 Secret 不进入提示词、trace、渲染进程或工具结果。模型在 Python 代码里先 `load_mcp(server)` 看远端工具清单,再用 `mcp_call(server, tool, args)` 触发真实 MCP 请求。这样保持 CodeAct 主范式,也用渐进披露控制工具 schema 成本。
+
+- **MCP/Secret 支持热刷新,运行边界仍需重建。** 只改 MCP Server 或 Secret 时,客户端配置保存后调用 `session.refreshConfig()` 刷新 MCP runtime、环境提示和主 system message;改 workspace、模型、Python、shell、memory、maxSteps 等会影响执行器或安全边界的项,仍走完整 `agent:restart`。顶部“重启当前会话”按钮用于让技能/长期记忆/运行配置的系统提示变化显式生效。
+
+- **工具桥只暴露代码本身碰不到、且必须由框架投递的能力。** 当前桥暴露 `screenshot` / `view_image` 以及 MCP 的 `load_mcp` / `mcp_call`。`read_file` / `search_files` 在 Python 里有 `open` / `glob`,经桥调用只是冗余;`request_help` 在代码块中不能真正暂停;`spawn_subagent` 套在代码执行里收益不清且失败难查。桥启动成功后才隐藏对应工具,避免两条路都断。
 
 - **视觉是插件,不是主模型的输入通道。** 配了 `VISION_MODEL` 才注册看图能力;图片交给视觉模型,主模型只接收文字观察。因此主模型是否多模态不影响架构,也方便换成更强文本模型。代价是主模型看不到没问到的图像细节,追问要再调一次;收益是主上下文不再携带图片。
 
@@ -493,7 +515,9 @@ interface TopicSummary {
 
 - **Electron 是主客户端,不是本地 HTTP server。** Agent 需要 Node 主进程来 spawn Python、开 SQLite、连 CDP;Electron 用 IPC 暴露窄接口,没有 localhost 端口和额外鉴权面。渲染进程按不可信环境处理:`contextIsolation: true`、`nodeIntegration: false`,明文 key 不进页面。代价是多一份 Chromium,但它与被 agent 控制的常驻浏览器必须分开。
 
-- **客户端配置写用户配置目录,不写回 `.env`。** `.env` 是回落来源,而 `config.ts` 的默认配置在模块加载时求值,写回 `.env` 不会热生效。配置面板写 JSON,保存后重建会话;workspace 会派生 fs 授权、Python cwd、写边界和浏览器 profile,假装热更新只会制造“界面显示新值、实际跑旧边界”的错位。
+- **客户端配置写用户配置目录,不写回 `.env`。** `.env` 是开发期/首次启动回落来源,真正的客户端配置写入 Electron userData 目录。打包后 trace、配置、记忆库和浏览器登录态都落在 userData 下,避免写进安装目录或项目目录。渲染进程只拿掩码和 `hasValue`,明文 key 只在主进程配置合并与请求发送时出现。
+
+- **配置页可以创建 Secret 空槽,但模型不读取明文。** MCP 这类第三方服务经常需要用户登录或复制 token,所以配置页支持先创建 Secret 槽位、绑定到 MCP Server,再由用户填值测试。模型可以通过管理配置工具建议创建/修改槽位描述和 MCP 配置,但明文凭证始终由用户在 UI 里填,框架只通过名称引用它。
 
 - **Markdown 渲染自己构 DOM,不走 HTML 字符串。** 模型输出和网页片段都是不可信文本。`markdown -> HTML -> innerHTML` 需要再依赖消毒器,漏一个选项就是 XSS;当前渲染器全程 `createElement` + `textContent`。流式期间只追加纯文本,done 后一次性渲染,避免半截 Markdown 反复改变结构。
 
@@ -509,18 +533,19 @@ interface TopicSummary {
 
 ### ✅ 已完成
 
-- **Interface**:Electron 客户端是当前正式交互壳,消费 `core/session.ts`,提供历史侧边栏、配置面板、危险命令确认、技能审批、流式渲染和安全 Markdown 渲染。
-- **Core**:`AgentSession` 统一装配、`Orchestrator` ReAct 主循环、`LLMClient`/`DeepSeekAdapter`、`ContextManager`、`TokenCounter`、`session-store`、长期记忆、技能沉淀、视觉分析、一次性子 agent、系统提示组装。
-- **Tools**:统一工具契约、注册表、调用管线和内置工具。工具按 `needs` 声明资源,runner 负责参数校验、资源注入、危险确认和错误包装。
+- **Interface**:Electron 客户端是当前正式交互壳,消费 `core/session.ts`,提供历史侧边栏、配置面板、Secret/MCP 管理、危险命令确认、技能审批与启停、选中 turn 手动沉淀/记忆压缩、重启当前会话、流式渲染和安全 Markdown 渲染。
+- **Core**:`AgentSession` 统一装配、`Orchestrator` ReAct 主循环、`LLMClient`/`DeepSeekAdapter`、`ContextManager`、`TokenCounter`、`session-store`、长期记忆、技能沉淀与启停、视觉分析、一次性子 agent、系统提示组装、MCP/Secret 热刷新。
+- **Tools**:统一工具契约、注册表、调用管线和内置工具。工具按 `needs` 声明资源,runner 负责参数校验、资源注入、危险确认和错误包装;系统工具包含 `load_skill` 和模型可用的配置管理入口。
+- **MCP**:支持 Streamable HTTP/SSE MCP Server 配置、连接测试、schema 摘要生成、按需 `load_mcp` / `mcp_call` 和 Secret 名称绑定。
 - **Executors**:文件系统驱动、Python 执行器、Shell 执行器、常驻浏览器、浏览器操作、工具桥、沙箱 venv、env 白名单、读黑名单、输出上限和进程树回收。
-- **Platform**:配置加载、客户端配置持久化、日志、trace、重试、错误类型、安全检查和 SQLite KV 存储。
+- **Platform**:配置加载、客户端配置持久化、Secret 合并/掩码、日志、trace、重试、错误类型、安全检查和 SQLite KV 存储。
+- **Packaging**:已配置 Windows portable/installer 打包。打包产物使用编译后的 `dist/`,运行数据落在 Electron userData 目录。
 
 ### ⏳ 未实现 / 冻结项
 
 - **HttpClient**:HTTP 抓取/下载执行器尚未落地。目前网页与 API 探索主要通过 Python/Playwright 或 Python 标准库完成。
 - **Planner**:多步任务拆解模块仍未实现。当前 ReAct 单循环尚未暴露必须引入 planner 的证据,暂不抢跑。
 - **Voice**:语音输入/播报仍是预留壳,不影响核心 Agent 能力。
-- **客户端打包**:开发期 Electron 主进程通过 `tsx` 直接加载 `.ts` 源码;打包 exe 时需要改成加载编译产物并处理原生依赖。
 - **服务端级隔离**:容器、独立用户、网络管控等只在服务端/多租户形态下重新评估,不作为当前本地路线的功能目标。
 - **子 agent stateful 模式**:保留上下文续传和 LRU 驻留池属于后续增强,当前只保留一次性子任务执行。
 
@@ -533,10 +558,11 @@ interface TopicSummary {
 | 语言 | TypeScript, ES modules |
 | 模型接入 | OpenAI SDK 兼容接口;默认 DeepSeek,内核依赖 `LLMClient` 抽象 |
 | 客户端 | Electron;主进程/预加载脚本用 CommonJS,开发期经 `tsx` 加载 TS 源码 |
+| MCP | Streamable HTTP/SSE MCP 客户端;通过 Secret 名称绑定 Bearer Token |
 | 浏览器自动化 | Playwright 运行在 Python 环境内,通过常驻 Chromium 的 CDP 连接 |
 | 代码执行 | Python 子进程 + audit hook 写护栏 + stdout/stderr 上限 + 进程树回收 |
 | 外部命令 | Shell 子进程,仅经 `run_command` 人工确认后执行 |
-| 持久化 | SQLite(`better-sqlite3` 惰性加载) + JSONL 会话历史 |
+| 持久化 | SQLite(`better-sqlite3` 惰性加载) + JSONL 会话历史 + Electron userData 配置 |
 | 参数校验 | Zod + `zod-to-json-schema` |
 | 可观测 | FileLogger + TraceRecorder 记录线格式 LLM 请求/响应 |
 | 测试 | Vitest 单元测试 + `tsc --noEmit` 类型检查 |
@@ -547,7 +573,7 @@ interface TopicSummary {
 
 当前路线是**收束文档、验证真实链路、修已知 bug**,不主动扩新功能。
 
-1. 精修本文档与 README,让它们只保留核心架构、边界与入口说明;事故细节继续沉到 [pitfalls.md](pitfalls.md)。
-2. 重新跑 `npm test` 与 `npm run typecheck`;如果改到 Electron 渲染层,还要重启客户端做真实界面验证。
-3. 按 [pitfalls.md](pitfalls.md#十待补的坑已知但还没修) 处理已知 bug:子进程中断、技能库覆盖、注定无效的重试、工具桥重建等。
-4. `HttpClient`、Planner、Voice、打包、stateful 子 agent 等保持冻结,除非后续明确重新开启功能开发。
+1. 对 MCP 真实服务做更多端到端 trace 样例,沉淀协议层常见坑到 [pitfalls.md](pitfalls.md)。
+2. 完善技能/记忆的前端管理能力:查看、清空、编辑或导出都应保持“明文凭证不进渲染进程”的边界。
+3. 继续修真实使用中暴露的客户端体验问题,尤其是滚动、长输出、浏览器恢复和中断后的状态同步。
+4. `HttpClient`、Planner、Voice、服务端级隔离、stateful 子 agent 等保持冻结,除非后续明确重新开启功能开发。

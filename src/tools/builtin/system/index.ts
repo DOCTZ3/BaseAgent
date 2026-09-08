@@ -8,3 +8,4 @@ export { SearchFilesTool } from './search-files.js';
 export { WriteFileTool } from './write-file.js';
 export { RunCommandTool } from './run-command.js';
 export { LoadSkillTool } from './load-skill.js';
+export { ManageAgentConfigTool } from './manage-agent-config.js';

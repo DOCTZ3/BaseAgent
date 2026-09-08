@@ -174,6 +174,36 @@ describe('turns.jsonl 读写', () => {
     expect(back[0].messages[0].content).toBe('第一行\n第二行\n第三行');
   });
 
+  it('写入前会脱敏工具参数里的 secret_value', () => {
+    const f = turnsFile(dir, 'secret');
+    appendTurn(f, {
+      turn_id: 1,
+      timestamp: Date.now(),
+      messages: [
+        { role: 'user', content: '帮我配置 token' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{
+            id: 'c1',
+            name: 'manage_agent_config',
+            args: {
+              action: 'upsert_secret',
+              secret: {
+                name: 'TOKEN',
+                secret_value: 'fresh-secret',
+              },
+            },
+          }],
+        },
+      ],
+    });
+
+    const raw = fs.readFileSync(f, 'utf8');
+    expect(raw).not.toContain('fresh-secret');
+    expect(raw).toContain('<secret:field-redacted>');
+  });
+
   it('坏行被跳过,好行照常读出', () => {
     const f = turnsFile(dir, 'w3');
     appendTurn(f, fakeTurn(1, '问题一'));

@@ -53,6 +53,18 @@ export interface MemoryManagerConfig {
   retry?: Partial<RetryConfig>;
 }
 
+export interface ManualMemoryExtractionResult {
+  ok: boolean;
+  changed?: boolean;
+  before?: number;
+  after?: number;
+  candidates?: number;
+  contradicts?: number;
+  reason?: string;
+  error?: string;
+  memories?: readonly MemoryEntry[];
+}
+
 // maxTokens **刻意不在这里给默认值** —— 与 SkillManager 同一个理由:
 // 兜底 2000 是个暗默预算,配了 MAIN_MAX_TOKENS 也管不到抽取调用,
 // 而思维链计入输出预算,不够时 content 直接是空的(技能抽取那边实测踩到,
@@ -132,21 +144,71 @@ export class MemoryManager {
     }
   }
 
-  private async extract(turns: readonly Turn[]): Promise<void> {
+  async extractFromTurns(
+    turns: readonly Turn[],
+    reason?: string,
+  ): Promise<ManualMemoryExtractionResult> {
+    const selected = turns.filter(t => t && Array.isArray(t.messages));
+    if (selected.length === 0) return { ok: false, error: '没有可压缩的轮次' };
+
+    if (this.extracting) {
+      return { ok: false, error: '长期记忆抽取正在进行,请稍后再试' };
+    }
+
+    this.extracting = true;
+    try {
+      const result = await this.extract(selected, reason || '用户手动选择的对话');
+      return { ok: true, ...result, memories: this.entries };
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      this.config.logger.warn('手动长期记忆抽取失败,保持原记忆', { error });
+      return { ok: false, error };
+    } finally {
+      this.extracting = false;
+    }
+  }
+
+  private async extract(
+    turns: readonly Turn[],
+    label = '最近的对话',
+  ): Promise<{
+    changed: boolean;
+    before: number;
+    after: number;
+    candidates: number;
+    contradicts: number;
+    reason?: string;
+  }> {
     const dialogue = this.renderTurns(turns);
-    if (!dialogue.trim()) return;
+    if (!dialogue.trim()) {
+      return {
+        changed: false,
+        before: this.entries.length,
+        after: this.entries.length,
+        candidates: 0,
+        contradicts: 0,
+        reason: '选中的轮次没有可用于长期记忆的用户发言',
+      };
+    }
 
     const existing = renderExistingForExtractor(this.entries);
     const extraction = await this.completeJSON(
-      `已记录的特征:\n${existing}\n\n最近的对话:\n${dialogue}`,
+      `已记录的特征:\n${existing}\n\n${label}:\n${dialogue}`,
     );
 
+    const before = this.entries.length;
     if (extraction.candidates.length === 0 && extraction.contradicts.length === 0) {
       this.config.logger.debug('长期记忆:本次无可抽取内容');
-      return;
+      return {
+        changed: false,
+        before,
+        after: before,
+        candidates: 0,
+        contradicts: 0,
+        reason: '模型判断没有稳定的长期记忆',
+      };
     }
 
-    const before = this.entries.length;
     // 合并在 memory.ts:默认全部保留,只替换明确指出矛盾的条目
     this.entries = mergeExtraction(this.entries, extraction, Date.now());
     saveMemory(this.config.store, this.entries);
@@ -157,6 +219,16 @@ export class MemoryManager {
       candidates: extraction.candidates.length,
       contradicts: extraction.contradicts.length,
     });
+
+    return {
+      changed: this.entries.length !== before
+        || extraction.candidates.length > 0
+        || extraction.contradicts.length > 0,
+      before,
+      after: this.entries.length,
+      candidates: extraction.candidates.length,
+      contradicts: extraction.contradicts.length,
+    };
   }
 
   /**

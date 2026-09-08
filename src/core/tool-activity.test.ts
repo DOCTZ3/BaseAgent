@@ -123,6 +123,17 @@ function okTool(name = 'noop'): Tool {
   };
 }
 
+function restartNeededTool(name = 'save_config'): Tool {
+  return {
+    name,
+    description: '保存配置',
+    parameters: z.object({}),
+    needs: [],
+    danger: false,
+    run: async () => ({ ok: true, data: { needs_restart: true } }),
+  };
+}
+
 /**
  * 脚本化客户端:先按 plan 逐步返回 tool_calls,用完之后给最终答案
  *
@@ -146,7 +157,7 @@ function scriptedClient(plan: string[][]): LLMClient {
   };
 }
 
-function runWith(plan: string[][], tools: Tool[]) {
+function runWith(plan: string[][], tools: Tool[], onEvent?: Parameters<Orchestrator['run']>[1]) {
   const ctx = makeContext();
   const registry = new ToolRegistry(logger);
   for (const t of tools) registry.register(t);
@@ -164,6 +175,7 @@ function runWith(plan: string[][], tools: Tool[]) {
     maxSteps: 20,
     logger,
     context: ctx,
+    onEvent,
   });
 
   return { ctx, orchestrator };
@@ -217,5 +229,20 @@ describe('orchestrator 推进来的粒度', () => {
     await orchestrator.run([{ role: 'user', content: 'q' }]);
 
     expect(ctx.getStats().currentTurn.toolSteps).toBeGreaterThanOrEqual(8);
+  });
+
+  it('配置类工具返回 needs_restart 时,工具事件摘要提示新建会话后生效', async () => {
+    const summaries: string[] = [];
+    const { orchestrator } = runWith(
+      [['save_config']],
+      [restartNeededTool()],
+      ev => {
+        if (ev.type === 'tool_end') summaries.push(ev.summary);
+      },
+    );
+
+    await orchestrator.run([{ role: 'user', content: 'q' }]);
+
+    expect(summaries).toContain('配置已保存,需新建会话后生效');
   });
 });

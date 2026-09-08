@@ -89,6 +89,30 @@ describe('环境段的关键约定', () => {
   it('绝不在代码里写账号密码', () => {
     expect(env).toContain('账号密码');
   });
+
+  it('浏览器遇到登录/验证时不继续绕,交给主 agent 请求用户帮助', () => {
+    expect(env).toContain('登录页');
+    expect(env).toContain('验证码');
+    expect(env).toContain('401/403');
+    expect(env).toContain('不要继续用 goto');
+  });
+
+  it('只把 MCP server 清单放进环境提示,工具 schema 由 load_mcp 按需披露', () => {
+    const withMcp = buildEnvironmentPrompt({
+      ...FULL,
+      mcpServers: [{
+        id: 'luckin',
+        name: 'Luckin',
+        description: '瑞幸点单、门店、菜单相关 MCP',
+      }],
+    });
+
+    expect(withMcp).toContain('已配置 MCP Servers');
+    expect(withMcp).toContain('luckin (Luckin): 瑞幸点单、门店、菜单相关 MCP');
+    expect(withMcp).toContain('load_mcp');
+    expect(withMcp).toContain('mcp_call');
+    expect(withMcp).toContain('inputSchema');
+  });
 });
 
 // ============================================
@@ -257,9 +281,9 @@ describe('敏感文件禁止读取', () => {
     expect(env).toContain('不要尝试绕过');
   });
 
-  it('给出路:凭证走环境变量、登录走常驻浏览器', () => {
+  it('给出路:凭证走 Secret 槽位、登录走常驻浏览器', () => {
     // 只禁不给出路等于制造一个新卡点(与装包那条同一个教训)
-    expect(env).toContain('环境变量');
+    expect(env).toContain('Secret 槽位');
     expect(env).toContain('登录态');
   });
 
@@ -304,11 +328,19 @@ describe('角色差异', () => {
     expect(main).toContain('没有请求用户帮助的能力');
   });
 
-  it('关掉子 agent 时主提示不提下放，也不提那条注意事项', () => {
+  it('主 agent 总是知道 request_help 是登录/验证/授权的正式通道', () => {
+    const main = buildMainSystemPrompt({ ...FULL, subAgentEnabled: false });
+
+    expect(main).toContain('request_help');
+    expect(main).toContain('OAuth 授权');
+    expect(main).toContain('不要把“绕过登录/验证码”当成任务的一部分');
+  });
+
+  it('关掉子 agent 时主提示不提下放，也不提子 agent 那条注意事项', () => {
     const main = buildMainSystemPrompt({ ...FULL, subAgentEnabled: false });
 
     expect(main).not.toContain('spawn_subagent');
-    expect(main).not.toContain('request_help');
+    expect(main).not.toContain('没有请求用户帮助的能力');
   });
 
   it('子 agent 提示强调回答是唯一产物', () => {

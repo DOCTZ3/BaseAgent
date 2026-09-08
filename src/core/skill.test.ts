@@ -54,6 +54,7 @@ function skill(over: Partial<Skill> = {}): Skill {
     description: '搜索知乎热搜榜并返回条目标题',
     steps: [{ goal: '进入知乎', how: 'page.goto("https://www.zhihu.com")' }],
     pending: false,
+    enabled: true,
     hits: 0,
     createdAt: T0,
     updatedAt: T0,
@@ -73,6 +74,26 @@ describe('存取', () => {
     const back = loadSkills(store);
     expect(back).toHaveLength(1);
     expect(back[0].name).toBe('zhihu-hot');
+  });
+
+  it('旧库没有 enabled 字段时默认按启用处理', () => {
+    const store = makeStore();
+    store.set(SKILL_KEY, JSON.stringify({
+      version: 1,
+      skills: [{
+        name: 'old-skill',
+        description: '旧版本沉淀的技能',
+        steps: [{ goal: '完成旧流程' }],
+        pending: false,
+        hits: 0,
+        createdAt: T0,
+        updatedAt: T0,
+      }],
+    }));
+
+    const back = loadSkills(store);
+    expect(back[0].enabled).toBe(true);
+    expect(activeSkills(back).map(s => s.name)).toEqual(['old-skill']);
   });
 
   it('格式坏了按空处理,不抛 —— skill 是增强,读不出来不该让会话起不来', () => {
@@ -99,6 +120,12 @@ describe('pending 闸门', () => {
     expect(pendingSkills(list).map(s => s.name)).toEqual(['b']);
   });
 
+  it('停用的技能仍在库里,但不进入 activeSkills', () => {
+    const list = [skill({ name: 'a' }), skill({ name: 'b', enabled: false })];
+    expect(activeSkills(list).map(s => s.name)).toEqual(['a']);
+    expect(list.map(s => s.name)).toEqual(['a', 'b']);
+  });
+
   it('索引里**不出现**待审批的 —— 含糊的描述不该占预算', () => {
     const idx = renderSkillIndex([
       skill({ name: 'good', description: '搜索知乎热搜榜' }),
@@ -107,6 +134,16 @@ describe('pending 闸门', () => {
 
     expect(idx).toContain('good');
     expect(idx).not.toContain('vague');
+  });
+
+  it('索引里不出现停用的 —— 停用只是退出提示词预算,不清理落盘数据', () => {
+    const idx = renderSkillIndex([
+      skill({ name: 'enabled-one', description: '可进入提示词的技能' }),
+      skill({ name: 'disabled-one', description: '已经停用的技能', enabled: false }),
+    ]);
+
+    expect(idx).toContain('enabled-one');
+    expect(idx).not.toContain('disabled-one');
   });
 
   it('全是待审批时索引为空串 —— 不留一个空标题段', () => {
@@ -221,6 +258,7 @@ describe('mergeSkillExtraction', () => {
     expect(r.changed).toBe('added');
     expect(r.skills).toHaveLength(1);
     expect(r.skills[0].pending).toBe(true);
+    expect(r.skills[0].pendingChange).toBe('added');
     expect(r.skills[0].hits).toBe(0);
     expect(activeSkills(r.skills)).toHaveLength(0);
   });
@@ -297,6 +335,16 @@ describe('mergeSkillExtraction', () => {
     expect(s.createdAt).toBe(T0);
     expect(s.updatedAt).toBe(T0 + 5000);
     expect(s.pending).toBe(true);      // 内容变了要再看一眼
+    expect(s.pendingChange).toBe('updated');
+  });
+
+  it('更新已有停用技能时保留停用状态,不偷偷重新启用', () => {
+    const existing = [skill({ name: 'weibo-hot', enabled: false })];
+    const r = mergeSkillExtraction(existing, good, T0 + 5000);
+
+    expect(r.changed).toBe('updated');
+    expect(r.skills[0].enabled).toBe(false);
+    expect(activeSkills(r.skills)).toEqual([]);
   });
 
   it('更新时未提供的字段保留原值 —— 不是填表式覆写', () => {

@@ -15,6 +15,7 @@
   'use strict';
 
   const $ = id => document.getElementById(id);
+  const MAX_ENABLED_SKILLS = 20;
 
   // Markdown 渲染器(md.js,必须在本文件之前加载)。
   // 取不到时降级为纯文本 —— 渲染坏掉不该让回答整段消失
@@ -30,8 +31,22 @@
     wsLabel: $('ws-label'),
     sideList: $('side-list'),
     toBottom: $('btn-to-bottom'),
+    toast: $('app-toast'),
+    restartSession: $('btn-restart-session'),
+    turnSelectBar: $('turn-select-bar'),
+    turnSelectCount: $('turn-select-count'),
+    turnActions: $('btn-turn-actions'),
+    turnActionPopover: $('turn-action-popover'),
+    extractSkill: $('btn-extract-skill'),
+    compressMemory: $('btn-compress-memory'),
+    clearTurnSelection: $('btn-clear-turn-selection'),
   };
   let bottomSentinel = null;
+  let toastTimer = 0;
+  let visibleTurns = [];
+  let selectedTurnIds = new Set();
+  let extractingSelectedTurns = false;
+  let extractingMemoryTurns = false;
 
   // ---------- 滚动 ----------
 
@@ -93,6 +108,12 @@
     });
   }
 
+  function scrollOpenInnerAreasToBottom() {
+    for (const node of els.stream.querySelectorAll('.think[open] .think-text')) {
+      if (node.scrollHeight > node.clientHeight) scrollElementToBottom(node);
+    }
+  }
+
   function keepBottomFor(ms = 900) {
     autoFollowBottom = true;
     stickToBottomUntil = Math.max(stickToBottomUntil, Date.now() + ms);
@@ -133,6 +154,7 @@
     autoFollowBottom = true;
     const box = currentThinkBox();
     if (box) scrollElementToBottom(box);
+    scrollOpenInnerAreasToBottom();
     scrollStreamToBottom();
   }
 
@@ -201,6 +223,8 @@
       if (!think) return;
       const text = think.text.trim();
 
+      think.el.classList.remove('live');
+
       if (!text) {
         think.el.remove();            // 空块不留:模型这一步没有思维链
       } else if (text.length <= THINK_FLAT) {
@@ -225,7 +249,7 @@
           // 用 <details> 而不是 div,是为了收尾时能原地折起来 ——
           // 换元素类型要做 DOM 手术,而流式中途换节点会让已渲染的文字闪一下
           const el = document.createElement('details');
-          el.className = 'think';
+          el.className = 'think live';
           el.open = true;   // 流式期间摊开:边生成边折叠会让内容在眼前跳
           const sum = document.createElement('summary');
           sum.textContent = '思考';
@@ -435,6 +459,17 @@
     scrollToBottom();
   }
 
+  function toast(text, isError = false) {
+    if (!els.toast) return;
+    clearTimeout(toastTimer);
+    els.toast.textContent = text;
+    els.toast.className = 'toast' + (isError ? ' error' : '');
+    els.toast.hidden = false;
+    toastTimer = setTimeout(() => {
+      els.toast.hidden = true;
+    }, isError ? 7000 : 3200);
+  }
+
   // ---------- 历史渲染 ----------
   //
   // 与流式渲染是**两套**,不复用:流式要处理增量、reset、未闭合状态,
@@ -454,14 +489,60 @@
     return '';
   }
 
+  function syncTurnSelectionBar() {
+    if (!els.turnSelectBar) return;
+    const count = selectedTurnIds.size;
+    const working = extractingSelectedTurns || extractingMemoryTurns;
+    els.turnSelectBar.hidden = count === 0;
+    if (els.turnActionPopover && (count === 0 || busy)) els.turnActionPopover.hidden = true;
+    els.turnSelectCount.textContent = `已选择 ${count} 轮`;
+    if (els.turnActions) {
+      els.turnActions.disabled = count === 0 || working || busy;
+      els.turnActions.textContent = working ? '处理中…' : '操作';
+    }
+    if (els.extractSkill) {
+      els.extractSkill.disabled = count === 0 || working || busy;
+      els.extractSkill.textContent = extractingSelectedTurns ? '沉淀中…' : '沉淀为技能';
+    }
+    if (els.compressMemory) {
+      els.compressMemory.disabled = count === 0 || working || busy;
+      els.compressMemory.textContent = extractingMemoryTurns ? '压缩中…' : '压缩进记忆';
+    }
+    if (els.clearTurnSelection) els.clearTurnSelection.disabled = count === 0 || working;
+  }
+
+  function clearTurnSelection() {
+    if (els.turnActionPopover) els.turnActionPopover.hidden = true;
+    selectedTurnIds = new Set();
+    for (const input of els.stream.querySelectorAll('.turn-check input')) {
+      input.checked = false;
+    }
+    syncTurnSelectionBar();
+  }
+
   /** 画一轮历史。位置约定与 core 一致:messages[0] 是提问,末尾不带 toolCalls 的 assistant 是答案 */
   function renderHistoryTurn(turn) {
     const msgs = turn.messages || [];
     if (msgs.length === 0) return;
 
     const bubble = document.createElement('div');
-    bubble.className = 'msg user';
-    bubble.textContent = textOf(msgs[0].content);
+    bubble.className = 'msg user history-user';
+    const pick = document.createElement('label');
+    pick.className = 'turn-check';
+    pick.title = '选择这一轮用于沉淀技能或压缩记忆';
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = selectedTurnIds.has(turn.turn_id);
+    check.addEventListener('change', () => {
+      if (check.checked) selectedTurnIds.add(turn.turn_id);
+      else selectedTurnIds.delete(turn.turn_id);
+      syncTurnSelectionBar();
+    });
+    pick.appendChild(check);
+    const text = document.createElement('div');
+    text.className = 'turn-text';
+    text.textContent = textOf(msgs[0].content);
+    bubble.append(pick, text);
     els.stream.appendChild(bubble);
 
     const wrap = document.createElement('div');
@@ -543,15 +624,21 @@
     els.sideList.classList.toggle('locked', v);
     $('btn-new').classList.toggle('locked', v);
     $('busy-lock-hint').hidden = !v;
+    syncTurnSelectionBar();
 
-    // 保存会走 restart() → 同一套 dispose()
+    // 保存可能会走 restart() → 同一套 dispose()
     $('btn-save').disabled = v;
     $('save-busy-hint').hidden = !v;
+    if (els.restartSession) els.restartSession.disabled = v;
   }
 
   async function submit() {
     const text = els.input.value.trim();
     if (!text || busy) return;
+
+    visibleTurns = [];
+    selectedTurnIds = new Set();
+    syncTurnSelectionBar();
 
     const empty = els.stream.querySelector('.empty');
     if (empty) empty.remove();
@@ -608,6 +695,105 @@
   // `run_command` 全部的安全性就是用户读那一行命令。所以这里:
   // 命令**原样**呈现(pre + textContent,不转义不折行)、默认焦点在「拒绝」、
   // Esc 等于拒绝。任何「顺手点过去」的设计都会让这道边界静默消失。
+
+  function preBlock(text) {
+    const pre = document.createElement('pre');
+    pre.className = 'verbatim';
+    pre.textContent = text;
+    return pre;
+  }
+
+  function confirmDraftTitle(text) {
+    const title = document.createElement('div');
+    title.className = 'confirm-draft-title';
+    title.textContent = text;
+    return title;
+  }
+
+  function confirmDraftRow(label, value) {
+    const row = document.createElement('div');
+    row.className = 'confirm-draft-row';
+
+    const k = document.createElement('span');
+    k.className = 'k';
+    k.textContent = label;
+
+    const v = document.createElement('span');
+    v.className = 'v';
+    v.textContent = value === undefined || value === null || value === ''
+      ? '未提供'
+      : String(value);
+
+    row.append(k, v);
+    return row;
+  }
+
+  function renderManageConfigConfirm(req) {
+    const args = req.args || {};
+    const action = args.action || '';
+    const wrap = document.createElement('div');
+    wrap.className = 'confirm-draft';
+
+    const actionLabel = {
+      upsert_secret: '保存 Secret',
+      delete_secret: '删除 Secret',
+      upsert_mcp_server: '保存 MCP Server',
+      delete_mcp_server: '删除 MCP Server',
+    }[action] || `配置操作: ${action || '未知'}`;
+
+    wrap.appendChild(confirmDraftTitle(actionLabel));
+    if (args.reason) wrap.appendChild(confirmDraftRow('原因', args.reason));
+
+    if (action === 'upsert_secret' || action === 'delete_secret') {
+      const secret = args.secret || {};
+      wrap.appendChild(confirmDraftRow('Secret 名称', secret.name ? String(secret.name).trim().toUpperCase() : '未提供'));
+      if (action === 'upsert_secret') {
+        wrap.appendChild(confirmDraftRow('用途说明', secret.description || '未填写'));
+        wrap.appendChild(confirmDraftRow(
+          'Secret 明文',
+          secret.secret_value ? '已提供,将写入本机 Secret Store,不会在工具结果中回显' : '未提供,只创建/更新占位或说明',
+        ));
+      } else {
+        wrap.appendChild(confirmDraftRow('影响', '会从本机配置中删除该 Secret;引用它的 MCP Server 将无法认证'));
+      }
+      wrap.appendChild(confirmDraftRow('生效时机', '需新建会话后生效'));
+      return wrap;
+    }
+
+    if (action === 'upsert_mcp_server' || action === 'delete_mcp_server') {
+      const server = args.mcp_server || {};
+      wrap.appendChild(confirmDraftRow('Server ID', server.id));
+      if (action === 'upsert_mcp_server') {
+        wrap.appendChild(confirmDraftRow('名称', server.name || server.id));
+        wrap.appendChild(confirmDraftRow('URL', server.url));
+        wrap.appendChild(confirmDraftRow('Bearer Secret', server.bearer_secret || '不使用'));
+        wrap.appendChild(confirmDraftRow('启用', server.enabled === false ? '否' : '是'));
+        wrap.appendChild(confirmDraftRow('用途说明', server.description || '未填写'));
+        const headers = server.headers && typeof server.headers === 'object'
+          ? Object.keys(server.headers)
+          : [];
+        wrap.appendChild(confirmDraftRow('固定 Headers', headers.length ? headers.join(', ') : '无'));
+      } else {
+        wrap.appendChild(confirmDraftRow('影响', '会从本机配置中删除该 MCP Server'));
+      }
+      wrap.appendChild(confirmDraftRow('生效时机', '需新建会话后 load_mcp 才会看到变化'));
+      return wrap;
+    }
+
+    wrap.appendChild(preBlock(JSON.stringify(args, null, 2)));
+    return wrap;
+  }
+
+  function renderConfirmBody(req) {
+    if (req.toolName === 'run_command' && req.args && req.args.command) {
+      return preBlock(String(req.args.command));
+    }
+    if (req.toolName === 'manage_agent_config') {
+      return renderManageConfigConfirm(req);
+    }
+    return preBlock(JSON.stringify(req.args, null, 2));
+  }
+
   window.AgentConfirm = {
     ask(req) {
       return new Promise(resolve => {
@@ -615,9 +801,8 @@
         const body = $('confirm-body');
         $('confirm-title').textContent = `确认执行 ${req.toolName}`;
 
-        body.textContent = req.toolName === 'run_command' && req.args && req.args.command
-          ? String(req.args.command)
-          : JSON.stringify(req.args, null, 2);
+        body.textContent = '';
+        body.appendChild(renderConfirmBody(req));
 
         mask.hidden = false;
         $('btn-deny').focus();
@@ -672,12 +857,33 @@
   // ---------- 配置抽屉 ----------
   const drawer = $('drawer');
   const mask = $('drawer-mask');
-  const openCfg = () => { drawer.hidden = false; mask.hidden = false; };
+  const cfgError = $('cfg-error');
+
+  function showCfgError(message) {
+    if (!cfgError) return;
+    cfgError.textContent = message;
+    cfgError.hidden = false;
+  }
+
+  function clearCfgError() {
+    if (!cfgError) return;
+    cfgError.textContent = '';
+    cfgError.hidden = true;
+  }
+
+  const openCfg = () => {
+    clearCfgError();
+    drawer.hidden = false;
+    mask.hidden = false;
+    void refreshConfigLists();
+  };
   const closeCfg = () => { drawer.hidden = true; mask.hidden = true; };
 
   $('btn-config').addEventListener('click', openCfg);
   $('btn-close-config').addEventListener('click', closeCfg);
   mask.addEventListener('click', closeCfg);
+  drawer.addEventListener('input', clearCfgError);
+  drawer.addEventListener('change', clearCfgError);
 
   // shell 的实际生效是三个条件的合成(shell.enabled && workspace && allowDangerousTools)。
   // 界面上是三个开关,所以必须把「你开了但没生效」说出来 —— 否则用户只会觉得开关坏了
@@ -719,10 +925,492 @@
     await window.AgentBridge?.openUserDataDir?.();
   });
 
-  function applyWorkspace(p) {
+  const secretList = $('secret-list');
+  const mcpList = $('mcp-list');
+  let secretRows = [];
+  let deletedSecrets = new Set();
+  let mcpRows = [];
+
+  function normalizeSecretUiName(name) {
+    return String(name || '').trim().toUpperCase();
+  }
+
+  function availableSecretNames() {
+    const byName = new Map();
+    for (const row of secretRows) {
+      const name = normalizeSecretUiName(row.name);
+      if (!name) continue;
+      const prev = byName.get(name);
+      byName.set(name, {
+        name,
+        description: row.description || prev?.description || '',
+        hasValue: !!(prev?.hasValue || row.hasValue || row.value),
+      });
+    }
+    return Array.from(byName.values())
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  function secretRow(name = '', existing = false, description = '', hasValue = false) {
+    return {
+      id: `s${Date.now()}${Math.random().toString(36).slice(2)}`,
+      name,
+      value: '',
+      description,
+      existing,
+      hasValue,
+    };
+  }
+
+  function configStatus(text, tone = 'muted', title = '') {
+    const el = document.createElement('span');
+    el.className = `config-status ${tone}`;
+    el.textContent = text;
+    if (title) el.title = title;
+    return el;
+  }
+
+  function setConfigStatus(el, status) {
+    el.className = `config-status ${status.tone || 'muted'}`;
+    el.textContent = status.text;
+    el.title = status.title || '';
+  }
+
+  function secretValueStatus(row) {
+    return row.value || row.hasValue
+      ? { text: '已填写', tone: 'ok', title: 'Secret value 已保存或本次已填写,具体值不会显示' }
+      : { text: '未填写', tone: 'warn', title: '需要填写 value 后,绑定它的 MCP 才能通过 Bearer 认证' };
+  }
+
+  function mcpAuthStatus(row) {
+    const name = normalizeSecretUiName(row.bearerSecret);
+    if (!name) return { text: '不使用认证', tone: 'muted' };
+    const secret = availableSecretNames().find(item => item.name === name);
+    if (!secret) return { text: 'Secret 不存在', tone: 'err' };
+    if (!secret.hasValue) return { text: 'Secret 未填写', tone: 'warn' };
+    return { text: '认证已配置', tone: 'ok' };
+  }
+
+  function mcpRow(data = {}) {
+    return {
+      id: `m${Date.now()}${Math.random().toString(36).slice(2)}`,
+      enabled: data.enabled !== false,
+      serverId: data.id || '',
+      name: data.name || data.id || '',
+      description: data.description || '',
+      url: data.url || '',
+      bearerSecret: data.bearerSecret || '',
+      testing: false,
+      describing: false,
+      testResult: null,
+    };
+  }
+
+  function suggestedSecretNameForMcp(row) {
+    const base = String(row.serverId || row.name || 'MCP')
+      .trim()
+      .replace(/[^A-Za-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .toUpperCase()
+      .slice(0, 52);
+    return `${base || 'MCP'}_TOKEN`;
+  }
+
+  function ensureSecretSlotForMcp(row) {
+    const secretName = suggestedSecretNameForMcp(row);
+    const existing = secretRows.find(s => normalizeSecretUiName(s.name) === secretName);
+    if (!existing) {
+      const label = row.name || row.serverId || 'MCP';
+      secretRows.push(secretRow(secretName, false, `${label} Bearer token`, false));
+    }
+    deletedSecrets.delete(secretName);
+    row.bearerSecret = secretName;
+    renderSecrets();
+    renderMcpServers();
+    $('restart-hint').hidden = false;
+  }
+
+  function renderSecrets() {
+    if (!secretList) return;
+    secretList.textContent = '';
+    for (const row of secretRows) {
+      const wrap = document.createElement('div');
+      wrap.className = 'config-row';
+
+      const head = document.createElement('div');
+      head.className = 'config-row-head';
+
+      const name = document.createElement('input');
+      name.type = 'text';
+      name.placeholder = 'SECRET_NAME';
+      name.value = row.name;
+      name.readOnly = row.existing;
+      name.addEventListener('input', () => {
+        row.name = normalizeSecretUiName(name.value);
+        name.value = row.name;
+        renderMcpServers();
+        $('restart-hint').hidden = false;
+      });
+
+      const del = document.createElement('button');
+      del.className = 'btn danger';
+      del.textContent = '删除';
+      del.addEventListener('click', () => {
+        if (row.existing && row.name) deletedSecrets.add(row.name);
+        secretRows = secretRows.filter(s => s.id !== row.id);
+        renderSecrets();
+        renderMcpServers();
+        $('restart-hint').hidden = false;
+      });
+
+      const status = configStatus('', 'muted');
+      setConfigStatus(status, secretValueStatus(row));
+
+      head.append(name, status, del);
+
+      const description = document.createElement('input');
+      description.type = 'text';
+      description.placeholder = '用途说明,例如: 瑞幸 MCP access token';
+      description.maxLength = 200;
+      description.value = row.description || '';
+      description.addEventListener('input', () => {
+        row.description = description.value;
+        $('restart-hint').hidden = false;
+      });
+
+      const value = document.createElement('input');
+      value.type = 'password';
+      value.placeholder = row.existing ? '(留空则沿用旧值)' : 'value';
+      value.addEventListener('input', () => {
+        row.value = value.value;
+        setConfigStatus(status, secretValueStatus(row));
+        renderMcpServers();
+        $('restart-hint').hidden = false;
+      });
+
+      wrap.append(head, description, value);
+      secretList.appendChild(wrap);
+    }
+  }
+
+  function renderMcpServers() {
+    if (!mcpList) return;
+    mcpList.textContent = '';
+    for (const row of mcpRows) {
+      const wrap = document.createElement('div');
+      wrap.className = 'config-row';
+
+      const head = document.createElement('div');
+      head.className = 'config-row-head';
+
+      const enabled = document.createElement('input');
+      enabled.type = 'checkbox';
+      enabled.checked = row.enabled;
+      enabled.addEventListener('change', () => {
+        row.enabled = enabled.checked;
+        $('restart-hint').hidden = false;
+      });
+
+      const id = document.createElement('input');
+      id.type = 'text';
+      id.placeholder = 'server_id';
+      id.value = row.serverId;
+      id.addEventListener('input', () => {
+        row.serverId = id.value;
+        if (!row.name) name.value = id.value;
+        $('restart-hint').hidden = false;
+      });
+
+      const del = document.createElement('button');
+      del.className = 'btn danger';
+      del.textContent = '删除';
+      del.addEventListener('click', () => {
+        mcpRows = mcpRows.filter(s => s.id !== row.id);
+        renderMcpServers();
+        $('restart-hint').hidden = false;
+      });
+
+      const test = document.createElement('button');
+      test.className = 'btn';
+      test.textContent = row.testing ? '测试中…' : '测试';
+      test.disabled = row.testing || row.describing;
+      test.addEventListener('click', async () => {
+        await testMcpRow(row);
+      });
+
+      const describe = document.createElement('button');
+      describe.className = 'btn';
+      describe.textContent = row.describing ? '生成中…' : '生成说明';
+      describe.disabled = row.testing || row.describing;
+      describe.addEventListener('click', async () => {
+        await describeMcpRow(row);
+      });
+
+      head.append(enabled, id, test, describe, del);
+
+      const grid = document.createElement('div');
+      grid.className = 'config-grid';
+
+      const nameLabel = document.createElement('label');
+      nameLabel.textContent = '名称';
+      const name = document.createElement('input');
+      name.type = 'text';
+      name.placeholder = '显示名称';
+      name.value = row.name;
+      name.addEventListener('input', () => {
+        row.name = name.value;
+        $('restart-hint').hidden = false;
+      });
+      nameLabel.appendChild(name);
+
+      const descriptionLabel = document.createElement('label');
+      descriptionLabel.textContent = '用途说明';
+      const description = document.createElement('input');
+      description.type = 'text';
+      description.placeholder = '例如: 瑞幸点单、门店、菜单相关 MCP';
+      description.maxLength = 240;
+      description.value = row.description || '';
+      description.addEventListener('input', () => {
+        row.description = description.value;
+        $('restart-hint').hidden = false;
+      });
+      descriptionLabel.appendChild(description);
+
+      const urlLabel = document.createElement('label');
+      urlLabel.textContent = 'URL';
+      const url = document.createElement('input');
+      url.type = 'text';
+      url.placeholder = 'https://example.com/mcp';
+      url.value = row.url;
+      url.addEventListener('input', () => {
+        row.url = url.value;
+        $('restart-hint').hidden = false;
+      });
+      urlLabel.appendChild(url);
+
+      const secretLabel = document.createElement('label');
+      secretLabel.textContent = 'Bearer Secret';
+      const secretLine = document.createElement('div');
+      secretLine.className = 'config-inline';
+      const secret = document.createElement('select');
+      const none = document.createElement('option');
+      none.value = '';
+      none.textContent = '不使用';
+      secret.appendChild(none);
+      const secrets = availableSecretNames();
+      for (const item of secrets) {
+        const option = document.createElement('option');
+        option.value = item.name;
+        option.textContent = item.description ? `${item.name} - ${item.description}` : item.name;
+        secret.appendChild(option);
+      }
+      if (row.bearerSecret && !secrets.some(item => item.name === row.bearerSecret)) {
+        const missing = document.createElement('option');
+        missing.value = row.bearerSecret;
+        missing.textContent = `${row.bearerSecret} (Secret 不存在)`;
+        secret.appendChild(missing);
+      }
+      secret.value = row.bearerSecret || '';
+      secret.addEventListener('change', () => {
+        row.bearerSecret = secret.value;
+        $('restart-hint').hidden = false;
+        renderMcpServers();
+      });
+
+      const newSlot = document.createElement('button');
+      newSlot.type = 'button';
+      newSlot.className = 'btn';
+      newSlot.textContent = '新建槽位';
+      newSlot.title = '按当前 server id 创建一个 Secret 空槽并绑定';
+      newSlot.addEventListener('click', () => ensureSecretSlotForMcp(row));
+
+      secretLine.append(secret, newSlot);
+      secretLabel.appendChild(secretLine);
+
+      const auth = mcpAuthStatus(row);
+      secretLabel.appendChild(configStatus(auth.text, auth.tone, auth.title));
+
+      grid.append(nameLabel, descriptionLabel, urlLabel, secretLabel);
+      wrap.append(head, grid);
+
+      if (row.testResult) {
+        wrap.appendChild(renderMcpTestResult(row.testResult));
+      }
+      mcpList.appendChild(wrap);
+    }
+  }
+
+  function mcpServerPatch(row) {
+    return {
+      id: row.serverId.trim(),
+      name: row.name.trim() || row.serverId.trim(),
+      description: row.description.trim() || undefined,
+      url: row.url.trim(),
+      enabled: true,
+      bearerSecret: row.bearerSecret.trim() || undefined,
+    };
+  }
+
+  async function testMcpRow(row) {
+    row.testing = true;
+    row.testResult = { ok: true, message: '正在测试连接并读取工具列表…' };
+    renderMcpServers();
+
+    try {
+      const result = await window.AgentConfigApi?.testMcp?.({
+        server: mcpServerPatch(row),
+        secrets: collectSecretPatches(),
+      });
+      row.testResult = result || { ok: false, error: '当前环境不支持 MCP 测试' };
+    } catch (e) {
+      row.testResult = {
+        ok: false,
+        error: e && e.message ? e.message : String(e),
+      };
+    } finally {
+      row.testing = false;
+      renderMcpServers();
+    }
+  }
+
+  async function describeMcpRow(row) {
+    row.describing = true;
+    row.testResult = { ok: true, message: '正在读取工具列表并生成用途说明…' };
+    renderMcpServers();
+
+    try {
+      const result = await window.AgentConfigApi?.describeMcp?.({
+        server: mcpServerPatch(row),
+        secrets: collectSecretPatches(),
+      });
+      if (!result || result.ok === false) {
+        row.testResult = {
+          ok: false,
+          title: '生成失败',
+          error: result?.error || '当前环境不支持 MCP 说明生成',
+        };
+      } else {
+        row.description = result.description || row.description;
+        row.testResult = { ok: true, message: '说明已生成,请检查后保存。' };
+        $('restart-hint').hidden = false;
+      }
+    } catch (e) {
+      row.testResult = {
+        ok: false,
+        error: e && e.message ? e.message : String(e),
+      };
+    } finally {
+      row.describing = false;
+      renderMcpServers();
+    }
+  }
+
+  function renderMcpTestResult(result) {
+    const box = document.createElement('div');
+    box.className = 'config-test' + (result.ok ? '' : ' error');
+
+    if (!result.ok) {
+      box.textContent = `${result.title || '测试失败'}: ${result.error || '未知错误'}`;
+      return box;
+    }
+
+    if (result.message) {
+      box.textContent = result.message;
+      return box;
+    }
+
+    const title = document.createElement('div');
+    title.textContent = `连接成功,发现 ${result.toolCount || 0} 个工具` +
+      (result.truncated ? '（仅显示前 50 个）' : '');
+    box.appendChild(title);
+
+    const tools = Array.isArray(result.tools) ? result.tools : [];
+    if (tools.length > 0) {
+      const list = document.createElement('div');
+      list.className = 'config-test-tools';
+      for (const tool of tools) {
+        const item = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = tool.description
+          ? `${tool.name} - ${tool.description}`
+          : tool.name;
+        item.appendChild(summary);
+
+        const schema = document.createElement('pre');
+        schema.textContent = JSON.stringify(tool.inputSchema || {}, null, 2);
+        item.appendChild(schema);
+        list.appendChild(item);
+      }
+      box.appendChild(list);
+    }
+
+    return box;
+  }
+
+  async function refreshConfigLists() {
+    const api = window.AgentConfigApi;
+    if (!api?.get) return;
+    try {
+      const cfg = await api.get();
+      applySecrets(cfg?.secrets || []);
+      applyMcpServers(cfg?.mcpServers || []);
+    } catch (e) {
+      showCfgError(`读取配置失败: ${e && e.message ? e.message : String(e)}`);
+    }
+  }
+
+  $('btn-add-secret')?.addEventListener('click', () => {
+    secretRows.push(secretRow());
+    renderSecrets();
+    renderMcpServers();
+    $('restart-hint').hidden = false;
+  });
+
+  $('btn-add-mcp')?.addEventListener('click', () => {
+    mcpRows.push(mcpRow());
+    renderMcpServers();
+    $('restart-hint').hidden = false;
+  });
+
+  function collectSecretPatches() {
+    const patches = [];
+    for (const name of deletedSecrets) patches.push({ name, delete: true });
+    for (const row of secretRows) {
+      const name = row.name.trim();
+      if (!name) continue;
+      if (row.value || !row.existing || row.description !== undefined) {
+        patches.push({
+          name,
+          value: row.value,
+          description: row.description || '',
+        });
+      }
+    }
+    return patches;
+  }
+
+  function collectMcpServers() {
+    return mcpRows
+      .map(row => ({ ...mcpServerPatch(row), enabled: !!row.enabled }))
+      .filter(row => row.id || row.url);
+  }
+
+  function applySecrets(list) {
+    deletedSecrets = new Set();
+    secretRows = (list || []).map(s => secretRow(s.name || '', true, s.description || '', !!s.hasValue));
+    renderSecrets();
+    renderMcpServers();
+  }
+
+  function applyMcpServers(list) {
+    mcpRows = (list || []).map(mcpRow);
+    renderMcpServers();
+  }
+
+  function applyWorkspace(p, markDirty = true) {
     els.wsLabel.textContent = p || '未选择工作区';
     $('ws-warn').hidden = !!p;
-    $('restart-hint').hidden = false;
+    if (markDirty) $('restart-hint').hidden = false;
   }
 
   /**
@@ -757,24 +1445,32 @@
       maxTokens: numOrNull('cfg-maxtokens'),
       maxSteps: numOrNull('cfg-maxsteps'),
       enableThinking: $('cfg-thinking').checked,
+      secrets: collectSecretPatches(),
+      mcpServers: collectMcpServers(),
     };
 
-    // 保存要重建会话(检依赖、起工具桥)。禁用按钮不只是为了好看:
-    // 重复点会并发触发多次装配 —— 那正是「两个 chromium 抢同一个 profile」
-    // 那个 bug 的触发条件
+    // 保存可能触发热刷新,也可能重建会话。禁用按钮不只是为了好看:
+    // 重复点会并发写配置;若其中一次需要重建,就可能撞上「两个 chromium
+    // 抢同一个 profile」那个 bug 的触发条件。
     const btn = $('btn-save');
     btn.disabled = true;
 
     try {
-      await window.AgentConfigApi?.save(patch);
+      const r = await window.AgentConfigApi?.save(patch);
+      for (const row of secretRows) {
+        if (row.value) row.hasValue = true;
+        row.value = '';
+        row.existing = true;
+      }
+      renderSecrets();
       $('cfg-key').value = '';    // 明文不留在 DOM 里
       closeCfg();
-      // 结果留在消息流里,不做按钮上的临时文字:重建现在很快
-      // (浏览器已提到进程级、不再重启 chromium),按钮上那行字一闪而过看不见
-      streamNote('配置已更新,会话已重建。');
+      toast(r?.hotReloaded
+        ? '配置已更新,MCP/Secret 已热刷新。'
+        : '配置已更新,会话已重建。');
     } catch (e) {
       // 失败必须说出来:静默的话用户以为存上了,而实际跑的还是旧配置
-      streamNote(`配置保存失败: ${e && e.message ? e.message : String(e)}`, true);
+      showCfgError(`保存失败: ${e && e.message ? e.message : String(e)}`);
     } finally {
       btn.disabled = false;
     }
@@ -835,9 +1531,30 @@
     return p;
   }
 
+  function setSkillManualHint(text, isError = false) {
+    const el = $('skill-manual-hint');
+    if (!el) return;
+    el.textContent = text || '';
+    el.hidden = !text;
+    el.classList.toggle('error', !!isError);
+  }
+
+  function enabledSkillCount() {
+    return skillCache.filter(s => !s.pending && s.enabled !== false).length;
+  }
+
+  function warnSkillLimit() {
+    const msg = `最多只能启用 ${MAX_ENABLED_SKILLS} 个技能。请先停用一个已启用技能。`;
+    setSkillManualHint(msg, true);
+    toast(msg, true);
+  }
+
   function renderSkillCard(s) {
     const card = document.createElement('div');
-    card.className = 'skill-card' + (s.pending ? ' pending' : '');
+    const approved = !s.pending;
+    card.className = 'skill-card'
+      + (s.pending ? ' pending' : '')
+      + (!s.pending && s.enabled === false ? ' disabled' : '');
 
     const name = document.createElement('div');
     name.className = 'skill-name';
@@ -849,16 +1566,28 @@
     // 于是看到相似的两条只能猜、然后干脆都不批(实测就是这样:
     // 用户以为只有新建机制,把一条更新当成了重复条目)。
     //
-    // createdAt !== updatedAt 即更新:新条目这两个值由 mergeSkillExtraction
-    // 用同一个 now 写入,而更新分支只动 updatedAt、保留原本的 createdAt
-    const isUpdate = s.createdAt !== s.updatedAt;
-    const tag = document.createElement('span');
-    tag.className = 'skill-tag ' + (isUpdate ? 'upd' : 'new');
-    tag.textContent = isUpdate ? '更新' : '新增';
-    tag.title = isUpdate
-      ? '在已有轨迹上改写,原条目的取用次数已保留'
-      : '这是一条新轨迹';
-    name.appendChild(tag);
+    // pendingChange 是真正的标签来源。createdAt/updatedAt 只能说明内容何时变过,
+    // 审批后不该继续显示「新增/更新」,否则用户会以为还有未处理变更。
+    const pendingChange = s.pending
+      ? (s.pendingChange || (s.createdAt !== s.updatedAt ? 'updated' : 'added'))
+      : null;
+    const isUpdate = pendingChange === 'updated';
+    if (s.pending) {
+      const tag = document.createElement('span');
+      tag.className = 'skill-tag ' + (isUpdate ? 'upd' : 'new');
+      tag.textContent = isUpdate ? '更新' : '新增';
+      tag.title = isUpdate
+        ? '在已有轨迹上改写,原条目的取用次数已保留'
+        : '这是一条新轨迹';
+      name.appendChild(tag);
+    }
+    if (!s.pending && s.enabled === false) {
+      const tag = document.createElement('span');
+      tag.className = 'skill-tag off';
+      tag.textContent = '停用';
+      tag.title = '不会进入技能索引,也不能被 load_skill 加载';
+      name.appendChild(tag);
+    }
 
     card.appendChild(name);
 
@@ -866,6 +1595,10 @@
     desc.className = 'skill-desc';
     desc.textContent = s.description;
     card.appendChild(desc);
+
+    const detail = document.createElement('div');
+    detail.className = 'skill-detail';
+    if (approved) detail.hidden = true;
 
     // 步骤:goal 与 how 分层显示。
     // 混成一段的话审批时读不出「这一步要达成什么」和「当时怎么做的」——
@@ -885,7 +1618,7 @@
         }
         ol.appendChild(li);
       }
-      card.appendChild(ol);
+      detail.appendChild(ol);
     }
 
     // 坑往往比正确路径值钱,所以不折叠
@@ -897,15 +1630,17 @@
         li.textContent = p;
         ul.appendChild(li);
       }
-      card.appendChild(ul);
+      detail.appendChild(ul);
     }
 
     if (s.note) {
       const note = document.createElement('div');
       note.className = 'skill-note';
       note.textContent = s.note;
-      card.appendChild(note);
+      detail.appendChild(note);
     }
+
+    card.appendChild(detail);
 
     const meta = document.createElement('div');
     meta.className = 'skill-meta';
@@ -916,13 +1651,29 @@
     // 已启用条目的 hits 则是另一个信号:0 次且沉淀很久 = 描述没能让模型选中它,
     // 这是判断「该不该改描述」唯一的可见线索
     const parts = [];
-    if (isUpdate) parts.push(`更新于 ${fmtTime(s.updatedAt)}`);
+    if (s.pending && isUpdate) parts.push(`更新于 ${fmtTime(s.updatedAt)}`);
     parts.push(`沉淀于 ${fmtTime(s.createdAt)}`);
     if (!s.pending || isUpdate) parts.unshift(`已取用 ${s.hits} 次`);
     meta.textContent = parts.join(' · ');
     card.appendChild(meta);
 
-    if (s.pending) card.appendChild(skillActions(s.name));
+    if (s.pending) {
+      card.appendChild(skillActions(s.name));
+    } else {
+      const bottom = document.createElement('div');
+      bottom.className = 'skill-acts';
+
+      const more = document.createElement('button');
+      more.className = 'btn';
+      more.textContent = '查看完整';
+      more.addEventListener('click', () => {
+        detail.hidden = !detail.hidden;
+        more.textContent = detail.hidden ? '查看完整' : '收起';
+      });
+
+      bottom.append(more, skillToggleButton(s));
+      card.appendChild(bottom);
+    }
     return card;
   }
 
@@ -947,6 +1698,10 @@
     // 两个按钮一起禁用:approve 会重画整个列表,期间再点另一个
     // 会对着一个即将被替换掉的 DOM 节点发第二次 IPC
     const run = async (fn, verb) => {
+      if (fn === window.AgentSkills.approve && enabledSkillCount() >= MAX_ENABLED_SKILLS) {
+        warnSkillLimit();
+        return;
+      }
       ok.disabled = no.disabled = true;
       try {
         const r = await fn(name);
@@ -992,6 +1747,45 @@
     return acts;
   }
 
+  function skillToggleButton(skill) {
+    const enabled = skill.enabled !== false;
+    const btn = document.createElement('button');
+    btn.className = enabled ? 'btn' : 'btn primary';
+    btn.textContent = enabled ? '停用' : '启用';
+    btn.title = enabled
+      ? '从后续技能索引中移除,但保留落盘内容'
+      : '重新加入后续技能索引';
+
+    btn.addEventListener('click', async () => {
+      const next = !enabled;
+      if (next && enabledSkillCount() >= MAX_ENABLED_SKILLS) {
+        warnSkillLimit();
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const r = await window.AgentSkills.setEnabled(skill.name, next);
+        if (r && r.ok === false) {
+          streamNote(`技能${next ? '启用' : '停用'}失败: ${r.error}`, true);
+          return;
+        }
+        if (r && r.changed === false) {
+          streamNote(`技能「${skill.name}」状态已变,未做改动。`);
+        } else {
+          $('skill-apply-hint').hidden = false;
+        }
+        if (r && r.skills) applySkills(r.skills);
+        else await refreshSkills();
+      } catch (e) {
+        streamNote(`技能${next ? '启用' : '停用'}失败: ${e && e.message ? e.message : String(e)}`, true);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    return btn;
+  }
+
   /** 把一份列表画进抽屉并同步角标 */
   function applySkills(list) {
     skillCache = list || [];
@@ -1006,9 +1800,19 @@
     }
 
     // 待审批排在前面:那是唯一需要动作的一组
+    const enabledCount = enabledSkillCount();
+    const summary = document.createElement('div');
+    summary.className = 'skill-limit';
+    summary.textContent = `已启用 ${enabledCount}/${MAX_ENABLED_SKILLS}`;
+    if (enabledCount >= MAX_ENABLED_SKILLS) {
+      summary.textContent += '，到达上限后需先停用再启用其他技能';
+    }
+    skillBody.appendChild(summary);
+
     const groups = [
       { title: '待审批', items: skillCache.filter(s => s.pending) },
-      { title: '已启用', items: skillCache.filter(s => !s.pending) },
+      { title: '已启用', items: skillCache.filter(s => !s.pending && s.enabled !== false) },
+      { title: '已停用', items: skillCache.filter(s => !s.pending && s.enabled === false) },
     ];
 
     for (const g of groups) {
@@ -1056,6 +1860,111 @@
     applySkills(r && r.skills);
   }
 
+  async function extractSelectedTurns() {
+    if (extractingSelectedTurns || extractingMemoryTurns || busy) return;
+    const turnIds = [...selectedTurnIds].filter(id =>
+      visibleTurns.some(t => t.turn_id === id),
+    );
+    if (turnIds.length === 0) return;
+
+    if (els.turnActionPopover) els.turnActionPopover.hidden = true;
+    extractingSelectedTurns = true;
+    setSkillManualHint(`正在从 ${turnIds.length} 轮历史中沉淀技能...`);
+    syncTurnSelectionBar();
+    try {
+      const r = await window.AgentSkills?.extractFromTurns?.({
+        turnIds,
+        reason: '用户在历史界面手动选择这些轮次进行技能沉淀',
+      });
+      if (!r || r.ok === false) {
+        const msg = `技能沉淀失败: ${r?.error || '当前环境不支持手动沉淀'}`;
+        setSkillManualHint(msg, true);
+        toast(msg, true);
+        openSkills();
+        return;
+      }
+      if (r.changed === 'none') {
+        const msg = `未生成技能: ${r.reason || '模型判断没有可复用轨迹'}`;
+        setSkillManualHint(msg);
+        toast(msg);
+        openSkills();
+      } else {
+        clearTurnSelection();
+        if (r.skills) applySkills(r.skills);
+        else await refreshSkills();
+        const changeText = r.changed === 'updated' ? '更新技能草稿' : '新增技能草稿';
+        const msg = `${changeText}: ${r.name || '未命名'}。请在技能库审批。`;
+        setSkillManualHint(msg);
+        toast(msg);
+        openSkills();
+      }
+    } catch (e) {
+      const msg = `技能沉淀失败: ${e && e.message ? e.message : String(e)}`;
+      setSkillManualHint(msg, true);
+      toast(msg, true);
+      openSkills();
+    } finally {
+      extractingSelectedTurns = false;
+      syncTurnSelectionBar();
+    }
+  }
+
+  async function compressSelectedTurnsToMemory() {
+    if (extractingSelectedTurns || extractingMemoryTurns || busy) return;
+    const turnIds = [...selectedTurnIds].filter(id =>
+      visibleTurns.some(t => t.turn_id === id),
+    );
+    if (turnIds.length === 0) return;
+
+    if (els.turnActionPopover) els.turnActionPopover.hidden = true;
+    extractingMemoryTurns = true;
+    toast(`正在从 ${turnIds.length} 轮历史中压缩长期记忆...`);
+    syncTurnSelectionBar();
+    try {
+      const r = await window.AgentMemory?.extractFromTurns?.({
+        turnIds,
+        reason: '用户在历史界面手动选择这些轮次进行长期记忆压缩',
+      });
+      if (!r || r.ok === false) {
+        toast(`记忆压缩失败: ${r?.error || '当前环境不支持手动记忆压缩'}`, true);
+        return;
+      }
+
+      if (r.changed) {
+        clearTurnSelection();
+        toast(`记忆已更新: ${r.before ?? 0} → ${r.after ?? 0} 条。重启当前会话后生效。`);
+      } else {
+        toast(`未更新记忆: ${r.reason || '模型判断没有稳定的长期记忆'}`);
+      }
+    } catch (e) {
+      toast(`记忆压缩失败: ${e && e.message ? e.message : String(e)}`, true);
+    } finally {
+      extractingMemoryTurns = false;
+      syncTurnSelectionBar();
+    }
+  }
+
+  els.turnActions?.addEventListener('click', e => {
+    e.stopPropagation();
+    if (els.turnActions.disabled || !els.turnActionPopover) return;
+    els.turnActionPopover.hidden = !els.turnActionPopover.hidden;
+  });
+
+  els.extractSkill?.addEventListener('click', () => {
+    void extractSelectedTurns();
+  });
+  els.compressMemory?.addEventListener('click', () => {
+    void compressSelectedTurnsToMemory();
+  });
+  els.clearTurnSelection?.addEventListener('click', () => {
+    clearTurnSelection();
+  });
+  document.addEventListener('click', e => {
+    if (!els.turnActionPopover || els.turnActionPopover.hidden) return;
+    if (els.turnSelectBar?.contains(e.target)) return;
+    els.turnActionPopover.hidden = true;
+  });
+
   // ---------- 历史侧边栏 ----------
   let activeSessionId = null;
 
@@ -1063,6 +1972,8 @@
   function clearStream() {
     els.stream.textContent = '';
     bottomSentinel = null;
+    visibleTurns = [];
+    selectedTurnIds = new Set();
     const hint = document.createElement('div');
     hint.className = 'empty';
     hint.textContent = '描述你要做的事,agent 会自己决定用什么工具。';
@@ -1071,13 +1982,19 @@
     // 而 scroll 事件在内容缩短时不保证触发 —— 漏掉就是空会话上挂着一个
     // 点了没反应的「回到底部」
     syncToBottomBtn();
+    syncTurnSelectionBar();
   }
 
   /** 把一份历史画进对话区 */
   function showHistory(sessionId, turns) {
+    const previousSessionId = activeSessionId;
     activeSessionId = sessionId;
     els.stream.textContent = '';
     bottomSentinel = null;
+    visibleTurns = turns || [];
+    selectedTurnIds = previousSessionId === sessionId
+      ? new Set([...selectedTurnIds].filter(id => visibleTurns.some(t => t.turn_id === id)))
+      : new Set();
     if (!turns || turns.length === 0) {
       clearStream();
     } else {
@@ -1085,6 +2002,7 @@
       // 打开历史落在最新一轮:那是用户要接着聊的地方,而不是几十轮之前
       scrollToBottom();
     }
+    syncTurnSelectionBar();
     markActive();
   }
 
@@ -1157,11 +2075,33 @@
     await refreshSidebar();
   });
 
+  els.restartSession?.addEventListener('click', async () => {
+    if (busy || els.restartSession.disabled) return;
+    const api = window.AgentRuntime;
+    if (!api?.restart) {
+      toast('当前环境不支持重启会话', true);
+      return;
+    }
+
+    els.restartSession.disabled = true;
+    els.restartSession.classList.add('spinning');
+    toast('正在重启当前会话...');
+    try {
+      await api.restart();
+      toast('当前会话已重启。');
+    } catch (e) {
+      toast(`重启失败: ${e && e.message ? e.message : String(e)}`, true);
+    } finally {
+      els.restartSession.classList.remove('spinning');
+      els.restartSession.disabled = busy;
+    }
+  });
+
   // ---------- 启动 ----------
   window.AgentApp = {
     /** 由 transport 在拿到会话信息后调用,填充界面 */
     hydrate(info) {
-      applyWorkspace(info.workspace || '');
+      applyWorkspace(info.workspace || '', false);
       $('restart-hint').hidden = true;
       $('cfg-baseurl').value = info.baseURL || '';
       $('cfg-model').value = info.model || '';
@@ -1189,6 +2129,8 @@
       $('cfg-maxsteps').value = info.maxSteps != null ? info.maxSteps : '';
       $('cfg-thinking').checked = info.enableThinking !== false;   // 默认开
 
+      applySecrets(info.secrets || []);
+      applyMcpServers(info.mcpServers || []);
       syncShellHint();
     },
 
