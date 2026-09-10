@@ -835,10 +835,12 @@
       return;
     }
     if (type === 'agent:confirm') {
+      markConfirmWaiting(payload?.reqId, payload?.req);
       void showConfirm(payload?.reqId, payload?.req);
       return;
     }
     if (type === 'agent:confirm-resolved') {
+      markConfirmResolved(payload?.reqId, payload);
       closeConfirmIfCurrent(payload?.reqId);
       return;
     }
@@ -900,6 +902,33 @@
     } else if (event.type === 'error') {
       appendTo(state.currentAssistant, 'div', 'msg error', event.message || '执行失败');
     }
+    scrollToBottom();
+  }
+
+  function markConfirmWaiting(reqId, req) {
+    if (!state.currentAssistant || !reqId) return;
+    const tag = document.createElement('div');
+    tag.className = 'tool running confirm-waiting';
+    tag.dataset.confirmReqId = String(reqId);
+    appendTo(tag, 'span', 'dot', '●');
+    appendTo(tag, 'span', 'name', req?.toolName || 'confirm');
+    appendTo(tag, 'span', 'sum', '等待确认...');
+    state.currentAssistant.appendChild(tag);
+    scrollToBottom();
+  }
+
+  function markConfirmResolved(reqId, payload) {
+    if (!state.currentAssistant || !reqId) return;
+    const tag = state.currentAssistant.querySelector(
+      `.confirm-waiting[data-confirm-req-id="${String(reqId)}"]`,
+    );
+    if (!tag) return;
+    const allowed = payload?.ok === true;
+    tag.className = `tool ${allowed ? 'ok' : 'fail'} confirm-waiting`;
+    const dot = tag.querySelector('.dot');
+    const sum = tag.querySelector('.sum');
+    if (dot) dot.textContent = allowed ? '✓' : '✕';
+    if (sum) sum.textContent = allowed ? '已确认' : '已拒绝/超时';
     scrollToBottom();
   }
 

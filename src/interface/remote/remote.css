@@ -103,7 +103,7 @@ button:disabled { opacity: .55; }
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #191c21;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 .msg.user { margin-left: 24px; background: #202834; white-space: pre-wrap; }
 .msg.assistant { margin-right: 24px; }
@@ -122,12 +122,17 @@ button:disabled { opacity: .55; }
   background: #15181d;
   color: var(--dim);
   font-size: 12px;
+  min-width: 0;
 }
 .tool .name {
   color: var(--accent);
   font-family: ui-monospace, Consolas, monospace;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
 }
 .tool .sum {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -454,7 +459,8 @@ button:disabled { opacity: .55; }
 }
 .confirm-draft-row .v {
   min-width: 0;
-  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
   color: var(--fg);
 }
 .modal-actions {
@@ -472,5 +478,20 @@ button:disabled { opacity: .55; }
 @media (min-width: 640px) {
   .field-grid {
     grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 420px) {
+  .confirm-draft-row {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
+
+  .tool {
+    align-items: flex-start;
+  }
+
+  .tool .sum {
+    white-space: normal;
   }
 }
