@@ -76,6 +76,17 @@
     </section>
   </main>
 
+  <div id="confirm-mask" class="modal-mask" hidden>
+    <div class="modal">
+      <h2 id="confirm-title">需要确认</h2>
+      <div id="confirm-body" class="confirm-body"></div>
+      <div class="modal-actions">
+        <button id="btn-deny" class="ghost" type="button">拒绝</button>
+        <button id="btn-allow" class="primary danger-fill" type="button">允许执行</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast" hidden></div>
   <script src="../app/md.js"></script>
   <script src="remote.js"></script>

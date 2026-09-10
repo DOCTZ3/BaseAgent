@@ -275,6 +275,9 @@ function createRemoteHub(options) {
       return appApi.runAgent(runId, body.input || '', { notifySessionChanged: true });
     }
     if (req.method === 'POST' && pathname === '/api/agent/abort') return appApi.abortAgent();
+    if (req.method === 'POST' && pathname === '/api/confirm/reply') {
+      return appApi.confirmReply(body.reqId, body.ok);
+    }
     if (req.method === 'POST' && pathname === '/api/agent/restart') return appApi.restartSession();
     if (req.method === 'POST' && pathname === '/api/config/save') return appApi.configSave(body.patch || {});
     if (req.method === 'POST' && pathname === '/api/config/test-mcp') return appApi.configTestMcp(body);

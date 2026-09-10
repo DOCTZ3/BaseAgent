@@ -14,6 +14,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body {
   margin: 0;
   min-height: 100vh;
@@ -110,7 +111,35 @@ button:disabled { opacity: .55; }
 .msg.error { border-color: #63333a; color: var(--err); white-space: pre-wrap; }
 .answer:not(.md) { white-space: pre-wrap; }
 .reasoning { color: var(--faint); font-size: 12px; }
-.tool { color: var(--warn); font-size: 12px; margin-top: 6px; }
+.tool {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #15181d;
+  color: var(--dim);
+  font-size: 12px;
+}
+.tool .name {
+  color: var(--accent);
+  font-family: ui-monospace, Consolas, monospace;
+}
+.tool .sum {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool.running .dot { color: var(--warn); }
+.tool.ok .dot { color: var(--ok); }
+.tool.fail {
+  border-color: #63333a;
+  color: var(--err);
+}
+.tool.fail .dot { color: var(--err); }
 
 .md {
   white-space: normal;
@@ -371,6 +400,73 @@ button:disabled { opacity: .55; }
 .toast.error {
   border-color: #63333a;
   color: var(--err);
+}
+
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, .58);
+}
+.modal {
+  width: min(560px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 14px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .42);
+}
+.confirm-body {
+  max-height: min(56vh, 420px);
+  overflow: auto;
+  color: var(--dim);
+}
+.verbatim {
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #101216;
+  color: var(--fg);
+  overflow-x: auto;
+  white-space: pre;
+}
+.confirm-draft {
+  display: grid;
+  gap: 8px;
+}
+.confirm-draft-title {
+  color: var(--fg);
+  font-weight: 700;
+}
+.confirm-draft-row {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.confirm-draft-row .k {
+  color: var(--faint);
+}
+.confirm-draft-row .v {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.danger-fill {
+  background: #5c2b2b;
+  color: var(--fg);
+  border-color: #704040;
 }
 
 @media (min-width: 640px) {

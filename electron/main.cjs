@@ -41,6 +41,7 @@ let relayClient = null;
 // 确认往返:reqId → resolve。主进程问、页面答
 const pendingConfirms = new Map();
 let confirmSeq = 0;
+const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * 加载 agent 的 ESM 代码
@@ -279,14 +280,7 @@ async function createSession(resumeSessionId) {
     browserManager: browser,
     // 传了就续接那个会话(沿用同一个 sessionId 并灌回历史轮次)
     resumeSessionId,
-    onConfirm: req =>
-      new Promise(resolve => {
-        // 窗口没了就拒绝:无人看守时放行等于开了任意命令执行
-        if (!win || win.isDestroyed()) return resolve(false);
-        const reqId = ++confirmSeq;
-        pendingConfirms.set(reqId, resolve);
-        win.webContents.send('agent:confirm', reqId, req);
-      }),
+    onConfirm: requestUserConfirm,
     // 技能沉淀完了通知渲染层刷角标。窗口没了就静默丢弃 ——
     // 库已经落盘,下次开窗口拉列表时自然带出来
     onSkillsChanged: () => {
@@ -359,6 +353,45 @@ function sendMemoryChanged() {
   relayClient?.publish('agent:memory-changed', {});
 }
 
+function requestUserConfirm(req) {
+  return new Promise(resolve => {
+    const reqId = ++confirmSeq;
+    const timer = setTimeout(() => {
+      const record = pendingConfirms.get(reqId);
+      if (!record) return;
+      pendingConfirms.delete(reqId);
+      record.resolve(false);
+      sendConfirmResolved(reqId, false, 'timeout');
+    }, CONFIRM_TIMEOUT_MS);
+    timer.unref?.();
+
+    pendingConfirms.set(reqId, { resolve, timer });
+    if (win && !win.isDestroyed()) win.webContents.send('agent:confirm', reqId, req);
+    remoteHub?.publish('agent:confirm', { reqId, req });
+    relayClient?.publish('agent:confirm', { reqId, req });
+  });
+}
+
+function submitConfirmReply(reqId, ok) {
+  const id = Number(reqId);
+  const record = pendingConfirms.get(id);
+  if (!record) return { ok: false, error: '确认请求已结束或不存在' };
+
+  pendingConfirms.delete(id);
+  clearTimeout(record.timer);
+  const allowed = ok === true;
+  record.resolve(allowed);
+  sendConfirmResolved(id, allowed, 'answered');
+  return { ok: true };
+}
+
+function sendConfirmResolved(reqId, ok, reason) {
+  const payload = { reqId, ok, reason };
+  if (win && !win.isDestroyed()) win.webContents.send('agent:confirm-resolved', reqId, payload);
+  remoteHub?.publish('agent:confirm-resolved', payload);
+  relayClient?.publish('agent:confirm-resolved', payload);
+}
+
 async function restartSession() {
   if (sessionPromise) {
     // 装配中途点了保存。等它落地再关,不然会漏掉一个 chromium
@@ -406,6 +439,7 @@ const appApi = createAppApi({
   sendSkillsChanged,
   sendConfigChanged,
   sendMemoryChanged,
+  confirmReply: submitConfirmReply,
 });
 
 async function startRemoteHub() {
@@ -479,11 +513,7 @@ ipcMain.handle('window:close', () => { win?.close(); });
 ipcMain.handle('window:is-maximized', () => !!win?.isMaximized());
 
 ipcMain.on('agent:confirm-reply', (_e, reqId, ok) => {
-  const resolve = pendingConfirms.get(reqId);
-  if (resolve) {
-    pendingConfirms.delete(reqId);
-    resolve(!!ok);
-  }
+  submitConfirmReply(reqId, !!ok);
 });
 
 // ---------- IPC:会话事实 ----------

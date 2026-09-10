@@ -34,6 +34,7 @@ function createAppApi(deps) {
     sendSkillsChanged,
     sendConfigChanged,
     sendMemoryChanged,
+    confirmReply,
   } = deps;
 
   return {
@@ -60,6 +61,10 @@ function createAppApi(deps) {
     abortAgent() {
       getSession()?.abort();
       return true;
+    },
+
+    confirmReply(reqId, ok) {
+      return confirmReply?.(reqId, ok === true) || { ok: false, error: '当前环境不支持确认回复' };
     },
 
     async info() {

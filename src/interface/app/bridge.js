@@ -82,7 +82,8 @@
 
   // 危险工具确认:主进程问 → 页面弹窗 → 答案回去。
   // 页面这边的实现在 app.js 的 AgentConfirm(命令原样呈现、默认焦点在拒绝)
-  bridge.onConfirm(req => window.AgentConfirm.ask(req));
+  bridge.onConfirm((req, reqId) => window.AgentConfirm.ask(req, reqId));
+  bridge.onConfirmResolved?.((reqId) => window.AgentConfirm.resolveExternal?.(reqId));
 
   // 历史会话。这一层保留包装是因为它有第二个实现的余地(mock.js 里可以给假列表),
   // 与窗口控制不同 —— 那个只有 Electron 一种实现

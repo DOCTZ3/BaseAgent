@@ -34,17 +34,26 @@ ipcRenderer.on('agent:event', (_e, runId, event) => {
 
 /** 危险工具确认:主进程发起,页面回答。往返都经这一条通道 */
 let confirmHandler = null;
+let confirmResolvedHandler = null;
 
 ipcRenderer.on('agent:confirm', async (_e, reqId, req) => {
   // 没有处理器时**必须回 false**。默认放行等于让 run_command 的
   // 那道人工边界在页面还没就绪时静默消失
   let ok = false;
   try {
-    if (confirmHandler) ok = await confirmHandler(req);
+    if (confirmHandler) ok = await confirmHandler(req, reqId);
   } catch {
     ok = false;
   }
   ipcRenderer.send('agent:confirm-reply', reqId, ok);
+});
+
+ipcRenderer.on('agent:confirm-resolved', (_e, reqId, payload) => {
+  try {
+    confirmResolvedHandler?.(reqId, payload);
+  } catch {
+    // 展示层同步失败不影响主进程已经完成的确认结果
+  }
 });
 
 contextBridge.exposeInMainWorld('AgentBridge', {
@@ -75,6 +84,7 @@ contextBridge.exposeInMainWorld('AgentBridge', {
 
   /** 注册确认处理器 */
   onConfirm(handler) { confirmHandler = handler; },
+  onConfirmResolved(handler) { confirmResolvedHandler = handler; },
 
   /**
    * 窗口控制 —— 顶栏是自绘的,系统按钮不存在,只能由页面请求

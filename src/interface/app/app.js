@@ -784,9 +784,32 @@
     return wrap;
   }
 
+  function renderMcpCallConfirm(req) {
+    const args = req.args || {};
+    const wrap = document.createElement('div');
+    wrap.className = 'confirm-draft';
+    wrap.appendChild(confirmDraftTitle('调用 MCP 工具'));
+    if (req.reason) wrap.appendChild(confirmDraftRow('原因', req.reason));
+    wrap.appendChild(confirmDraftRow('Server ID', args.server_id || inferMcpServerFromTool(req.toolName)));
+    wrap.appendChild(confirmDraftRow('工具名', args.tool_name || req.toolName));
+    wrap.appendChild(confirmDraftRow('调用参数', JSON.stringify(args.arguments ?? args, null, 2)));
+    wrap.appendChild(confirmDraftRow('影响', '会由电脑端向已配置的 MCP Server 发起一次真实工具调用'));
+    return wrap;
+  }
+
+  function inferMcpServerFromTool(toolName) {
+    const name = String(toolName || '');
+    if (!name.startsWith('mcp_')) return '未提供';
+    const parts = name.slice(4).split('_');
+    return parts[0] || '未提供';
+  }
+
   function renderConfirmBody(req) {
     if (req.toolName === 'run_command' && req.args && req.args.command) {
       return preBlock(String(req.args.command));
+    }
+    if (req.toolName === 'mcp_call' || String(req.toolName || '').startsWith('mcp_')) {
+      return renderMcpCallConfirm(req);
     }
     if (req.toolName === 'manage_agent_config') {
       return renderManageConfigConfirm(req);
@@ -795,10 +818,13 @@
   }
 
   window.AgentConfirm = {
-    ask(req) {
+    activeReqId: null,
+    activeFinish: null,
+    ask(req, reqId) {
       return new Promise(resolve => {
         const mask = $('confirm-mask');
         const body = $('confirm-body');
+        this.activeReqId = reqId;
         $('confirm-title').textContent = `确认执行 ${req.toolName}`;
 
         body.textContent = '';
@@ -808,16 +834,23 @@
         $('btn-deny').focus();
 
         const finish = ok => {
+          this.activeReqId = null;
+          this.activeFinish = null;
           mask.hidden = true;
           document.removeEventListener('keydown', onKey);
           resolve(ok);
         };
+        this.activeFinish = finish;
         const onKey = e => { if (e.key === 'Escape') finish(false); };
 
         $('btn-allow').onclick = () => finish(true);
         $('btn-deny').onclick = () => finish(false);
         document.addEventListener('keydown', onKey);
       });
+    },
+    resolveExternal(reqId) {
+      if (this.activeReqId !== reqId || !this.activeFinish) return;
+      this.activeFinish(false);
     },
   };
 

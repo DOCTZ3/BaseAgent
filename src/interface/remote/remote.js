@@ -12,6 +12,8 @@
     currentAnswer: null,
     currentAnswerRaw: '',
     currentReasoning: null,
+    currentTools: new Map(),
+    pendingConfirmId: null,
     busy: false,
     pendingHistoryReload: false,
     activeSessionId: null,
@@ -105,6 +107,8 @@
     state.eventAbort = null;
     state.token = '';
     state.activeSessionId = null;
+    state.pendingConfirmId = null;
+    $('confirm-mask').hidden = true;
     localStorage.removeItem('baseagent.remote.token');
     $('pair-panel').hidden = false;
     $('app-panel').hidden = true;
@@ -735,8 +739,10 @@
     state.currentRunId = `remote-ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     appendMessage('user', text);
     state.currentAssistant = appendMessage('assistant', '');
-    state.currentAnswer = appendTo(state.currentAssistant, 'div', 'answer', '');
+    state.currentAnswer = null;
     state.currentAnswerRaw = '';
+    state.currentReasoning = null;
+    state.currentTools = new Map();
     syncBusy();
     try {
       const result = await request('/api/agent/run', {
@@ -765,6 +771,7 @@
       state.currentAnswer = null;
       state.currentAnswerRaw = '';
       state.currentReasoning = null;
+      state.currentTools = new Map();
       syncBusy();
       if (state.pendingHistoryReload) {
         state.pendingHistoryReload = false;
@@ -827,6 +834,14 @@
       if (runId === state.currentRunId) applyAgentEvent(event);
       return;
     }
+    if (type === 'agent:confirm') {
+      void showConfirm(payload?.reqId, payload?.req);
+      return;
+    }
+    if (type === 'agent:confirm-resolved') {
+      closeConfirmIfCurrent(payload?.reqId);
+      return;
+    }
     if (type === 'agent:session-changed') {
       if (state.busy) state.pendingHistoryReload = true;
       else void Promise.allSettled([loadHistory(), loadHistoryList()]);
@@ -852,9 +867,36 @@
       }
       state.currentReasoning.textContent += event.text || '';
     } else if (event.type === 'tool_start') {
-      appendTo(state.currentAssistant, 'div', 'tool', `调用工具: ${event.name}`);
+      state.currentReasoning = null;
+      const tag = document.createElement('div');
+      tag.className = 'tool running';
+      appendTo(tag, 'span', 'dot', '●');
+      appendTo(tag, 'span', 'name', event.name || 'tool');
+      appendTo(tag, 'span', 'sum', '执行中...');
+      state.currentAssistant.appendChild(tag);
+      if (event.id) state.currentTools.set(event.id, tag);
     } else if (event.type === 'tool_end') {
-      appendTo(state.currentAssistant, 'div', 'tool', `${event.ok ? '完成' : '失败'}: ${event.summary || event.name}`);
+      const tag = event.id ? state.currentTools.get(event.id) : null;
+      if (tag) {
+        tag.className = `tool ${event.ok ? 'ok' : 'fail'}`;
+        const dot = tag.querySelector('.dot');
+        const sum = tag.querySelector('.sum');
+        if (dot) dot.textContent = event.ok ? '✓' : '✕';
+        if (sum) {
+          sum.textContent = event.summary || (event.ok ? '完成' : '失败');
+          sum.title = event.summary || '';
+        }
+      } else {
+        const fallback = appendTo(
+          state.currentAssistant,
+          'div',
+          `tool ${event.ok ? 'ok' : 'fail'}`,
+          '',
+        );
+        appendTo(fallback, 'span', 'dot', event.ok ? '✓' : '✕');
+        appendTo(fallback, 'span', 'name', event.name || 'tool');
+        appendTo(fallback, 'span', 'sum', event.summary || (event.ok ? '完成' : '失败'));
+      }
     } else if (event.type === 'error') {
       appendTo(state.currentAssistant, 'div', 'msg error', event.message || '执行失败');
     }
@@ -899,6 +941,162 @@
       }).filter(Boolean).join('\n');
     }
     return String(content);
+  }
+
+  function preBlock(text) {
+    const pre = document.createElement('pre');
+    pre.className = 'verbatim';
+    pre.textContent = text;
+    return pre;
+  }
+
+  function confirmDraftTitle(text) {
+    const title = document.createElement('div');
+    title.className = 'confirm-draft-title';
+    title.textContent = text;
+    return title;
+  }
+
+  function confirmDraftRow(label, value) {
+    const row = document.createElement('div');
+    row.className = 'confirm-draft-row';
+    appendTo(row, 'span', 'k', label);
+    appendTo(row, 'span', 'v',
+      value === undefined || value === null || value === '' ? '未提供' : String(value));
+    return row;
+  }
+
+  function renderManageConfigConfirm(req) {
+    const args = req?.args || {};
+    const action = args.action || '';
+    const wrap = document.createElement('div');
+    wrap.className = 'confirm-draft';
+    const actionLabel = {
+      upsert_secret: '保存 Secret',
+      delete_secret: '删除 Secret',
+      upsert_mcp_server: '保存 MCP Server',
+      delete_mcp_server: '删除 MCP Server',
+    }[action] || `配置操作: ${action || '未知'}`;
+
+    wrap.appendChild(confirmDraftTitle(actionLabel));
+    if (args.reason) wrap.appendChild(confirmDraftRow('原因', args.reason));
+
+    if (action === 'upsert_secret' || action === 'delete_secret') {
+      const secret = args.secret || {};
+      wrap.appendChild(confirmDraftRow('Secret 名称', secret.name ? normalizeSecretName(secret.name) : '未提供'));
+      if (action === 'upsert_secret') {
+        wrap.appendChild(confirmDraftRow('用途说明', secret.description || '未填写'));
+        wrap.appendChild(confirmDraftRow(
+          'Secret 明文',
+          secret.secret_value ? '已提供,将写入电脑端 Secret Store,不会回显' : '未提供,只创建/更新占位或说明',
+        ));
+      } else {
+        wrap.appendChild(confirmDraftRow('影响', '会从电脑端配置中删除该 Secret;引用它的 MCP Server 将无法认证'));
+      }
+      wrap.appendChild(confirmDraftRow('生效时机', '需新建会话后生效'));
+      return wrap;
+    }
+
+    if (action === 'upsert_mcp_server' || action === 'delete_mcp_server') {
+      const server = args.mcp_server || {};
+      wrap.appendChild(confirmDraftRow('Server ID', server.id));
+      if (action === 'upsert_mcp_server') {
+        wrap.appendChild(confirmDraftRow('名称', server.name || server.id));
+        wrap.appendChild(confirmDraftRow('URL', server.url));
+        wrap.appendChild(confirmDraftRow('Bearer Secret', server.bearer_secret || '不使用'));
+        wrap.appendChild(confirmDraftRow('启用', server.enabled === false ? '否' : '是'));
+        wrap.appendChild(confirmDraftRow('用途说明', server.description || '未填写'));
+        const headers = server.headers && typeof server.headers === 'object'
+          ? Object.keys(server.headers)
+          : [];
+        wrap.appendChild(confirmDraftRow('固定 Headers', headers.length ? headers.join(', ') : '无'));
+      } else {
+        wrap.appendChild(confirmDraftRow('影响', '会从电脑端配置中删除该 MCP Server'));
+      }
+      wrap.appendChild(confirmDraftRow('生效时机', '需新建会话后 load_mcp 才会看到变化'));
+      return wrap;
+    }
+
+    wrap.appendChild(preBlock(JSON.stringify(args, null, 2)));
+    return wrap;
+  }
+
+  function renderMcpCallConfirm(req) {
+    const args = req?.args || {};
+    const wrap = document.createElement('div');
+    wrap.className = 'confirm-draft';
+    wrap.appendChild(confirmDraftTitle('调用 MCP 工具'));
+    if (req?.reason) wrap.appendChild(confirmDraftRow('原因', req.reason));
+    wrap.appendChild(confirmDraftRow('Server ID', args.server_id || inferMcpServerFromTool(req?.toolName)));
+    wrap.appendChild(confirmDraftRow('工具名', args.tool_name || req?.toolName));
+    wrap.appendChild(confirmDraftRow('调用参数', JSON.stringify(args.arguments ?? args, null, 2)));
+    wrap.appendChild(confirmDraftRow('影响', '会由电脑端向已配置的 MCP Server 发起一次真实工具调用'));
+    return wrap;
+  }
+
+  function inferMcpServerFromTool(toolName) {
+    const name = String(toolName || '');
+    if (!name.startsWith('mcp_')) return '未提供';
+    const parts = name.slice(4).split('_');
+    return parts[0] || '未提供';
+  }
+
+  function renderConfirmBody(req) {
+    if (req?.toolName === 'run_command' && req.args && req.args.command) {
+      return preBlock(String(req.args.command));
+    }
+    if (req?.toolName === 'mcp_call' || String(req?.toolName || '').startsWith('mcp_')) {
+      return renderMcpCallConfirm(req);
+    }
+    if (req?.toolName === 'manage_agent_config') {
+      return renderManageConfigConfirm(req);
+    }
+    return preBlock(JSON.stringify(req?.args || {}, null, 2));
+  }
+
+  async function showConfirm(reqId, req) {
+    if (!reqId || state.pendingConfirmId === reqId) return;
+    state.pendingConfirmId = reqId;
+
+    const mask = $('confirm-mask');
+    const body = $('confirm-body');
+    const allow = $('btn-allow');
+    const deny = $('btn-deny');
+    $('confirm-title').textContent = `确认执行 ${req?.toolName || '工具'}`;
+    body.textContent = '';
+    body.appendChild(renderConfirmBody(req));
+    allow.disabled = false;
+    deny.disabled = false;
+    mask.hidden = false;
+    deny.focus();
+
+    const submit = async ok => {
+      if (state.pendingConfirmId !== reqId) return;
+      allow.disabled = true;
+      deny.disabled = true;
+      try {
+        const result = await request('/api/confirm/reply', {
+          method: 'POST',
+          body: JSON.stringify({ reqId, ok }),
+        });
+        if (result?.ok === false) throw new Error(result.error || '确认回复失败');
+        closeConfirmIfCurrent(reqId);
+      } catch (e) {
+        allow.disabled = false;
+        deny.disabled = false;
+        toast(`确认回复失败: ${errorText(e)}`, true);
+      }
+    };
+
+    allow.onclick = () => void submit(true);
+    deny.onclick = () => void submit(false);
+  }
+
+  function closeConfirmIfCurrent(reqId) {
+    if (state.pendingConfirmId !== reqId) return;
+    state.pendingConfirmId = null;
+    const mask = $('confirm-mask');
+    if (mask) mask.hidden = true;
   }
 
   function appendTo(parent, tag, className, text) {
@@ -1191,6 +1389,11 @@
     if (!text) return;
     $('input').value = '';
     void send(text);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape' || $('confirm-mask').hidden || !state.pendingConfirmId) return;
+    e.preventDefault();
+    $('btn-deny').click();
   });
   document.querySelectorAll('.tab').forEach(btn => {
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));

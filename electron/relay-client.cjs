@@ -136,6 +136,9 @@ function createRelayClient(options) {
       return appApi.runAgent(runId, body.input || '', { notifySessionChanged: true });
     }
     if (method === 'POST' && pathname === '/api/agent/abort') return appApi.abortAgent();
+    if (method === 'POST' && pathname === '/api/confirm/reply') {
+      return appApi.confirmReply(body.reqId, body.ok);
+    }
     if (method === 'POST' && pathname === '/api/agent/restart') return appApi.restartSession();
     if (method === 'POST' && pathname === '/api/config/save') return appApi.configSave(body.patch || {});
     if (method === 'POST' && pathname === '/api/config/test-mcp') return appApi.configTestMcp(body);
