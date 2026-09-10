@@ -2,8 +2,8 @@
 // Electron 主进程 —— 原生窗口 + agent 宿主
 // ============================================
 //
-// agent 直接跑在**这个进程**里(它本来就是 Node),所以没有端口、没有 HTTP、
-// 没有第二套鉴权。渲染进程与它之间只有 preload.cjs 那一道窄口子。
+// agent 直接跑在**这个进程**里(它本来就是 Node)。渲染进程与它之间只有
+// preload.cjs 那一道窄口子;未来手机/转发入口则经 RemoteHub 复用同一套 AppApi。
 //
 // 两个不得不这么写的地方:
 //
@@ -19,6 +19,9 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { createAppApi } = require('./app-api.cjs');
+const { createRemoteHub } = require('./remote-hub.cjs');
+const { createRelayClient } = require('./relay-client.cjs');
 
 const appRoot = path.join(__dirname, '..');
 
@@ -32,7 +35,8 @@ app.setName('BaseAgent');
 let win = null;
 let session = null;          // AgentSession
 let createAgentSession = null;   // 动态 import 拿到的工厂
-let currentRunId = null;
+let remoteHub = null;
+let relayClient = null;
 
 // 确认往返:reqId → resolve。主进程问、页面答
 const pendingConfirms = new Map();
@@ -243,7 +247,7 @@ async function switchSession(resumeSessionId) {
   session = null;
   await old?.dispose();
   const s = await ensureSession(resumeSessionId);
-  if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
+  sendSessionChanged();
   return s;
 }
 
@@ -286,7 +290,7 @@ async function createSession(resumeSessionId) {
     // 技能沉淀完了通知渲染层刷角标。窗口没了就静默丢弃 ——
     // 库已经落盘,下次开窗口拉列表时自然带出来
     onSkillsChanged: () => {
-      if (win && !win.isDestroyed()) win.webContents.send('agent:skills-changed');
+      sendSkillsChanged();
     },
     onConfigChanged: () => loadAppConfigOverrides(),
   });
@@ -327,44 +331,129 @@ function createWindow() {
   win.on('closed', () => { win = null; });
 }
 
-// ---------- IPC:跑一轮 ----------
-ipcMain.handle('agent:run', async (_e, runId, input) => {
-  const s = await ensureSession();
-  currentRunId = runId;
+function sendAgentEvent(runId, event) {
+  if (win && !win.isDestroyed()) win.webContents.send('agent:event', runId, event);
+  remoteHub?.publish('agent:event', { runId, event });
+  relayClient?.publish('agent:event', { runId, event });
+}
 
-  const send = event => {
-    if (win && !win.isDestroyed()) win.webContents.send('agent:event', runId, event);
-  };
+function sendSessionChanged() {
+  if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
+  remoteHub?.publish('agent:session-changed', {});
+  relayClient?.publish('agent:session-changed', {});
+}
+
+function sendSkillsChanged() {
+  if (win && !win.isDestroyed()) win.webContents.send('agent:skills-changed');
+  remoteHub?.publish('agent:skills-changed', {});
+  relayClient?.publish('agent:skills-changed', {});
+}
+
+function sendConfigChanged() {
+  remoteHub?.publish('agent:config-changed', {});
+  relayClient?.publish('agent:config-changed', {});
+}
+
+function sendMemoryChanged() {
+  remoteHub?.publish('agent:memory-changed', {});
+  relayClient?.publish('agent:memory-changed', {});
+}
+
+async function restartSession() {
+  if (sessionPromise) {
+    // 装配中途点了保存。等它落地再关,不然会漏掉一个 chromium
+    try { await sessionPromise; } catch { /* 装配本身失败,下面照常重建 */ }
+  }
+
+  const old = session;
+  const resumeSessionId = old?.sessionId;
+  session = null;
+  await old?.dispose();
+
+  const config = await loadEffectiveConfig();
+  // 如果本来就没有会话,保存配置只需要刷新界面事实,不必立刻装配 agent。
+  // 第一轮消息会按最新配置懒创建;这能避免“保存/启动就等 venv+浏览器”的卡顿。
+  if (!old || !config.models.main.apiKey) {
+    sendSessionChanged();
+    return true;
+  }
+
+  await ensureSession(resumeSessionId);
+  sendSessionChanged();
+  return true;
+}
+
+const appApi = createAppApi({
+  ensureSession,
+  getSession: () => session,
+  switchSession,
+  restartSession,
+  loadEffectiveConfig,
+  loadAppConfigOverrides,
+  loadConfigStore,
+  loadPlatformConfig,
+  loadPlatformSecrets,
+  loadMcpModule,
+  loadDeepSeekModule,
+  loadSessionStore,
+  getUserDataDir: () => app.getPath('userData'),
+  getRemoteHubInfo: () => remoteHub?.info() || null,
+  getRelayClientInfo: () => relayClient?.info() || null,
+  createRemotePairCode: options => remoteHub?.createPairCode(options),
+  openPath: p => shell.openPath(p),
+  sendAgentEvent,
+  sendSessionChanged,
+  sendSkillsChanged,
+  sendConfigChanged,
+  sendMemoryChanged,
+});
+
+async function startRemoteHub() {
+  if (process.env.BASEAGENT_REMOTE_HUB === '0') return;
+
+  const host = process.env.BASEAGENT_REMOTE_HOST || '127.0.0.1';
+  const port = process.env.BASEAGENT_REMOTE_PORT || 17888;
+  remoteHub = createRemoteHub({
+    appApi,
+    host,
+    port,
+    token: process.env.BASEAGENT_REMOTE_TOKEN,
+    staticRoot: path.join(appRoot, 'src', 'interface', 'remote'),
+    markdownPath: path.join(appRoot, 'src', 'interface', 'app', 'md.js'),
+    logger: console,
+  });
 
   try {
-    // 用局部的 s,不用全局 session:重建可能在这一轮进行中发生,
-    // 那样 session 会被换掉而这一轮该跑在它原来那个上
-    const result = await s.run(input, send);
-    return { ok: true, stopReason: result.stopReason, answer: result.answer };
+    await remoteHub.start();
   } catch (err) {
-    // 失败**当成正常返回值**回去,不让异常穿过 IPC。两个理由:
-    //
-    // ① Electron 序列化异常时只带 message,自定义字段(LLMError.detail)会被丢掉 ——
-    //    而 detail 里正是服务端的原话(如「Output data may contain inappropriate
-    //    content.」= 输出被内容审查拦下),丢了就又回到「只显示 LLM API 调用失败」
-    // ② 它还会给消息加上「Error invoking remote method 'agent:run':」前缀,
-    //    那半截是实现细节,不该出现在用户眼前
-    console.error('本轮执行失败', err);
-    return {
-      ok: false,
-      error: err && err.message ? err.message : String(err),
-      // 服务端原话。渲染进程只把它当文本显示,不做任何解析
-      detail: err && err.detail ? String(err.detail) : undefined,
-      code: err && err.code ? String(err.code) : undefined,
-    };
-  } finally {
-    currentRunId = null;
+    console.warn('RemoteHub 启动失败,远程同步入口不可用', err);
+    remoteHub = null;
   }
+}
+
+function startRelayClient() {
+  const url = process.env.BASEAGENT_RELAY_URL;
+  const token = process.env.BASEAGENT_RELAY_TOKEN;
+  if (!url && !token) return;
+
+  relayClient = createRelayClient({
+    appApi,
+    url,
+    token,
+    deviceId: process.env.BASEAGENT_RELAY_DEVICE_ID || 'default',
+    reconnectMs: process.env.BASEAGENT_RELAY_RECONNECT_MS,
+    logger: console,
+  });
+  relayClient.start();
+}
+
+// ---------- IPC:跑一轮 ----------
+ipcMain.handle('agent:run', async (_e, runId, input) => {
+  return appApi.runAgent(runId, input);
 });
 
 ipcMain.handle('agent:abort', () => {
-  session?.abort();
-  return true;
+  return appApi.abortAgent();
 });
 
 // ---------- IPC:窗口控制 ----------
@@ -403,70 +492,12 @@ ipcMain.on('agent:confirm-reply', (_e, reqId, ok) => {
 // pythonDir 曾经两处各算一份,而错位不报错、只表现成
 // 「venv 里装了、代码里 import 不到」
 ipcMain.handle('agent:info', async () => {
-  const s = session;
-  const c = s ? s.config : await loadEffectiveConfig();
-  const main = c.models.main;
-  const shellEnabled =
-    s ? s.info.shellEnabled : c.shell.enabled && !!c.workspace && c.security.allowDangerousTools;
-
-  return {
-    model: s ? s.info.model : main.model,
-    baseURL: s ? s.info.baseURL : main.baseURL,
-    visionModel: s ? s.info.visionModel || '' : c.models.vision?.model || '',
-    workspace: c.workspace || '',
-    pythonEnabled: c.python.enabled,
-    allowDangerousTools: c.security.allowDangerousTools,
-    // shell 要给**两个**值,不能只给一个:
-    // - shellEnabled 是实际生效值(shell.enabled && workspace && allowDangerousTools 的合成)
-    // - shellConfigured 是用户勾的那个原始值
-    // 只给合成值会静默丢配置:勾了 shell 但没勾「允许危险工具」时,
-    // 面板回填成未勾选,用户下次保存就把自己存的 true 写成了 false
-    shellEnabled,
-    shellConfigured: c.shell.enabled,
-    subAgentEnabled: c.subAgent.enabled,
-    memoryEnabled: c.memory.enabled,
-    // 运行参数:给**实际生效值**。maxTokens 未配时是 undefined,
-    // 原样传出去让面板显示空(= 走默认),不要兜成 0
-    maxTokens: c.models.main.maxTokens,
-    maxSteps: c.execution.maxSteps,
-    enableThinking: c.models.main.enableThinking,
-    userDataDir: app.getPath('userData'),
-    // 只给掩码。明文 key 不进渲染进程 —— 那里跑着不可信内容
-    apiKeyMasked: maskKey(main.apiKey),
-    secrets: (c.secrets?.items || []).map(s => ({
-      name: s.name,
-      description: s.description || '',
-      hasValue: !!s.value,
-    })),
-    mcpServers: c.mcp?.servers || [],
-    mcpTools: s ? s.info.mcpTools : [],
-  };
+  return appApi.info();
 });
 
 ipcMain.handle('agent:notices', async () => {
-  if (session) return session.notices;
-
-  const c = await loadEffectiveConfig();
-  const notices = [];
-  if (!c.models.main.apiKey) {
-    notices.push({
-      level: 'error',
-      message: 'DEEPSEEK_API_KEY 未配置,请先在配置面板填写 API key。',
-    });
-  }
-  if (!c.workspace) {
-    notices.push({
-      level: 'warn',
-      message: 'WORKSPACE 未配置,文件类工具与代码执行将全部被拒绝。',
-    });
-  }
-  return notices;
+  return appApi.notices();
 });
-
-function maskKey(k) {
-  if (!k) return '(未配置)';
-  return k.length <= 8 ? 'sk-••••' : `${k.slice(0, 3)}••••••••${k.slice(-4)}`;
-}
 
 // ---------- IPC:目录选择 ----------
 //
@@ -483,322 +514,51 @@ ipcMain.handle('dialog:pick-directory', async () => {
 });
 
 ipcMain.handle('app:open-user-data', async () => {
-  await shell.openPath(app.getPath('userData'));
-  return true;
+  return appApi.openUserDataDir();
+});
+
+ipcMain.handle('remote:create-pair-code', async (_e, options) => {
+  return appApi.createRemotePairCode(options);
 });
 
 // ---------- IPC:配置 ----------
 ipcMain.handle('config:get', async () => {
-  const { readConfigFile } = await loadConfigStore();
-  const cfg = readConfigFile();
-  return {
-    ...cfg,
-    secrets: (cfg.secrets || []).map(s => ({
-      name: s.name,
-      description: s.description || '',
-      hasValue: !!s.value,
-    })),
-  };
+  return appApi.configGet();
 });
 
 ipcMain.handle('config:save', async (_e, patch) => {
-  const { writeConfigFile } = await loadConfigStore();
-  const before = session ? await loadEffectiveConfig() : null;
-
-  // 校验失败要**当成正常返回值**回去,不能让异常穿过 IPC:
-  // Electron 会把抛出的 Error 包成
-  // 「Error invoking remote method 'config:save': Error: 单次生成上限应在…」——
-  // 前缀那半截是实现细节,而这条消息是直接给用户看的
-  try {
-    writeConfigFile(patch);
-  } catch (err) {
-    return { ok: false, error: err && err.message ? err.message : String(err) };
-  }
-
-  if (session && before) {
-    const after = await loadEffectiveConfig();
-    if (!requiresFullSessionRestart(before, after)) {
-      try {
-        await session.refreshConfig(await loadAppConfigOverrides());
-        if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
-        return { ok: true, needsRestart: false, hotReloaded: true };
-      } catch (err) {
-        console.error('MCP 配置热刷新失败', err);
-        return {
-          ok: true,
-          needsRestart: true,
-          hotReloaded: false,
-          warning: err && err.message ? err.message : String(err),
-        };
-      }
-    }
-  }
-
-  // 工作区、模型、Python 开关等仍必须重建会话:这些会派生执行器和安全边界。
-  return { ok: true, needsRestart: true };
+  return appApi.configSave(patch);
 });
 
-function requiresFullSessionRestart(before, after) {
-  return JSON.stringify(restartRelevantConfig(before)) !==
-    JSON.stringify(restartRelevantConfig(after));
-}
-
-function restartRelevantConfig(c) {
-  const main = c.models.main || {};
-  const vision = c.models.vision || null;
-  return {
-    main: {
-      apiKey: main.apiKey || '',
-      baseURL: main.baseURL || '',
-      model: main.model || '',
-      maxTokens: main.maxTokens ?? null,
-      enableThinking: main.enableThinking !== false,
-    },
-    vision: vision
-      ? {
-          apiKey: vision.apiKey || '',
-          baseURL: vision.baseURL || '',
-          model: vision.model || '',
-        }
-      : null,
-    workspace: c.workspace || '',
-    pythonEnabled: !!c.python.enabled,
-    allowDangerousTools: !!c.security.allowDangerousTools,
-    shellEnabled: !!c.shell.enabled,
-    subAgentEnabled: !!c.subAgent.enabled,
-    memoryEnabled: !!c.memory.enabled,
-    maxSteps: c.execution.maxSteps,
-  };
-}
-
 ipcMain.handle('config:test-mcp', async (_e, payload) => {
-  const { readConfigFile, validateStored } = await loadConfigStore();
-  const { mergeSecretPatches, normalizeSecretName } = await loadPlatformSecrets();
-  const { McpRuntime } = await loadMcpModule();
-
-  try {
-    const server = normalizeMcpServerForTest(payload?.server, normalizeSecretName);
-    const secretPatches = Array.isArray(payload?.secrets) ? payload.secrets : [];
-
-    const errors = validateStored({ mcpServers: [server], secrets: secretPatches });
-    if (errors.length > 0) return { ok: false, error: errors.join(';') };
-
-    const stored = readConfigFile();
-    const secrets = mergeSecretPatches(stored.secrets || [], secretPatches);
-    const loaded = await loadMcpToolsForConfigTest(McpRuntime, server, secrets);
-    if (!loaded.ok) return { ok: false, error: loaded.error || 'MCP 测试失败' };
-
-    const data = loaded.data || {};
-    const tools = Array.isArray(data.tools) ? data.tools : [];
-    return {
-      ok: true,
-      server: data.server || { id: server.id, name: server.name },
-      toolCount: tools.length,
-      tools: tools.slice(0, 50).map(t => ({
-        name: String(t.name || ''),
-        description: String(t.description || ''),
-        inputSchema: t.inputSchema,
-      })),
-      truncated: tools.length > 50,
-    };
-  } catch (err) {
-    return { ok: false, error: err && err.message ? err.message : String(err) };
-  }
+  return appApi.configTestMcp(payload);
 });
 
 ipcMain.handle('config:describe-mcp', async (_e, payload) => {
-  const { readConfigFile, validateStored } = await loadConfigStore();
-  const { mergeSecretPatches, normalizeSecretName } = await loadPlatformSecrets();
-  const { McpRuntime } = await loadMcpModule();
-
-  try {
-    const server = normalizeMcpServerForTest(payload?.server, normalizeSecretName);
-    const secretPatches = Array.isArray(payload?.secrets) ? payload.secrets : [];
-
-    const errors = validateStored({ mcpServers: [server], secrets: secretPatches });
-    if (errors.length > 0) return { ok: false, error: errors.join(';') };
-
-    const stored = readConfigFile();
-    const secrets = mergeSecretPatches(stored.secrets || [], secretPatches);
-    const loaded = await loadMcpToolsForConfigTest(McpRuntime, server, secrets);
-    if (!loaded.ok) return { ok: false, error: loaded.error || 'MCP Server 加载失败' };
-
-    const config = await loadEffectiveConfig();
-    const main = config.models.main;
-    if (!main.apiKey) {
-      return { ok: false, error: '主模型 API key 未配置,无法生成 MCP 用途说明' };
-    }
-
-    const { DeepSeekAdapter } = await loadDeepSeekModule();
-    const llm = new DeepSeekAdapter({
-      apiKey: main.apiKey,
-      baseURL: main.baseURL,
-      model: main.model,
-      enableThinking: !!main.enableThinking,
-      maxTokens: Math.min(main.maxTokens || 700, 700),
-      temperature: 0.2,
-      retry: config.retry,
-      logger: console,
-    });
-
-    const tools = Array.isArray(loaded.data?.tools) ? loaded.data.tools : [];
-    const response = await llm.complete({
-      responseFormat: 'json_object',
-      traceLabel: 'config:mcp-description',
-      messages: [
-        {
-          role: 'system',
-          content: [
-            '你负责为 BaseAgent 配置页生成 MCP Server 的用途说明。',
-            '只输出 JSON,格式为 {"description":"..."}。',
-            'description 用中文,80 到 120 字左右,说明这个 MCP 适合什么任务、主要能力和使用边界。',
-            '不要提 token、密钥、认证、HTTP、SSE、实现细节,不要编造工具列表以外的能力。',
-          ].join('\n'),
-        },
-        {
-          role: 'user',
-          content: JSON.stringify({
-            server: {
-              id: server.id,
-              name: server.name,
-              currentDescription: server.description || '',
-              endpoint: safeMcpEndpointLabel(server.url),
-            },
-            toolCount: tools.length,
-            tools: summarizeMcpToolsForPrompt(tools),
-            truncated: tools.length > 30,
-          }, null, 2),
-        },
-      ],
-    });
-
-    const parsed = JSON.parse(response.content || '{}');
-    const description = cleanGeneratedDescription(parsed.description);
-    if (!description) return { ok: false, error: '模型没有生成有效说明' };
-
-    return { ok: true, description };
-  } catch (err) {
-    return { ok: false, error: err && err.message ? err.message : String(err) };
-  }
+  return appApi.configDescribeMcp(payload);
 });
 
-async function loadMcpToolsForConfigTest(McpRuntime, server, secrets) {
-  const runtime = new McpRuntime({
-    servers: [{ ...server, enabled: true }],
-    secrets,
-    logger: console,
-  });
-
-  try {
-    return await runtime.load(server.id);
-  } finally {
-    await runtime.close();
-  }
-}
-
-function normalizeMcpServerForTest(raw, normalizeSecretName) {
-  if (!raw || typeof raw !== 'object') throw new Error('MCP Server 配置格式不正确');
-  const id = String(raw.id || '').trim();
-  const name = String(raw.name || id).trim();
-  const description = String(raw.description || '').trim();
-  const bearerSecret = raw.bearerSecret ? normalizeSecretName(String(raw.bearerSecret)) : undefined;
-  const headers = raw.headers && typeof raw.headers === 'object'
-    ? Object.fromEntries(
-        Object.entries(raw.headers)
-          .filter(([k, v]) => String(k).trim() && typeof v === 'string')
-          .map(([k, v]) => [String(k).trim(), v]),
-      )
-    : undefined;
-
-  return {
-    id,
-    name,
-    ...(description ? { description } : {}),
-    url: String(raw.url || '').trim(),
-    enabled: true,
-    ...(bearerSecret ? { bearerSecret } : {}),
-    ...(headers ? { headers } : {}),
-  };
-}
-
-function summarizeMcpToolsForPrompt(tools) {
-  return tools.slice(0, 30).map(tool => ({
-    name: String(tool.name || '').slice(0, 120),
-    description: clipForPrompt(tool.description || '', 320),
-    input: summarizeMcpInputSchema(tool.inputSchema),
-  }));
-}
-
-function summarizeMcpInputSchema(schema) {
-  if (!schema || typeof schema !== 'object') return {};
-  const properties = schema.properties && typeof schema.properties === 'object'
-    ? Object.keys(schema.properties).slice(0, 24)
-    : [];
-  const required = Array.isArray(schema.required)
-    ? schema.required.filter(v => typeof v === 'string').slice(0, 24)
-    : [];
-  return { properties, required };
-}
-
-function clipForPrompt(value, max) {
-  return String(value || '').trim().replace(/\s+/g, ' ').slice(0, max);
-}
-
-function cleanGeneratedDescription(value) {
-  const text = clipForPrompt(value, 240);
-  return text.length >= 8 ? text : '';
-}
-
-function safeMcpEndpointLabel(rawUrl) {
-  try {
-    const u = new URL(String(rawUrl || ''));
-    return `${u.protocol}//${u.host}`;
-  } catch {
-    return '';
-  }
-}
-
-/**
- * 重建会话(改了 workspace 这类需要重启的项之后)
- *
- * 三处顺序不能换:
- * ① 先 await 掉正在进行的装配 —— 否则它建好之后会覆盖掉重建出来的那个,
- *    而旧的那份再没人 dispose,chromium 就成了孤儿(锁着 profile 目录)
- * ② dispose 必须在 session = null **之前**取到引用,否则关不掉旧实例
- * ③ 新会话建好才发 session-changed:壳收到就会去拉 info,
- *    早发会让它拿到半个状态
- */
 // ---------- IPC:会话历史 ----------
 //
 // 列表**不经会话**:开一个 AgentSession 要起 chromium、建 venv、检依赖,
 // 而这里只要读几个 turns.jsonl 的第一行。为了列侧边栏付那些代价说不通。
 ipcMain.handle('history:list', async () => {
-  const { listSessions } = await loadSessionStore();
-  const { loadConfig } = await loadPlatformConfig();
-  return listSessions(loadConfig(await loadAppConfigOverrides()).trace.dir);
+  return appApi.listHistory();
 });
 
 /** 当前会话的完整原始对话 —— 前端渲染历史用 */
 ipcMain.handle('history:current', async () => {
-  // 启动时渲染层会调用它来恢复当前视图。这里不能顺手创建完整会话:
-  // 建会话会检查 venv、起浏览器、启动工具桥,直接把“打开窗口”拖慢。
-  // 真正需要会话的是发送消息或显式打开某段历史。
-  if (!session) return { sessionId: null, turns: [] };
-
-  const s = await ensureSession();
-  return { sessionId: s.sessionId, turns: s.history() };
+  return appApi.currentHistory();
 });
 
 /** 切到某个历史会话 */
 ipcMain.handle('history:open', async (_e, sessionId) => {
-  const s = await switchSession(sessionId);
-  return { sessionId: s.sessionId, turns: s.history() };
+  return appApi.openHistory(sessionId);
 });
 
 /** 开新对话 —— 不传 resumeSessionId 即新建 */
 ipcMain.handle('history:new', async () => {
-  const s = await switchSession(undefined);
-  return { sessionId: s.sessionId, turns: [] };
+  return appApi.newHistory();
 });
 
 // ---------- IPC:技能审批 ----------
@@ -812,118 +572,27 @@ ipcMain.handle('history:new', async () => {
 
 /** 全部技能(含待审批)。渲染层自己按 pending 分组 */
 ipcMain.handle('skills:list', async () => {
-  // 启动时会刷新角标,但不能为了角标创建完整会话。技能库是增强能力,
-  // 首屏响应优先;会话建好后 onSessionChanged / onSkillsChanged 会再刷新。
-  if (!session) return { ok: false, error: '会话尚未启动' };
-
-  const s = await ensureSession();
-  if (!s.skills) return { ok: false, error: '技能库未启用' };
-  return { ok: true, skills: s.skills.list() };
+  return appApi.listSkills();
 });
 
 ipcMain.handle('skills:approve', async (_e, name) => {
-  if (!session) return { ok: false, error: '会话尚未启动' };
-
-  const s = await ensureSession();
-  if (!s.skills) return { ok: false, error: '技能库未启用' };
-
-  if (enabledSkillCount(s.skills.list()) >= 20) {
-    return { ok: false, error: '最多只能启用 20 个技能。请先停用一个已启用技能。' };
-  }
-
-  // approve 返回 false = 名字不存在或它本来就不是待审状态。
-  // 两种都不算错误,但要让渲染层知道「没发生变化」,否则列表刷新后
-  // 用户会以为自己点了却没反应
-  const changed = s.skills.approve(name);
-  return { ok: true, changed, skills: s.skills.list() };
+  return appApi.approveSkill(name);
 });
 
 ipcMain.handle('skills:reject', async (_e, name) => {
-  if (!session) return { ok: false, error: '会话尚未启动' };
-
-  const s = await ensureSession();
-  if (!s.skills) return { ok: false, error: '技能库未启用' };
-
-  const changed = s.skills.reject(name);
-  return { ok: true, changed, skills: s.skills.list() };
+  return appApi.rejectSkill(name);
 });
 
 ipcMain.handle('skills:set-enabled', async (_e, name, enabled) => {
-  if (!session) return { ok: false, error: '会话尚未启动' };
-
-  const s = await ensureSession();
-  if (!s.skills) return { ok: false, error: '技能库未启用' };
-
-  if (enabled === true && enabledSkillCount(s.skills.list()) >= 20) {
-    return { ok: false, error: '最多只能启用 20 个技能。请先停用一个已启用技能。' };
-  }
-
-  const changed = s.skills.setEnabled(String(name || ''), enabled === true);
-  return { ok: true, changed, skills: s.skills.list() };
+  return appApi.setSkillEnabled(name, enabled);
 });
 
-function enabledSkillCount(skills) {
-  return (skills || []).filter(s => !s.pending && s.enabled !== false).length;
-}
-
 ipcMain.handle('memory:extract-from-turns', async (_e, payload) => {
-  if (!session) return { ok: false, error: '会话尚未启动' };
-
-  const s = await ensureSession();
-  if (!s.memory) return { ok: false, error: '长期记忆未启用' };
-
-  try {
-    const ids = Array.isArray(payload?.turnIds)
-      ? payload.turnIds
-          .map(n => Number(n))
-          .filter(n => Number.isInteger(n) && n > 0)
-      : [];
-    if (ids.length === 0) return { ok: false, error: '请先选择要压缩进记忆的对话轮次' };
-
-    const selectedIds = new Set(ids);
-    const selectedTurns = s.history().filter(t => selectedIds.has(t.turn_id));
-    if (selectedTurns.length === 0) {
-      return { ok: false, error: '选中的轮次不在当前会话历史中' };
-    }
-
-    const result = await s.memory.extractFromTurns(selectedTurns, String(payload?.reason || ''));
-    return {
-      ...result,
-      memories: s.memory.list(),
-    };
-  } catch (err) {
-    return { ok: false, error: err && err.message ? err.message : String(err) };
-  }
+  return appApi.extractMemoryFromTurns(payload);
 });
 
 ipcMain.handle('skills:extract-from-turns', async (_e, payload) => {
-  if (!session) return { ok: false, error: '会话尚未启动' };
-
-  const s = await ensureSession();
-  if (!s.skills) return { ok: false, error: '技能库未启用' };
-
-  try {
-    const ids = Array.isArray(payload?.turnIds)
-      ? payload.turnIds
-          .map(n => Number(n))
-          .filter(n => Number.isInteger(n) && n > 0)
-      : [];
-    if (ids.length === 0) return { ok: false, error: '请先选择要沉淀的对话轮次' };
-
-    const selectedIds = new Set(ids);
-    const selectedTurns = s.history().filter(t => selectedIds.has(t.turn_id));
-    if (selectedTurns.length === 0) {
-      return { ok: false, error: '选中的轮次不在当前会话历史中' };
-    }
-
-    const result = await s.skills.extractFromTurns(selectedTurns, String(payload?.reason || ''));
-    return {
-      ...result,
-      skills: s.skills.list(),
-    };
-  } catch (err) {
-    return { ok: false, error: err && err.message ? err.message : String(err) };
-  }
+  return appApi.extractSkillFromTurns(payload);
 });
 
 async function loadSessionStore() {
@@ -967,27 +636,7 @@ async function loadDeepSeekModule() {
 }
 
 ipcMain.handle('agent:restart', async () => {
-  if (sessionPromise) {
-    // 装配中途点了保存。等它落地再关,不然会漏掉一个 chromium
-    try { await sessionPromise; } catch { /* 装配本身失败,下面照常重建 */ }
-  }
-
-  const old = session;
-  const resumeSessionId = old?.sessionId;
-  session = null;
-  await old?.dispose();
-
-  const config = await loadEffectiveConfig();
-  // 如果本来就没有会话,保存配置只需要刷新界面事实,不必立刻装配 agent。
-  // 第一轮消息会按最新配置懒创建;这能避免“保存/启动就等 venv+浏览器”的卡顿。
-  if (!old || !config.models.main.apiKey) {
-    if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
-    return true;
-  }
-
-  await ensureSession(resumeSessionId);
-  if (win && !win.isDestroyed()) win.webContents.send('agent:session-changed');
-  return true;
+  return appApi.restartSession();
 });
 
 async function loadConfigStore() {
@@ -1000,7 +649,11 @@ async function loadConfigStore() {
 }
 
 // ---------- 生命周期 ----------
-app.whenReady().then(createWindow);
+app.whenReady().then(async () => {
+  createWindow();
+  await startRemoteHub();
+  startRelayClient();
+});
 
 // Windows/Linux 上关窗即退出。dispose 在 before-quit 里做
 app.on('window-all-closed', () => {
@@ -1026,7 +679,7 @@ app.on('before-quit', async e => {
   // session 的 dispose() 不再关它(ownsBrowser 为 false)——
   // 只判 session 的话,session 为 null 时会直接 return、把 chromium 漏掉,
   // 而它是 detached 的,留下来锁着 profile 目录导致下次启动失败
-  if (cleaningUp || (!session && !sharedBrowser)) return;
+  if (cleaningUp || (!session && !sharedBrowser && !remoteHub?.isRunning() && !relayClient)) return;
   e.preventDefault();
   cleaningUp = true;
 
@@ -1044,6 +697,20 @@ app.on('before-quit', async e => {
     console.error('关闭常驻浏览器失败', err);
   }
   sharedBrowser = null;
+
+  try {
+    await remoteHub?.stop();
+  } catch (err) {
+    console.error('关闭 RemoteHub 失败', err);
+  }
+  remoteHub = null;
+
+  try {
+    relayClient?.stop();
+  } catch (err) {
+    console.error('关闭 RelayClient 失败', err);
+  }
+  relayClient = null;
 
   app.quit();
 });

@@ -107,6 +107,46 @@ npm run rebuild:native
 
 更完整的配置项见 [.env.example](./.env.example)。
 
+## 手机端访问
+
+BaseAgent 支持两种远程入口,手机端页面和桌面端共用同一套 `AppApi`,不会复制一份
+MCP、skill、记忆或配置逻辑。
+
+局域网或本机转发场景可以使用内置 RemoteHub。客户端启动后会提供 `/remote/`、
+`/api/*` 和 `/events` 接口,设置面板中可以生成短时配对码。默认只监听
+`127.0.0.1`,如果要让局域网设备直连,需要把 `BASEAGENT_REMOTE_HOST` 改成
+`0.0.0.0`,并设置足够强的 `BASEAGENT_REMOTE_TOKEN`。
+
+公网手机访问建议使用 Cloud Relay。Agent 仍运行在电脑端,电脑主动用 WebSocket
+连接公网 Relay;手机只访问 Relay 的网页和 API。Relay 只保存在线连接、短期访问
+token 和正在转发的请求,不保存 workspace 文件、Secret 明文、trace 或浏览器登录态。
+
+服务器上启动 Relay:
+
+```bash
+BASEAGENT_RELAY_TOKEN=your-long-random-token npm run relay:server
+```
+
+生产环境建议把 Relay 放在 HTTPS/WSS 反向代理之后。也可以设置
+`BASEAGENT_RELAY_PAIR_CODE=123456` 固定测试配对码;不设置时服务端启动会随机生成并打印。
+
+电脑端配置:
+
+```env
+BASEAGENT_RELAY_URL=wss://your-domain.example/pc
+BASEAGENT_RELAY_TOKEN=your-long-random-token
+BASEAGENT_RELAY_DEVICE_ID=default
+```
+
+手机端打开:
+
+```text
+https://your-domain.example/remote/
+```
+
+在页面里输入 Relay 地址和配对码后,手机发送消息、审批 skill、配置 Secret/MCP 等操作
+都会转发回这台电脑执行;电脑端产生的回答和刷新事件也会同步回手机端。
+
 ## Windows 打包
 
 项目已接入 `electron-builder`，当前主要面向 Windows 桌面端分发。

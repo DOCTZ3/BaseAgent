@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BaseAgent Remote</title>
+<link rel="stylesheet" href="remote.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>BaseAgent</h1>
+      <p id="status">未连接</p>
+    </div>
+    <button id="btn-disconnect" class="ghost" hidden>断开</button>
+  </header>
+
+  <main>
+    <section id="pair-panel" class="panel">
+      <h2>连接电脑端</h2>
+      <label>电脑地址
+        <input id="endpoint" type="text" inputmode="url" placeholder="http://192.168.1.10:17888">
+      </label>
+      <label>配对码
+        <input id="pair-code" type="text" inputmode="numeric" maxlength="6" placeholder="6 位数字">
+      </label>
+      <button id="btn-pair" class="primary">连接</button>
+      <p class="hint">先在电脑端设置里生成配对码。默认 127.0.0.1 只能给本机或转发器用。</p>
+    </section>
+
+    <section id="app-panel" hidden>
+      <div class="tabs">
+        <button class="tab active" data-tab="chat">对话</button>
+        <button class="tab" data-tab="history">历史</button>
+        <button class="tab" data-tab="skills">技能</button>
+        <button class="tab" data-tab="config">配置</button>
+      </div>
+
+      <section id="tab-chat" class="tab-body">
+        <div id="stream" class="stream"></div>
+        <form id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="发给电脑端 agent..."></textarea>
+          <button id="btn-send" class="primary" type="submit">发送</button>
+          <button id="btn-stop" class="ghost" type="button" hidden>停止</button>
+        </form>
+      </section>
+
+      <section id="tab-skills" class="tab-body" hidden>
+        <div class="section-head">
+          <h2>技能审批</h2>
+          <button id="btn-refresh-skills" class="ghost">刷新</button>
+        </div>
+        <div id="skills" class="list"></div>
+      </section>
+
+      <section id="tab-history" class="tab-body" hidden>
+        <div class="section-head">
+          <h2>历史会话</h2>
+          <button id="btn-new-session" class="ghost">新对话</button>
+        </div>
+        <div id="history-list" class="list"></div>
+      </section>
+
+      <section id="tab-config" class="tab-body" hidden>
+        <div class="section-head">
+          <h2>Secret / MCP</h2>
+          <button id="btn-save-config" class="primary">保存</button>
+        </div>
+        <h3 class="subhead">Secret Store</h3>
+        <div id="secret-list" class="list"></div>
+        <button id="btn-add-secret" class="ghost">添加 Secret</button>
+        <h3 class="subhead">MCP Servers</h3>
+        <div id="mcp-list" class="list"></div>
+        <button id="btn-add-mcp" class="ghost">添加 MCP Server</button>
+      </section>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="../app/md.js"></script>
+  <script src="remote.js"></script>
+</body>
+</html>

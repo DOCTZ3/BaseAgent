@@ -16,6 +16,7 @@
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:mock": "tsx src/test-mock.ts",
+    "relay:server": "node scripts/relay-server.cjs",
     "typecheck": "tsc --noEmit",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3"
   },
@@ -24,6 +25,7 @@
     "dotenv": "^17.4.2",
     "openai": "^4.56.0",
     "tiktoken": "^1.0.22",
+    "ws": "^8.21.3",
     "zod": "^3.23.8",
     "zod-to-json-schema": "^3.25.2"
   },
@@ -38,6 +40,7 @@
     "files": [
       "electron/**/*",
       "src/interface/app/**/*",
+      "src/interface/remote/**/*",
       "dist/**/*",
       "package.json"
     ],

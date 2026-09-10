@@ -77,6 +77,7 @@
 
   window.AgentRuntime = {
     restart: () => bridge.restart(),
+    createRemotePairCode: options => bridge.createRemotePairCode(options),
   };
 
   // 危险工具确认:主进程问 → 页面弹窗 → 答案回去。

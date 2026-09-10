@@ -150,6 +150,20 @@
     },
   };
 
+  window.AgentRuntime = {
+    restart: async () => true,
+    createRemotePairCode: async () => {
+      await sleep(250);
+      return {
+        ok: true,
+        code: '246810',
+        expiresAt: Date.now() + 120000,
+        expiresInMs: 120000,
+        endpoint: 'http://127.0.0.1:17888',
+      };
+    },
+  };
+
   // 假的会话信息,形状与将来 server 要给的一致
   window.AgentApp.hydrate({
     model: 'deepseek-v4-flash',
@@ -163,6 +177,12 @@
     subAgentEnabled: true,
     memoryEnabled: true,
     apiKeyMasked: 'sk-••••••••1234',
+    remoteHub: {
+      enabled: true,
+      host: '127.0.0.1',
+      port: 17888,
+      tokenMasked: 'test••••oken',
+    },
   });
 
   window.AgentApp.notices([

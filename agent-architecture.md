@@ -28,7 +28,7 @@
 │  interface/  交互层(壳,可替换)                            │
 │    · app/         已实现:Electron 客户端(流式、历史侧边栏) │
 │                   含自写 Markdown 渲染(只建 DOM,不碰 HTML) │
-│                   配置/Secret/MCP/技能/记忆均经 IPC 窄接口 │
+│                   桌面经 IPC,远程/Relay 经 AppApi 同步状态 │
 │    · voice        预留:ASR 语音转文字 / TTS 播报            │
 │    职责:只做 输入→文本 / 结构化结果→展示,零业务逻辑        │
 │    关键:壳共用 core/session.ts 一份装配,壳不重算事实       │
@@ -513,7 +513,9 @@ interface TopicSummary {
 
 - **视觉观察由框架投递,不交给 Python 代码。** 经工具桥看图时,代码触发调用但拿不到观察本体,观察走 `ToolResult.observations` 回到主循环。原因是模型常常不会 `print` 函数返回值,如果把观察只返回给代码,花过钱的视觉结果会静默消失。`question` 必须明确,否则视觉模型只能给泛泛描述。
 
-- **Electron 是主客户端,不是本地 HTTP server。** Agent 需要 Node 主进程来 spawn Python、开 SQLite、连 CDP;Electron 用 IPC 暴露窄接口,没有 localhost 端口和额外鉴权面。渲染进程按不可信环境处理:`contextIsolation: true`、`nodeIntegration: false`,明文 key 不进页面。代价是多一份 Chromium,但它与被 agent 控制的常驻浏览器必须分开。
+- **桌面 IPC 与 RemoteHub 共用 AppApi。** Agent 需要 Node 主进程来 spawn Python、开 SQLite、连 CDP;Electron 渲染进程只经 preload IPC 窄接口访问能力,未来手机端/云端转发入口经 RemoteHub 的 HTTP/SSE 调同一套 `app-api.cjs`。RemoteHub 默认只监听 `127.0.0.1` 且要求 bearer token,用于给转发器或开发调试接入;桌面端只显示 token 掩码,真正接入走短时一次性配对码 `/pair/claim` 换取 client token。内置最小远端网页在 `/remote/`,用 fetch 事件流承接 `agent:event` 和配置/技能/记忆刷新。不把配置、MCP、skill、记忆逻辑复制到第二套服务里。
+
+- **Cloud Relay 只转发,不拥有 Agent 状态。** 公网手机端不直接打到电脑,而是访问 `scripts/relay-server.cjs` 提供的 `/remote/`、`/api/*` 和 `/events`;电脑端 `relay-client.cjs` 主动用 WebSocket 连到 Relay,绕开 NAT 与路由器端口转发。Relay 收到手机 HTTP 请求后转成 `{type:"request", requestId, method, path, body}` 发给电脑端,电脑端仍调用同一个 `AppApi`,再以 `{type:"response"}` 回传;Agent 流式事件则由电脑端发 `{type:"event"}`,Relay fan-out 到手机 SSE。Relay 只保存在线连接、一次性/短期 client token 和 in-flight request,不保存 Secret value、workspace 文件、trace 或浏览器登录态。公网部署必须放在 HTTPS/WSS 后,`BASEAGENT_RELAY_TOKEN` 是电脑接入 Relay 的长凭证,`BASEAGENT_RELAY_PAIR_CODE` 只用于手机换取 client token。
 
 - **客户端配置写用户配置目录,不写回 `.env`。** `.env` 是开发期/首次启动回落来源,真正的客户端配置写入 Electron userData 目录。打包后 trace、配置、记忆库和浏览器登录态都落在 userData 下,避免写进安装目录或项目目录。渲染进程只拿掩码和 `hasValue`,明文 key 只在主进程配置合并与请求发送时出现。
 

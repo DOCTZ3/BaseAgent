@@ -858,6 +858,7 @@
   const drawer = $('drawer');
   const mask = $('drawer-mask');
   const cfgError = $('cfg-error');
+  let remotePairTimer = 0;
 
   function showCfgError(message) {
     if (!cfgError) return;
@@ -923,6 +924,118 @@
 
   $('btn-open-data').addEventListener('click', async () => {
     await window.AgentBridge?.openUserDataDir?.();
+  });
+
+  function clearRemotePair() {
+    clearInterval(remotePairTimer);
+    remotePairTimer = 0;
+    const pair = $('remote-pair');
+    if (pair) pair.hidden = true;
+  }
+
+  function updateRemotePairCountdown(expiresAt) {
+    const expiry = $('remote-pair-expiry');
+    if (!expiry) return false;
+    const left = Math.max(0, expiresAt - Date.now());
+    const seconds = Math.ceil(left / 1000);
+    expiry.textContent = seconds > 0
+      ? `${seconds} 秒内有效,用后失效`
+      : '配对码已过期';
+    return seconds > 0;
+  }
+
+  function renderRemoteHubInfo(remoteHub) {
+    const status = $('remote-status');
+    const endpoint = $('remote-endpoint');
+    const token = $('remote-token');
+    const hint = $('remote-hint');
+    const pairBtn = $('btn-remote-pair');
+    if (!status || !endpoint || !token || !hint) return;
+
+    const enabled = !!remoteHub?.enabled;
+    status.textContent = enabled ? '已启动' : '未启动';
+    status.className = `config-status ${enabled ? 'ok' : 'warn'}`;
+    endpoint.value = enabled && remoteHub.host && remoteHub.port
+      ? `http://${remoteHub.host}:${remoteHub.port}`
+      : '';
+    token.value = remoteHub?.tokenMasked || '';
+    if (pairBtn) pairBtn.disabled = !enabled;
+
+    if (!enabled) {
+      hint.textContent = 'RemoteHub 未启动。可检查 BASEAGENT_REMOTE_HUB、端口占用或启动日志。';
+      clearRemotePair();
+    } else if (remoteHub.host === '127.0.0.1' || remoteHub.host === 'localhost') {
+      hint.textContent = '当前只监听本机。手机端需要通过转发器连接,或改为局域网监听并设置强 token。';
+    } else {
+      hint.textContent = '当前监听非本机地址。请确认网络环境可信,并通过 Bearer token 访问。';
+    }
+  }
+
+  function renderRelayClientInfo(relayClient) {
+    const status = $('relay-status');
+    const url = $('relay-url');
+    const deviceId = $('relay-device-id');
+    const hint = $('relay-hint');
+    if (!status || !url || !deviceId || !hint) return;
+
+    const enabled = !!relayClient?.enabled;
+    const connected = !!relayClient?.connected;
+    status.textContent = connected ? '已连接' : (enabled ? '重连中' : '未配置');
+    status.className = `config-status ${connected ? 'ok' : (enabled ? 'warn' : 'muted')}`;
+    url.value = relayClient?.url || '';
+    deviceId.value = relayClient?.deviceId || '';
+
+    if (!enabled) {
+      hint.textContent = '未配置云端 Relay。手机跨公网访问时,需要先部署 relay server 并在电脑端配置 URL/token。';
+      return;
+    }
+
+    if (connected) {
+      const since = relayClient.connectedAt
+        ? new Date(relayClient.connectedAt).toLocaleString()
+        : '';
+      hint.textContent = since
+        ? `电脑已主动连到 Relay。连接时间: ${since}`
+        : '电脑已主动连到 Relay,手机端可通过 Relay 的 /remote/ 页面配对访问。';
+      return;
+    }
+
+    hint.textContent = 'Relay 已配置但当前未连接。请检查服务器地址、长 token、网络或服务端日志。';
+  }
+
+  $('btn-remote-pair')?.addEventListener('click', async () => {
+    const api = window.AgentRuntime;
+    if (!api?.createRemotePairCode) {
+      toast('当前环境不支持生成配对码', true);
+      return;
+    }
+
+    const btn = $('btn-remote-pair');
+    const pair = $('remote-pair');
+    const code = $('remote-pair-code');
+    const endpoint = $('remote-endpoint');
+    clearRemotePair();
+    if (btn) btn.disabled = true;
+
+    try {
+      const r = await api.createRemotePairCode();
+      if (!r || r.ok === false) {
+        toast(`生成配对码失败: ${r?.error || 'RemoteHub 未启动'}`, true);
+        return;
+      }
+
+      if (code) code.textContent = r.code || '------';
+      if (endpoint && r.endpoint) endpoint.value = r.endpoint;
+      if (pair) pair.hidden = false;
+      updateRemotePairCountdown(r.expiresAt);
+      remotePairTimer = setInterval(() => {
+        if (!updateRemotePairCountdown(r.expiresAt)) clearRemotePair();
+      }, 1000);
+    } catch (e) {
+      toast(`生成配对码失败: ${e && e.message ? e.message : String(e)}`, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   });
 
   const secretList = $('secret-list');
@@ -2129,6 +2242,8 @@
       $('cfg-maxsteps').value = info.maxSteps != null ? info.maxSteps : '';
       $('cfg-thinking').checked = info.enableThinking !== false;   // 默认开
 
+      renderRemoteHubInfo(info.remoteHub);
+      renderRelayClientInfo(info.relayClient);
       applySecrets(info.secrets || []);
       applyMcpServers(info.mcpServers || []);
       syncShellHint();

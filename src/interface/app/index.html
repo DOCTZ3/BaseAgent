@@ -151,6 +151,49 @@
     </section>
 
     <section>
+      <h3>远程入口 <span class="hint">手机端/转发服务同步通道</span></h3>
+      <div class="remote-stack">
+        <div class="remote-card" id="remote-hub-card">
+          <div class="remote-line">
+            <span>本机 RemoteHub</span>
+            <span class="config-status" id="remote-status">未启动</span>
+          </div>
+          <label>连接地址
+            <input type="text" id="remote-endpoint" readonly placeholder="(未启用)">
+          </label>
+          <label>访问令牌
+            <input type="text" id="remote-token" readonly placeholder="(未生成)">
+          </label>
+          <div class="remote-actions">
+            <button class="btn" id="btn-remote-pair">生成配对码</button>
+          </div>
+          <div class="remote-pair" id="remote-pair" hidden>
+            <div>
+              <span class="hint">配对码</span>
+              <strong id="remote-pair-code">------</strong>
+            </div>
+            <span id="remote-pair-expiry">2 分钟内有效,用后失效</span>
+          </div>
+          <p class="hint" id="remote-hint">默认只监听本机,需要转发器或局域网配置后手机才能连接。</p>
+        </div>
+
+        <div class="remote-card" id="relay-client-card">
+          <div class="remote-line">
+            <span>云端 Relay</span>
+            <span class="config-status" id="relay-status">未配置</span>
+          </div>
+          <label>Relay 地址
+            <input type="text" id="relay-url" readonly placeholder="(未配置)">
+          </label>
+          <label>设备 ID
+            <input type="text" id="relay-device-id" readonly placeholder="default">
+          </label>
+          <p class="hint" id="relay-hint">配置 BASEAGENT_RELAY_URL 和 BASEAGENT_RELAY_TOKEN 后,电脑会主动连接公网 Relay。</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
       <h3>Secret Store <span class="hint">MCP 和第三方凭证使用</span></h3>
       <div class="config-list" id="secret-list"></div>
       <button class="btn" id="btn-add-secret">添加 Secret</button>
