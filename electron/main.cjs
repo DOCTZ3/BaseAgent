@@ -365,7 +365,12 @@ function requestUserConfirm(req) {
     }, CONFIRM_TIMEOUT_MS);
     timer.unref?.();
 
-    pendingConfirms.set(reqId, { resolve, timer });
+    pendingConfirms.set(reqId, {
+      resolve,
+      timer,
+      req,
+      createdAt: Date.now(),
+    });
     if (win && !win.isDestroyed()) win.webContents.send('agent:confirm', reqId, req);
     remoteHub?.publish('agent:confirm', { reqId, req });
     relayClient?.publish('agent:confirm', { reqId, req });
@@ -383,6 +388,14 @@ function submitConfirmReply(reqId, ok) {
   record.resolve(allowed);
   sendConfirmResolved(id, allowed, 'answered');
   return { ok: true };
+}
+
+function listPendingConfirms() {
+  return Array.from(pendingConfirms.entries()).map(([reqId, record]) => ({
+    reqId,
+    req: record.req,
+    createdAt: record.createdAt,
+  }));
 }
 
 function sendConfirmResolved(reqId, ok, reason) {
@@ -440,6 +453,7 @@ const appApi = createAppApi({
   sendConfigChanged,
   sendMemoryChanged,
   confirmReply: submitConfirmReply,
+  listPendingConfirms,
 });
 
 async function startRemoteHub() {

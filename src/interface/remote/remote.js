@@ -23,6 +23,7 @@
     secrets: [],
     deletedSecrets: new Set(),
     mcpServers: [],
+    confirmPollTimer: 0,
   };
   const md = window.AgentMarkdown ?? createFallbackMarkdown();
 
@@ -100,6 +101,7 @@
 
     await Promise.allSettled([loadInfo(), loadHistory(), loadHistoryList(), loadSkills()]);
     startEvents();
+    startConfirmPolling();
   }
 
   function disconnect() {
@@ -109,6 +111,7 @@
     state.activeSessionId = null;
     state.pendingConfirmId = null;
     $('confirm-mask').hidden = true;
+    stopConfirmPolling();
     localStorage.removeItem('baseagent.remote.token');
     $('pair-panel').hidden = false;
     $('app-panel').hidden = true;
@@ -744,6 +747,7 @@
     state.currentReasoning = null;
     state.currentTools = new Map();
     syncBusy();
+    startConfirmPolling();
     try {
       const result = await request('/api/agent/run', {
         method: 'POST',
@@ -772,6 +776,7 @@
       state.currentAnswerRaw = '';
       state.currentReasoning = null;
       state.currentTools = new Map();
+      stopConfirmPolling();
       syncBusy();
       if (state.pendingHistoryReload) {
         state.pendingHistoryReload = false;
@@ -907,6 +912,10 @@
 
   function markConfirmWaiting(reqId, req) {
     if (!state.currentAssistant || !reqId) return;
+    const existed = state.currentAssistant.querySelector(
+      `.confirm-waiting[data-confirm-req-id="${String(reqId)}"]`,
+    );
+    if (existed) return;
     const tag = document.createElement('div');
     tag.className = 'tool running confirm-waiting';
     tag.dataset.confirmReqId = String(reqId);
@@ -1126,6 +1135,42 @@
     state.pendingConfirmId = null;
     const mask = $('confirm-mask');
     if (mask) mask.hidden = true;
+  }
+
+  function startConfirmPolling() {
+    if (state.confirmPollTimer || !state.token) return;
+    void pollPendingConfirms();
+    state.confirmPollTimer = setInterval(() => {
+      if (!state.token || (!state.busy && !state.pendingConfirmId)) {
+        stopConfirmPolling();
+        return;
+      }
+      void pollPendingConfirms();
+    }, 1200);
+  }
+
+  function stopConfirmPolling() {
+    if (!state.confirmPollTimer) return;
+    clearInterval(state.confirmPollTimer);
+    state.confirmPollTimer = 0;
+  }
+
+  async function pollPendingConfirms() {
+    try {
+      const data = await request('/api/confirm/pending');
+      const confirms = Array.isArray(data?.confirms) ? data.confirms : [];
+      if (confirms.length === 0) {
+        if (state.pendingConfirmId) closeConfirmIfCurrent(state.pendingConfirmId);
+        return;
+      }
+      const item = confirms[0];
+      if (item?.reqId) {
+        markConfirmWaiting(item.reqId, item.req);
+        void showConfirm(item.reqId, item.req);
+      }
+    } catch {
+      // SSE 仍是主路径;轮询失败时保持安静,避免执行期间刷错误 toast。
+    }
   }
 
   function appendTo(parent, tag, className, text) {

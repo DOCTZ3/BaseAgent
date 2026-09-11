@@ -267,6 +267,7 @@ function createRemoteHub(options) {
       return appApi.currentHistory({ resumeLatest: true });
     }
     if (req.method === 'GET' && pathname === '/api/skills/list') return appApi.listSkills();
+    if (req.method === 'GET' && pathname === '/api/confirm/pending') return appApi.confirmPending();
 
     const body = await readJson(req);
 

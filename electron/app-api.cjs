@@ -35,6 +35,7 @@ function createAppApi(deps) {
     sendConfigChanged,
     sendMemoryChanged,
     confirmReply,
+    listPendingConfirms,
   } = deps;
 
   return {
@@ -65,6 +66,13 @@ function createAppApi(deps) {
 
     confirmReply(reqId, ok) {
       return confirmReply?.(reqId, ok === true) || { ok: false, error: '当前环境不支持确认回复' };
+    },
+
+    confirmPending() {
+      return {
+        ok: true,
+        confirms: listPendingConfirms?.() || [],
+      };
     },
 
     async info() {

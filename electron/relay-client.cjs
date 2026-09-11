@@ -130,6 +130,7 @@ function createRelayClient(options) {
       return appApi.currentHistory({ resumeLatest: true });
     }
     if (method === 'GET' && pathname === '/api/skills/list') return appApi.listSkills();
+    if (method === 'GET' && pathname === '/api/confirm/pending') return appApi.confirmPending();
 
     if (method === 'POST' && pathname === '/api/agent/run') {
       const runId = body.runId || `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

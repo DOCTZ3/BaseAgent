@@ -129,7 +129,9 @@ button:disabled { opacity: .55; }
   font-family: ui-monospace, Consolas, monospace;
   flex: 0 1 auto;
   min-width: 0;
-  overflow-wrap: break-word;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tool .sum {
   flex: 1 1 auto;
