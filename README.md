@@ -128,7 +128,8 @@ BASEAGENT_RELAY_TOKEN=your-long-random-token npm run relay:server
 ```
 
 生产环境建议把 Relay 放在 HTTPS/WSS 反向代理之后。也可以设置
-`BASEAGENT_RELAY_PAIR_CODE=123456` 固定测试配对码;不设置时服务端启动会随机生成并打印。
+`BASEAGENT_RELAY_PAIR_CODE=123456` 作为固定测试配对码;正常使用时不需要配置它,
+桌面端连上 Relay 后可以在设置面板里生成短时云端配对码。
 
 电脑端配置:
 
@@ -144,7 +145,7 @@ BASEAGENT_RELAY_DEVICE_ID=default
 https://your-domain.example/remote/
 ```
 
-在页面里输入 Relay 地址和配对码后,手机发送消息、审批 skill、配置 Secret/MCP 等操作
+在页面里输入桌面端生成的云端配对码后,手机发送消息、审批 skill、配置 Secret/MCP 等操作
 都会转发回这台电脑执行;电脑端产生的回答和刷新事件也会同步回手机端。
 
 ## Windows 打包

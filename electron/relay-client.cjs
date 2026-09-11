@@ -20,6 +20,8 @@ function createRelayClient(options) {
   let closed = false;
   let connectedAt = 0;
   let reconnectTimer = null;
+  let relaySeq = 0;
+  const relayRequests = new Map();
 
   function start() {
     if (!url || !token) {
@@ -69,6 +71,11 @@ function createRelayClient(options) {
     closed = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
+    for (const [requestId, record] of relayRequests) {
+      clearTimeout(record.timer);
+      record.resolve({ ok: false, error: 'RelayClient 已关闭' });
+      relayRequests.delete(requestId);
+    }
     const current = ws;
     ws = null;
     if (current && current.readyState === WebSocket.OPEN) current.close(1000, 'BaseAgent shutdown');
@@ -94,11 +101,52 @@ function createRelayClient(options) {
     };
   }
 
+  function createPairCode(options = {}) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return Promise.resolve({ ok: false, error: 'Relay 未连接' });
+    }
+
+    const requestId = `relay-client-${Date.now()}-${++relaySeq}`;
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        relayRequests.delete(requestId);
+        resolve({ ok: false, error: 'Relay 生成配对码超时' });
+      }, 15000);
+      timer.unref?.();
+
+      relayRequests.set(requestId, { resolve, timer });
+      send({
+        type: 'relay_request',
+        requestId,
+        action: 'create_pair_code',
+        ttlMs: options.ttlMs,
+      });
+    });
+  }
+
   async function handleMessage(raw) {
     let message;
     try {
       message = JSON.parse(String(raw));
     } catch {
+      return;
+    }
+
+    if (message?.type === 'relay_response' && message.requestId) {
+      const requestId = String(message.requestId);
+      const record = relayRequests.get(requestId);
+      if (!record) return;
+      relayRequests.delete(requestId);
+      clearTimeout(record.timer);
+      if (message.ok) {
+        record.resolve({
+          ok: true,
+          ...(message.result || {}),
+          endpoint: message.result?.endpoint || endpointFromRelayUrl(url),
+        });
+      } else {
+        record.resolve({ ok: false, error: message.error || 'Relay 请求失败' });
+      }
       return;
     }
 
@@ -167,7 +215,7 @@ function createRelayClient(options) {
     return true;
   }
 
-  return { start, stop, publish, info };
+  return { start, stop, publish, info, createPairCode };
 }
 
 function cleanDeviceId(value) {
@@ -186,6 +234,16 @@ function withQuery(rawUrl, params) {
     if (value !== undefined && value !== '') u.searchParams.set(key, value);
   }
   return u.toString();
+}
+
+function endpointFromRelayUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
+    return `${protocol}//${u.host}`;
+  } catch {
+    return '';
+  }
 }
 
 module.exports = { createRelayClient };

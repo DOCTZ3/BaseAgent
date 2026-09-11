@@ -81,6 +81,7 @@ contextBridge.exposeInMainWorld('AgentBridge', {
   pickDirectory: () => ipcRenderer.invoke('dialog:pick-directory'),
   openUserDataDir: () => ipcRenderer.invoke('app:open-user-data'),
   createRemotePairCode: options => ipcRenderer.invoke('remote:create-pair-code', options),
+  createRelayPairCode: options => ipcRenderer.invoke('relay:create-pair-code', options),
 
   /** 注册确认处理器 */
   onConfirm(handler) { confirmHandler = handler; },

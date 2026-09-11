@@ -20,14 +20,14 @@ require('dotenv').config({ path: path.join(root, '.env'), quiet: true });
 const host = process.env.BASEAGENT_RELAY_HOST || '0.0.0.0';
 const port = normalizePort(process.env.BASEAGENT_RELAY_PORT || process.env.PORT || 17900);
 const relayToken = process.env.BASEAGENT_RELAY_TOKEN || crypto.randomBytes(24).toString('base64url');
-const pairCode = normalizePairCode(process.env.BASEAGENT_RELAY_PAIR_CODE) ||
-  String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+const fallbackPairCode = normalizePairCode(process.env.BASEAGENT_RELAY_PAIR_CODE);
 const requestTimeoutMs = normalizeTimeout(process.env.BASEAGENT_RELAY_REQUEST_TIMEOUT_MS);
 const remoteRoot = path.resolve(process.env.BASEAGENT_RELAY_REMOTE_ROOT || path.join(root, 'src', 'interface', 'remote'));
 const markdownPath = path.resolve(process.env.BASEAGENT_RELAY_MARKDOWN_PATH || path.join(root, 'src', 'interface', 'app', 'md.js'));
 
 const pcs = new Map();
 const pending = new Map();
+const pairCodes = new Map();
 const clientTokens = new Map();
 const sseClients = new Set();
 
@@ -52,12 +52,12 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-wss.on('connection', (ws, _req, url) => {
+wss.on('connection', (ws, req, url) => {
   const deviceId = cleanDeviceId(url.searchParams.get('deviceId') || 'default');
   const old = pcs.get(deviceId);
   old?.close?.(1012, 'Replaced by a new PC connection');
 
-  const pc = { deviceId, ws, connectedAt: Date.now() };
+  const pc = { deviceId, ws, connectedAt: Date.now(), endpoint: publicEndpointFromUpgrade(req) };
   pcs.set(deviceId, pc);
   console.log(`PC connected: ${deviceId}`);
   broadcastToDevice(deviceId, 'relay:pc-status', { online: true, deviceId });
@@ -77,7 +77,7 @@ server.listen(port, host, () => {
   const address = server.address();
   console.log(`BaseAgent Relay listening on http://${host}:${address.port}`);
   console.log(`PC token: ${maskToken(relayToken)}`);
-  console.log(`Pair code: ${pairCode}`);
+  console.log(`Pair code: ${fallbackPairCode || '(generate from desktop client)'}`);
 });
 
 async function handleHttp(req, res) {
@@ -136,12 +136,18 @@ async function handlePairClaim(req, res) {
   try {
     const body = await readJson(req);
     const code = normalizePairCode(body.code);
-    if (!code || code !== pairCode) {
+    prunePairCodes();
+    const record = code ? pairCodes.get(code) : null;
+    const fallbackMatched = fallbackPairCode && code === fallbackPairCode;
+    if (!record && !fallbackMatched) {
       replyJson(res, 401, { ok: false, error: 'Pair code is invalid' });
       return;
     }
 
-    const deviceId = cleanDeviceId(body.deviceId || 'default');
+    if (record) pairCodes.delete(code);
+    const deviceId = record
+      ? record.deviceId
+      : cleanDeviceId(body.deviceId || 'default');
     const token = crypto.randomBytes(24).toString('base64url');
     clientTokens.set(token, {
       deviceId,
@@ -239,6 +245,11 @@ function handlePcMessage(deviceId, raw) {
     return;
   }
 
+  if (message.type === 'relay_request') {
+    handlePcRelayRequest(deviceId, message);
+    return;
+  }
+
   if (message.type === 'event') {
     broadcastToDevice(deviceId, message.eventType, message.payload);
     return;
@@ -252,6 +263,55 @@ function handlePcMessage(deviceId, raw) {
 
   if (message.ok) record.resolve(message.result);
   else record.reject(new Error(message.error || 'PC request failed'));
+}
+
+function handlePcRelayRequest(deviceId, message) {
+  const pc = pcs.get(deviceId);
+  if (!pc || !message.requestId) return;
+
+  try {
+    if (message.action !== 'create_pair_code') {
+      throw new Error(`Unknown relay action: ${message.action || ''}`);
+    }
+
+    const result = createPairCodeForDevice(deviceId, {
+      ttlMs: message.ttlMs,
+      endpoint: pc.endpoint,
+    });
+    pc.ws.send(JSON.stringify({
+      type: 'relay_response',
+      requestId: String(message.requestId),
+      ok: true,
+      result,
+    }));
+  } catch (err) {
+    pc.ws.send(JSON.stringify({
+      type: 'relay_response',
+      requestId: String(message.requestId),
+      ok: false,
+      error: errorText(err),
+    }));
+  }
+}
+
+function createPairCodeForDevice(deviceId, options = {}) {
+  prunePairCodes();
+  const ttlMs = normalizePairTtlMs(options.ttlMs);
+  let code = '';
+  for (let i = 0; i < 10; i++) {
+    code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+    if (!pairCodes.has(code) && code !== fallbackPairCode) break;
+  }
+
+  const expiresAt = Date.now() + ttlMs;
+  pairCodes.set(code, { deviceId, expiresAt });
+  return {
+    code,
+    deviceId,
+    expiresAt,
+    expiresInMs: ttlMs,
+    endpoint: options.endpoint || '',
+  };
 }
 
 function broadcastToDevice(deviceId, type, payload) {
@@ -272,6 +332,13 @@ function failPendingForDevice(deviceId, message) {
     pending.delete(requestId);
     clearTimeout(record.timer);
     record.reject(new Error(message));
+  }
+}
+
+function prunePairCodes() {
+  const now = Date.now();
+  for (const [code, record] of pairCodes) {
+    if (record.expiresAt <= now) pairCodes.delete(code);
   }
 }
 
@@ -323,6 +390,13 @@ function bearerToken(req) {
 
 function publicEndpoint(req) {
   const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http';
+  const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${port}`;
+  return `${proto}://${host}`;
+}
+
+function publicEndpointFromUpgrade(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() ||
+    (req.socket?.encrypted ? 'https' : 'http');
   const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${port}`;
   return `${proto}://${host}`;
 }
@@ -393,6 +467,12 @@ function normalizePort(value) {
 function normalizeTimeout(value) {
   const n = Number(value);
   return Number.isInteger(n) && n >= 1000 ? n : 30 * 60 * 1000;
+}
+
+function normalizePairTtlMs(value) {
+  const n = Number(value);
+  if (!Number.isInteger(n)) return 120000;
+  return Math.min(Math.max(n, 30000), 10 * 60 * 1000);
 }
 
 function normalizePairCode(value) {

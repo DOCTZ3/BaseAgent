@@ -793,6 +793,16 @@ body {
   font-size: 12px;
 }
 
+.remote-pair-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  color: var(--fg-faint);
+  text-align: right;
+}
+
 .remote-pair strong {
   display: block;
   margin-top: 2px;

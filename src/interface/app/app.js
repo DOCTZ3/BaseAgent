@@ -892,6 +892,7 @@
   const mask = $('drawer-mask');
   const cfgError = $('cfg-error');
   let remotePairTimer = 0;
+  let relayPairTimer = 0;
 
   function showCfgError(message) {
     if (!cfgError) return;
@@ -966,8 +967,28 @@
     if (pair) pair.hidden = true;
   }
 
+  function clearRelayPair() {
+    clearInterval(relayPairTimer);
+    relayPairTimer = 0;
+    const pair = $('relay-pair');
+    if (pair) pair.hidden = true;
+    const endpoint = $('relay-pair-endpoint');
+    if (endpoint) endpoint.textContent = '手机端打开 Relay /remote/ 后输入此码';
+  }
+
   function updateRemotePairCountdown(expiresAt) {
     const expiry = $('remote-pair-expiry');
+    if (!expiry) return false;
+    const left = Math.max(0, expiresAt - Date.now());
+    const seconds = Math.ceil(left / 1000);
+    expiry.textContent = seconds > 0
+      ? `${seconds} 秒内有效,用后失效`
+      : '配对码已过期';
+    return seconds > 0;
+  }
+
+  function updateRelayPairCountdown(expiresAt) {
+    const expiry = $('relay-pair-expiry');
     if (!expiry) return false;
     const left = Math.max(0, expiresAt - Date.now());
     const seconds = Math.ceil(left / 1000);
@@ -1009,6 +1030,7 @@
     const url = $('relay-url');
     const deviceId = $('relay-device-id');
     const hint = $('relay-hint');
+    const pairBtn = $('btn-relay-pair');
     if (!status || !url || !deviceId || !hint) return;
 
     const enabled = !!relayClient?.enabled;
@@ -1017,9 +1039,11 @@
     status.className = `config-status ${connected ? 'ok' : (enabled ? 'warn' : 'muted')}`;
     url.value = relayClient?.url || '';
     deviceId.value = relayClient?.deviceId || '';
+    if (pairBtn) pairBtn.disabled = !connected;
 
     if (!enabled) {
       hint.textContent = '未配置云端 Relay。手机跨公网访问时,需要先部署 relay server 并在电脑端配置 URL/token。';
+      clearRelayPair();
       return;
     }
 
@@ -1028,12 +1052,13 @@
         ? new Date(relayClient.connectedAt).toLocaleString()
         : '';
       hint.textContent = since
-        ? `电脑已主动连到 Relay。连接时间: ${since}`
-        : '电脑已主动连到 Relay,手机端可通过 Relay 的 /remote/ 页面配对访问。';
+        ? `电脑已主动连到 Relay。点击“生成云端配对码”后,手机端打开 Relay 的 /remote/ 页面配对。连接时间: ${since}`
+        : '电脑已主动连到 Relay。点击“生成云端配对码”后,手机端打开 Relay 的 /remote/ 页面配对。';
       return;
     }
 
     hint.textContent = 'Relay 已配置但当前未连接。请检查服务器地址、长 token、网络或服务端日志。';
+    clearRelayPair();
   }
 
   $('btn-remote-pair')?.addEventListener('click', async () => {
@@ -1066,6 +1091,46 @@
       }, 1000);
     } catch (e) {
       toast(`生成配对码失败: ${e && e.message ? e.message : String(e)}`, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  $('btn-relay-pair')?.addEventListener('click', async () => {
+    const api = window.AgentRuntime;
+    if (!api?.createRelayPairCode) {
+      toast('当前环境不支持生成云端配对码', true);
+      return;
+    }
+
+    const btn = $('btn-relay-pair');
+    const pair = $('relay-pair');
+    const code = $('relay-pair-code');
+    const endpoint = $('relay-pair-endpoint');
+    clearRelayPair();
+    if (btn) btn.disabled = true;
+
+    try {
+      const r = await api.createRelayPairCode();
+      if (!r || r.ok === false) {
+        toast(`生成云端配对码失败: ${r?.error || 'Relay 未连接'}`, true);
+        return;
+      }
+
+      if (code) code.textContent = r.code || '------';
+      if (endpoint) {
+        const remoteUrl = r.endpoint ? `${String(r.endpoint).replace(/\/$/, '')}/remote/` : '';
+        endpoint.textContent = remoteUrl
+          ? `手机端打开 ${remoteUrl} 后输入此码`
+          : '手机端打开 Relay /remote/ 后输入此码';
+      }
+      if (pair) pair.hidden = false;
+      updateRelayPairCountdown(r.expiresAt);
+      relayPairTimer = setInterval(() => {
+        if (!updateRelayPairCountdown(r.expiresAt)) clearRelayPair();
+      }, 1000);
+    } catch (e) {
+      toast(`生成云端配对码失败: ${e && e.message ? e.message : String(e)}`, true);
     } finally {
       if (btn) btn.disabled = false;
     }

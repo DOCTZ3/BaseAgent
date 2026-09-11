@@ -446,6 +446,7 @@ const appApi = createAppApi({
   getRemoteHubInfo: () => remoteHub?.info() || null,
   getRelayClientInfo: () => relayClient?.info() || null,
   createRemotePairCode: options => remoteHub?.createPairCode(options),
+  createRelayPairCode: options => relayClient?.createPairCode(options),
   openPath: p => shell.openPath(p),
   sendAgentEvent,
   sendSessionChanged,
@@ -563,6 +564,10 @@ ipcMain.handle('app:open-user-data', async () => {
 
 ipcMain.handle('remote:create-pair-code', async (_e, options) => {
   return appApi.createRemotePairCode(options);
+});
+
+ipcMain.handle('relay:create-pair-code', async (_e, options) => {
+  return appApi.createRelayPairCode(options);
 });
 
 // ---------- IPC:配置 ----------

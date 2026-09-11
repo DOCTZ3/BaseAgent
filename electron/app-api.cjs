@@ -28,6 +28,7 @@ function createAppApi(deps) {
     getRemoteHubInfo,
     getRelayClientInfo,
     createRemotePairCode,
+    createRelayPairCode,
     openPath,
     sendAgentEvent,
     sendSessionChanged,
@@ -134,6 +135,10 @@ function createAppApi(deps) {
 
     createRemotePairCode(options) {
       return createRemotePairCode?.(options) || { ok: false, error: 'RemoteHub 未启动' };
+    },
+
+    createRelayPairCode(options) {
+      return createRelayPairCode?.(options) || { ok: false, error: 'Relay 未连接' };
     },
 
     async configGet() {

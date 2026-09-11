@@ -165,7 +165,7 @@
             <input type="text" id="remote-token" readonly placeholder="(未生成)">
           </label>
           <div class="remote-actions">
-            <button class="btn" id="btn-remote-pair">生成配对码</button>
+            <button class="btn" id="btn-remote-pair">生成本机配对码</button>
           </div>
           <div class="remote-pair" id="remote-pair" hidden>
             <div>
@@ -188,6 +188,19 @@
           <label>设备 ID
             <input type="text" id="relay-device-id" readonly placeholder="default">
           </label>
+          <div class="remote-actions">
+            <button class="btn" id="btn-relay-pair">生成云端配对码</button>
+          </div>
+          <div class="remote-pair" id="relay-pair" hidden>
+            <div>
+              <span class="hint">云端配对码</span>
+              <strong id="relay-pair-code">------</strong>
+            </div>
+            <div class="remote-pair-meta">
+              <span id="relay-pair-expiry">2 分钟内有效,用后失效</span>
+              <span id="relay-pair-endpoint">手机端打开 Relay /remote/ 后输入此码</span>
+            </div>
+          </div>
           <p class="hint" id="relay-hint">配置 BASEAGENT_RELAY_URL 和 BASEAGENT_RELAY_TOKEN 后,电脑会主动连接公网 Relay。</p>
         </div>
       </div>
